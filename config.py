@@ -4,7 +4,6 @@
 # =============================================================================
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-INPUT_VIDEO        = "D:\VOD"          # path to your raw livestream
 OUTPUT_DIR         = "D:\output_clips"            # where finished clips go
 WORKING_DIR        = "working"                 # temp files (transcripts, raw cuts)
 YOLO_WEIGHTS       = "models/proya_best.pt"    # your trained YOLO weights
@@ -20,16 +19,10 @@ BEFORE_AFTER_DIR        = "assets/before_after"   # folder with your images
 BEFORE_AFTER_ENABLED    = True                    # set False to disable globally
 BEFORE_AFTER_START_T    = 0        # seconds — when image appears (after hook)
 BEFORE_AFTER_DURATION   = 2.5        # seconds the image is shown
-BEFORE_AFTER_WIDTH_PCT  = 0.72       # image width as fraction of frame width
-BEFORE_AFTER_Y_CENTER   = 0.48       # vertical center position (0=top, 1=bottom)
 BEFORE_AFTER_OPACITY    = 1.0       # 0.0 = invisible, 1.0 = fully opaque
 BEFORE_AFTER_FADE_IN    = 0.00       # seconds to fade in
 BEFORE_AFTER_FADE_OUT   = 0.25       # seconds to fade out
-BEFORE_AFTER_ROUNDED    = False       # apply rounded corner mask to image
-BEFORE_AFTER_CORNER_R   = 24         # corner radius in pixels (if ROUNDED = True)
 # Label shown above the image — set to None to disable
-BEFORE_AFTER_LABEL      = ""
-BEFORE_AFTER_LABEL_COLOR = "white"
 
 # ── Word Correction / Brand Name Normalization ────────────────────────────────
 # Whisper sometimes mishears brand/product names. This dictionary maps
@@ -197,6 +190,17 @@ WORD_CORRECTIONS = {
     "dari vatipus"   : "derivatives",
     "aldochronic"    : "Hyaluronic",
     "FLAGFLAG"       : "flek fleg",
+    "denny"          : "dia ini",
+    "disconok"       : "diskon",
+    "deriva tipes"   : "derivatives",
+    "tretamik"       : "tranexamic",
+    "pandang"        : "panda",
+    "derivatif"      : "derivatives",
+    "trexamide"      : "tranexamic",
+    "exit"           : "acid",
+    "asitanya"       : "acid",
+
+
  }
 # Apply corrections to subtitle text displayed on clips (in addition to transcript)
 WORD_CORRECTION_APPLY_TO_SUBTITLES = True
@@ -205,11 +209,14 @@ WORD_CORRECTION_APPLY_TO_SUBTITLES = True
 # LM Studio → Local Server → must be running before you start the pipeline
 LM_STUDIO_BASE_URL = "http://localhost:1234/v1"
 LM_STUDIO_API_KEY  = "lm-studio"               # LM Studio accepts any non-empty string
-LM_STUDIO_MODEL    = "meta-llama-3.1-8b-instruct"          # match the model name shown in LM Studio
+LM_STUDIO_MOMENT_MODEL_ID = "qwen/qwen3.6-27b"
+LM_STUDIO_MODEL    = LM_STUDIO_MOMENT_MODEL_ID          # match the model name shown in LM Studio
 LM_STUDIO_TIMEOUT  = 360                       # seconds per request
+LM_STUDIO_MODEL_MANAGEMENT_ENABLED = True
+MOMENT_DETECTOR_WORKERS = 2                    # limited parallel LM Studio calls
 
 # ── Whisper ───────────────────────────────────────────────────────────────────
-WHISPER_MODEL_SIZE = "large-v3"                # prioritize transcription quality on high-end GPU
+WHISPER_MODEL_SIZE = "large-v3-turbo"                # prioritize transcription quality on high-end GPU
 WHISPER_DEVICE     = "cuda"                    # use RTX GPU
 WHISPER_COMPUTE    = "float16"                 # fast GPU inference
 WHISPER_BEAM_SIZE  = 5                         # broader search improves tricky words/prices
@@ -223,7 +230,6 @@ WHISPERX_DEVICE             = WHISPER_DEVICE
 WHISPERX_ALIGN_MODEL        = None             # auto-pick based on language
 WHISPERX_INTERPOLATE_METHOD = "nearest"
 WHISPERX_MODEL_DIR          = None
-WHISPERX_MODEL_CACHE_ONLY   = False
 WHISPERX_MAX_SEGMENT_SECONDS = 30              # cap Wav2Vec2 alignment windows to avoid CUDA OOM
 WHISPERX_ALIGN_IN_SUBPROCESS = True            # protect saved raw transcript if WhisperX crashes natively
 WHISPERX_FALLBACK_TO_RAW_ON_OOM = True         # keep queue moving if WhisperX still runs out of VRAM
@@ -284,12 +290,10 @@ HOOK_COLOR          = "white"       # "white" | "yellow" — alternate per vibe
 HOOK_STROKE_COLOR   = "black"
 HOOK_STROKE_W       = 5            # 4–6px thick for TikTok style
 HOOK_DURATION       = 2.5          # show hook title briefly at the start
-HOOK_Y_POS          = 0.5         # vertical start as fraction of frame height
 # Background is auto-height (fits text exactly + padding)
 
 # ── Subtitles ─────────────────────────────────────────────────────────────────
 SUBTITLE_FONTSIZE   = 120           # 60–80 range
-SUBTITLE_COLOR      = "#FFFFFF"    # default white; highlight words override this
 SUBTITLE_STROKE     = "#000000"
 SUBTITLE_STROKE_W   = 3            # 2–4px
 SUBTITLE_Y_POS      = 0.80        # vertical position (fraction of frame height)
@@ -339,13 +343,11 @@ HIGHLIGHT_RED_COLOR = "#FF3B30"
 # ── Products ──────────────────────────────────────────────────────────────────
 PRODUCT_CLASSES = {
     0: "Cleanser",
-    1: "Serum",
-    2: "Toner",
-    3: "Eye Cream",
-    4: "Sheet Mask",
-    5: "skin cream",
-    # When you add host_face to your YOLO dataset, add it here too:
-    6: "host_face",
+    1: "Eye Cream",
+    2: "host_face",
+    3: "Serum",
+    4: "skin cream",
+    5: "Toner",
 }
 BRAND_NAME = "PROYA 5X Vitamin C"
 
@@ -384,15 +386,12 @@ FACE_ZOOM_MIN_GAP      = 1.0
 # Active word highlight colour (used when word is not a semantic keyword)
 KARAOKE_ACTIVE_COLOR     = "#FFD600"   # TikTok yellow
 KARAOKE_INACTIVE_OPACITY = 1.0       # 0.0=invisible, 1.0=same as active; try 0.3–0.5
-KARAOKE_WORD_SPACING     = 14         # px gap between words in a row
 
 # ── Product Zoom Caption ──────────────────────────────────────────────────────
 ZOOM_CAPTION_TEXT_COLOR     = "white"      # product name
 ZOOM_CAPTION_BRAND_COLOR    = "#FFD600"    # "PROYA 5X VITAMIN C" line
 ZOOM_CAPTION_STROKE_COLOR   = "black"      # outline on both lines
 ZOOM_CAPTION_STROKE_WIDTH   = 4
-ZOOM_CAPTION_BRAND_STROKE_W = 4
-ZOOM_CAPTION_ICON           = ""         # change to "✨" "🧴" etc.
 ZOOM_CAPTION_FONTSIZE       = 120    # ← product name (e.g. "SERUM") — increase for bigger
 ZOOM_CAPTION_BRAND_FONTSIZE = 0    # ← brand line ("PROYA 5X VITAMIN C") — increase for bigger
 ZOOM_CAPTION_Y_POS          = 0.10  # top-center caption vertical position as fraction of frame height
@@ -400,7 +399,6 @@ ZOOM_CAPTION_Y_POS          = 0.10  # top-center caption vertical position as fr
 # ── Output Video ──────────────────────────────────────────────────────────────
 OUTPUT_FPS     = 30
 OUTPUT_CODEC   = "libx264"
-OUTPUT_AUDIO   = "aac"
 OUTPUT_CRF     = 23               # lower = better quality, bigger file
 OUTPUT_PRESET  = "fast"           # ultrafast/fast/medium
 
@@ -425,25 +423,23 @@ SFX_GREEN_FOLDER       = "highlight_green"
 SFX_RED_FOLDER         = "highlight_red"
 
 # Volume multiplier per category (1.0 = original file volume)
-SFX_VOLUME_PRODUCT     = 0.20    # product zoom whoosh
-SFX_VOLUME_YELLOW      = 0.15    # attention / benefit words
-SFX_VOLUME_GREEN       = 0.15    # result / proof words
-SFX_VOLUME_RED         = 0.15    # pain / problem words
+SFX_VOLUME_PRODUCT     = 0.15    # product zoom whoosh
+SFX_VOLUME_YELLOW      = 0.10    # attention / benefit words
+SFX_VOLUME_GREEN       = 0.10    # result / proof words
+SFX_VOLUME_RED         = 0.10    # pain / problem words
 
 # Minimum seconds between SFX of the same highlight category
 # (prevents rapid-fire SFX when multiple keywords appear back-to-back)
-SFX_HIGHLIGHT_DEBOUNCE = 1.5
-
 # Highlight SFX cadence in karaoke subtitle blocks.
 # 2 means: trigger on a highlighted block, skip the next block, then allow again.
 SFX_HIGHLIGHT_BLOCK_INTERVAL = 2
 
 # Quality-first overrides for product-selling clips.
 # Stricter values reduce random cuts, silent clips, and weak filler moments.
-CHUNK_DURATION = 120
-CHUNK_OVERLAP = 12
-MIN_CLIP_DURATION = 15
-MAX_CLIP_DURATION = 45
+CHUNK_DURATION = 300
+CHUNK_OVERLAP = 45
+MIN_CLIP_DURATION = 25
+MAX_CLIP_DURATION = 60
 MIN_SCORE = 7.0
 PAD_START = 0.5
 PAD_END = 0.75
@@ -457,7 +453,6 @@ OUTPUT_CODEC = "h264_nvenc"
 OUTPUT_PRESET = "p1"
 OUTPUT_CRF = 35
 OUTPUT_CQ = 35
-OUTPUT_THREADS = 8
 OUTPUT_AUDIO_BITRATE = "96k"
 MAX_PARALLEL_CLIPS = 6
 EDIT_LOG_EVERY_N = 25
@@ -466,7 +461,36 @@ EDIT_LOG_CREATED_CLIPS = True
 LOG_FFMPEG_FILTER_COMPLEX = False
 RAW_CUT_CODEC   = "libx264"   # CPU — fast enough, no NVENC slot used
 RAW_CUT_PRESET  = "ultrafast"
-FFMPEG_GPU_ENCODER = "h264_nvenc"
+
+# Automated post-render clip scoring.
+SCORER_ENABLED = True
+SCORER_FRAME_SAMPLE_RATE = 10
+SCORER_MIN_SCORE_TO_EXPORT = 0.0
+SCORER_WEIGHTS = {"content": 0.466667, "visual": 0.0, "quality": 0.2, "engagement": 0.333333}
+SCORER_HOST_FOCUS_WEIGHT = 0.0
+SCORER_HOOK_WEIGHT = 0.0
+SCORER_APPLY_CAPS = True
+SCORER_CACHE_ENABLED = True
+SCORER_FORCE_RESCORE = False
+SCORER_EXPORT_READY_THRESHOLD = 7.0
+SCORER_REVIEW_THRESHOLD = 5.0
+SCORER_AUTO_SORT_ENABLED = True
+SCORER_TOP_VARIANTS_PER_CLIP = 0
+SCORER_VISION_ENABLED = True
+SCORER_VISION_FRAME_SAMPLE_RATE = 150
+SCORER_VISION_BASE_URL = "http://localhost:1234/v1"
+SCORER_VISION_API_KEY = "lm-studio"
+SCORER_VISION_MODEL_ID = "qwen2.5-vl-32b-instruct"
+SCORER_VISION_MODEL = SCORER_VISION_MODEL_ID
+SCORER_VISION_TIMEOUT = 120
+SCORER_VISION_DEBUG = False
+SCORER_FOCUS_DROP_OUTLIERS = True
+SCORER_FOCUS_SKIP_FIRST_FRAME = True
+SCORER_BATCH_FLUSH_EVERY = 5
+SCORER_SIMILARITY_FRAME_SAMPLE_RATE = 30
+SCORER_SIMILARITY_MAX_FRAMES = 24
+SCORER_PRODUCT_VISIBLE_MIN_RATIO = 0.05
+SCORER_GENERIC_PRODUCT_LABELS = ["bottle", "cup"]
 
 # ── Variation Engine ──────────────────────────────────────────────────────────
 # How many style variants to render per detected moment.

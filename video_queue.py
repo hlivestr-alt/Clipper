@@ -31,6 +31,8 @@ from pathlib import Path
 from queue import Empty, PriorityQueue, Queue
 from typing import Optional
 
+from stage_cache import stage_fingerprint_matches, write_stage_fingerprint
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,10 +48,24 @@ log = logging.getLogger("proya.queue")
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov"}
 STAGES = ("transcribe", "llm", "yolo", "ffmpeg")
+GPU_ANALYSIS_STAGES = ("transcribe", "llm")
 PRE_EDIT_STAGES = STAGES[:-1]
 EDIT_STAGE = "ffmpeg"
 TERMINAL_VIDEO_STATUSES = {"completed", "failed"}
 STATE_SCHEMA_VERSION = 2
+CLIP_PROGRESS_DEFAULTS = {
+    "progress_pct": 0,
+    "message": None,
+    "last_progress_at": None,
+    "clips_total": 0,
+    "clips_completed": 0,
+    "clips_created": 0,
+    "clips_failed": 0,
+    "clips_skipped": 0,
+    "last_clip_id": None,
+    "last_clip_status": None,
+    "last_event": None,
+}
 
 
 @dataclass(frozen=True)
@@ -97,6 +113,7 @@ class VideoQueueRunner:
         self.stop_event = threading.Event()
         self.state = self._load_state()
         self.job_counter = 0
+        self.active_video_keys: set[str] = set()
         self.queues = {
             "gpu": PriorityQueue(),
             "yolo": Queue(),
@@ -138,8 +155,17 @@ class VideoQueueRunner:
             self._stop_workers()
 
         with self.state_lock:
-            completed = sum(1 for v in self.state["videos"].values() if v["status"] == "completed")
-            failed = sum(1 for v in self.state["videos"].values() if v["status"] == "failed")
+            active_video_keys = self._active_video_keys_locked()
+            completed = sum(
+                1
+                for video_path, v in self.state["videos"].items()
+                if video_path in active_video_keys and v["status"] == "completed"
+            )
+            failed = sum(
+                1
+                for video_path, v in self.state["videos"].items()
+                if video_path in active_video_keys and v["status"] == "failed"
+            )
         log.info("=" * 70)
         log.info(f"Queue finished | completed={completed} | failed={failed}")
         log.info(f"State file: {self.state_path}")
@@ -148,10 +174,14 @@ class VideoQueueRunner:
 
     def _load_state(self) -> dict:
         if self.state_path.exists():
-            with open(self.state_path, "r", encoding="utf-8") as f:
-                state = json.load(f)
-            if isinstance(state.get("videos"), dict):
-                return self._migrate_state(state)
+            try:
+                with open(self.state_path, "r", encoding="utf-8") as f:
+                    state = json.load(f)
+            except Exception as exc:
+                log.warning(f"Ignoring unreadable queue state {self.state_path}: {exc}")
+            else:
+                if isinstance(state.get("videos"), dict):
+                    return self._migrate_state(state)
 
         return {
             "schema_version": STATE_SCHEMA_VERSION,
@@ -218,6 +248,7 @@ class VideoQueueRunner:
     def _sync_videos(self, videos: list[Path]) -> None:
         with self.state_lock:
             known = self.state["videos"]
+            self.active_video_keys = {str(video.resolve()) for video in videos}
             for video in videos:
                 key = str(video.resolve())
                 working_dir, output_dir = self._video_dirs(video)
@@ -307,9 +338,11 @@ class VideoQueueRunner:
             stage_state["status"] = "running"
             stage_state["started_at"] = self._now_iso()
             stage_state["last_error"] = None
+            if job.stage == EDIT_STAGE:
+                self._reset_clip_progress_locked(stage_state)
             entry["status"] = "running"
             entry["current_stage"] = job.stage
-            if job.stage == EDIT_STAGE:
+            if job.stage in {"yolo", EDIT_STAGE}:
                 self._schedule_locked(f"{job.stage}-start")
             self._save_state_locked()
 
@@ -432,6 +465,7 @@ class VideoQueueRunner:
 
         chunks = build_text_chunks(transcript, self.cfg.CHUNK_DURATION, self.cfg.CHUNK_OVERLAP)
         detect_moments(chunks, str(working_dir), self.cfg)
+        write_stage_fingerprint(working_dir / "moments.json", video_path, self.cfg, "llm")
 
     def _stage_yolo(self, video_path: str) -> None:
         from vision_scanner import build_scan_ranges_from_moments, scan_video_for_products
@@ -450,6 +484,13 @@ class VideoQueueRunner:
             str(working_dir),
             self.cfg,
             scan_ranges=scan_ranges,
+        )
+        write_stage_fingerprint(
+            working_dir / "product_detections.json",
+            video_path,
+            self.cfg,
+            "yolo",
+            extra={"scan_ranges": scan_ranges},
         )
 
     def _stage_ffmpeg(self, video_path: str) -> None:
@@ -474,6 +515,13 @@ class VideoQueueRunner:
                 cut_only=False,
                 output_tag=self.output_tag,
                 working_tag=self.working_tag,
+                progress_callback=lambda stage, pct, message, **payload: self._handle_ffmpeg_progress(
+                    video_path,
+                    stage,
+                    pct,
+                    message,
+                    **payload,
+                ),
             )
         finally:
             if self.ffmpeg_max_parallel_clips is not None and original_max_parallel_clips is not None:
@@ -482,6 +530,54 @@ class VideoQueueRunner:
                 os.environ.pop("PROYA_QUEUE_FFMPEG_BELOW_NORMAL", None)
             else:
                 os.environ["PROYA_QUEUE_FFMPEG_BELOW_NORMAL"] = original_ffmpeg_priority_flag
+
+    def _handle_ffmpeg_progress(self, video_path: str, stage: str, pct: int, message: str, **payload) -> None:
+        with self.state_lock:
+            entry = self.state["videos"].get(video_path)
+            if entry is None:
+                return
+
+            stage_state = entry["stages"].setdefault(EDIT_STAGE, self._new_stage_entry())
+            stage_state["progress_pct"] = self._coerce_nonnegative_int(pct)
+            stage_state["message"] = message
+            stage_state["last_progress_at"] = self._now_iso()
+
+            for field in (
+                "clips_total",
+                "clips_completed",
+                "clips_created",
+                "clips_failed",
+                "clips_skipped",
+            ):
+                if field in payload:
+                    stage_state[field] = self._coerce_nonnegative_int(payload.get(field))
+
+            if payload.get("clip_id"):
+                stage_state["last_clip_id"] = str(payload["clip_id"])
+            if payload.get("clip_status"):
+                stage_state["last_clip_status"] = str(payload["clip_status"])
+            if payload.get("event"):
+                stage_state["last_event"] = str(payload["event"])
+            if payload.get("output_dir"):
+                entry["output_dir"] = str(payload["output_dir"])
+
+            if entry.get("status") not in TERMINAL_VIDEO_STATUSES:
+                entry["status"] = "running"
+                entry["current_stage"] = EDIT_STAGE
+
+            self._save_state_locked()
+
+    def _reset_clip_progress_locked(self, stage_state: dict) -> None:
+        for key, value in CLIP_PROGRESS_DEFAULTS.items():
+            stage_state[key] = value
+        stage_state["last_event"] = None
+
+    @staticmethod
+    def _coerce_nonnegative_int(value) -> int:
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
 
     def _run_stage_subprocess(self, stage: str, video_path: str) -> None:
         cmd = [
@@ -534,7 +630,7 @@ class VideoQueueRunner:
         }
 
     def _new_stage_entry(self) -> dict:
-        return {
+        stage_entry = {
             "status": "pending",
             "attempts": 0,
             "started_at": None,
@@ -543,6 +639,8 @@ class VideoQueueRunner:
             "last_error": None,
             "queued": False,
         }
+        stage_entry.update(CLIP_PROGRESS_DEFAULTS)
+        return stage_entry
 
     def _ensure_stage_shapes(self, entry: dict) -> None:
         entry.setdefault("run_history", [])
@@ -558,6 +656,8 @@ class VideoQueueRunner:
                 stages[stage].setdefault("duration_sec", None)
                 stages[stage].setdefault("last_error", None)
                 stages[stage].setdefault("queued", False)
+                for key, value in CLIP_PROGRESS_DEFAULTS.items():
+                    stages[stage].setdefault(key, value)
 
     def _reset_entry_for_new_run(self, entry: dict) -> None:
         self._archive_current_run(entry)
@@ -613,7 +713,7 @@ class VideoQueueRunner:
         for stage, path in cache_checks.items():
             stage_state = stages[stage]
             stage_state["queued"] = False
-            if path.exists():
+            if self._stage_output_current(entry, stage, path):
                 stage_state["status"] = "done"
                 stage_state["finished_at"] = stage_state.get("finished_at") or self._now_iso()
                 continue
@@ -634,6 +734,78 @@ class VideoQueueRunner:
         elif entry.get("status") not in TERMINAL_VIDEO_STATUSES:
             entry["status"] = "queued"
 
+    def _stage_output_current(self, entry: dict, stage: str, path: Path) -> bool:
+        video_path = entry.get("path") or entry.get("video_path")
+        if not video_path or not path.exists():
+            return False
+        try:
+            if stage == "transcribe":
+                from transcriber import load_cached_transcript, transcript_cache_is_compatible
+
+                transcript = load_cached_transcript(str(path.parent))
+                return bool(
+                    transcript
+                    and transcript_cache_is_compatible(transcript, self.cfg)
+                    and stage_fingerprint_matches(path, video_path, self.cfg, "transcribe")
+                )
+            if stage == "llm":
+                from moment_detector import _cached_moments_are_current
+
+                with open(path, "r", encoding="utf-8") as f:
+                    moments = json.load(f)
+                return bool(
+                    _cached_moments_are_current(moments)
+                    and stage_fingerprint_matches(path, video_path, self.cfg, "llm")
+                )
+            if stage == "yolo":
+                from vision_scanner import (
+                    _is_valid_cached_events,
+                    _vision_cache_fingerprint_matches,
+                    build_scan_ranges_from_moments,
+                )
+
+                with open(path, "r", encoding="utf-8") as f:
+                    events = json.load(f)
+                if not _is_valid_cached_events(events):
+                    return False
+                moments_path = Path(entry["working_dir"]) / "moments.json"
+                if not moments_path.exists():
+                    return False
+                with open(moments_path, "r", encoding="utf-8") as f:
+                    moments = json.load(f)
+                scan_ranges = build_scan_ranges_from_moments(moments, self.cfg)
+                return bool(
+                    _vision_cache_fingerprint_matches(path, video_path, self.cfg, scan_ranges)
+                    and stage_fingerprint_matches(
+                        path,
+                        video_path,
+                        self.cfg,
+                        "yolo",
+                        extra={"scan_ranges": scan_ranges},
+                    )
+                )
+            if stage == "ffmpeg":
+                with open(path, "r", encoding="utf-8") as f:
+                    manifest = json.load(f)
+                valid_manifest = isinstance(manifest, list) or (
+                    isinstance(manifest, dict)
+                    and isinstance(manifest.get("clips") or manifest.get("items"), list)
+                )
+                return bool(
+                    valid_manifest
+                    and stage_fingerprint_matches(
+                        path,
+                        video_path,
+                        self.cfg,
+                        "ffmpeg",
+                        extra={"max_clips": None, "cut_only": False},
+                    )
+                )
+        except Exception as exc:
+            log.warning(f"Ignoring invalid {stage} cache for {Path(video_path).name}: {exc}")
+            return False
+        return False
+
     def _next_stage_locked(self, entry: dict) -> Optional[str]:
         for stage in STAGES:
             if entry["stages"][stage]["status"] != "done":
@@ -641,14 +813,19 @@ class VideoQueueRunner:
         return None
 
     def _schedule_locked(self, reason: str) -> None:
+        active_video_keys = self._active_video_keys_locked()
         ordered_items = sorted(
-            self.state["videos"].items(),
+            (
+                (video_path, entry)
+                for video_path, entry in self.state["videos"].items()
+                if video_path in active_video_keys
+            ),
             key=lambda item: (self._stage_priority_for_video(item[1]), item[1]["name"]),
         )
 
-        # First advance anything that has already entered the pipeline. When a
-        # video reaches FFmpeg it moves to the edit backlog and no longer holds
-        # an analysis slot, so the next source video can start immediately.
+        # First advance anything that has already entered the pipeline. Once a
+        # video moves beyond the GPU stages, it no longer holds an analysis
+        # slot, so YOLO/FFmpeg can run while the next source video transcribes.
         for video_path, entry in ordered_items:
             if entry["status"] in TERMINAL_VIDEO_STATUSES:
                 continue
@@ -660,15 +837,18 @@ class VideoQueueRunner:
 
         active_analysis = sum(
             1
-            for entry in self.state["videos"].values()
-            if entry["status"] not in TERMINAL_VIDEO_STATUSES and self._video_is_active_analysis(entry)
+            for video_path, entry in self.state["videos"].items()
+            if video_path in active_video_keys
+            and entry["status"] not in TERMINAL_VIDEO_STATUSES
+            and self._video_is_active_analysis(entry)
         )
 
         if active_analysis >= self.max_active_analysis_videos:
             return
 
-        # Backfill the analysis lane with fresh videos only. Edit queued/running
-        # videos are deliberately ignored here because FFmpeg has its own worker.
+        # Backfill the GPU analysis lane with fresh videos only. YOLO and
+        # FFmpeg queued/running videos are deliberately ignored here because
+        # they have their own workers.
         for video_path, entry in ordered_items:
             if active_analysis >= self.max_active_analysis_videos:
                 break
@@ -689,15 +869,11 @@ class VideoQueueRunner:
         return False
 
     def _video_is_active_analysis(self, entry: dict) -> bool:
-        if self._video_has_reached_editing(entry):
-            return False
-        for stage in PRE_EDIT_STAGES:
-            if self._stage_has_progress(entry["stages"][stage]):
+        for stage in GPU_ANALYSIS_STAGES:
+            stage_state = entry["stages"][stage]
+            if stage_state.get("status") != "done" and self._stage_has_progress(stage_state):
                 return True
         return False
-
-    def _video_has_reached_editing(self, entry: dict) -> bool:
-        return self._stage_has_progress(entry["stages"][EDIT_STAGE])
 
     @staticmethod
     def _stage_has_progress(stage_state: dict) -> bool:
@@ -757,9 +933,19 @@ class VideoQueueRunner:
         raise ValueError(f"Unknown stage: {stage}")
 
     def _all_videos_terminal_locked(self) -> bool:
-        if not self.state["videos"]:
+        active_video_keys = self._active_video_keys_locked()
+        if not active_video_keys:
             return True
-        return all(entry["status"] in TERMINAL_VIDEO_STATUSES for entry in self.state["videos"].values())
+        return all(
+            self.state["videos"][video_path]["status"] in TERMINAL_VIDEO_STATUSES
+            for video_path in active_video_keys
+            if video_path in self.state["videos"]
+        )
+
+    def _active_video_keys_locked(self) -> set[str]:
+        if self.active_video_keys:
+            return set(self.active_video_keys)
+        return set(self.state.get("videos", {}).keys())
 
     def _make_queue_payload(self, queue_name: str, job: Optional[StageJob]):
         self.job_counter += 1
@@ -812,8 +998,9 @@ def main() -> int:
         type=int,
         default=1,
         help=(
-            "How many videos may be active in transcription/LLM/YOLO at once. "
-            "FFmpeg editing has its own queue and does not block new analysis."
+            "How many videos may be active in GPU analysis stages "
+            "(transcription/LLM) at once. YOLO and FFmpeg have their own queues "
+            "and do not block new analysis."
         ),
     )
     parser.add_argument("--poll-interval", type=float, default=2.0, help="Monitor loop interval in seconds")
@@ -874,8 +1061,10 @@ def _run_stage_once(
         from transcriber import transcribe
 
         if _reuse_base_transcript_for_tagged_run(video_path, working_dir, working_tag, cfg):
+            write_stage_fingerprint(working_dir / "transcript.json", video_path, cfg, "transcribe")
             return
         transcribe(video_path, str(working_dir), cfg)
+        write_stage_fingerprint(working_dir / "transcript.json", video_path, cfg, "transcribe")
         return
     if stage == "llm":
         from moment_detector import detect_moments
@@ -886,6 +1075,7 @@ def _run_stage_once(
             raise RuntimeError("Transcript cache missing or outdated before LLM stage")
         chunks = build_text_chunks(transcript, cfg.CHUNK_DURATION, cfg.CHUNK_OVERLAP)
         detect_moments(chunks, str(working_dir), cfg)
+        write_stage_fingerprint(working_dir / "moments.json", video_path, cfg, "llm")
         return
     if stage == "yolo":
         from vision_scanner import build_scan_ranges_from_moments, scan_video_for_products
@@ -897,6 +1087,13 @@ def _run_stage_once(
             moments = json.load(f)
         scan_ranges = build_scan_ranges_from_moments(moments, cfg)
         scan_video_for_products(video_path, str(working_dir), cfg, scan_ranges=scan_ranges)
+        write_stage_fingerprint(
+            working_dir / "product_detections.json",
+            video_path,
+            cfg,
+            "yolo",
+            extra={"scan_ranges": scan_ranges},
+        )
         return
     if stage == "ffmpeg":
         from main import run_pipeline
@@ -927,33 +1124,93 @@ def _reuse_base_transcript_for_tagged_run(
     from transcriber import load_cached_transcript, transcript_cache_is_compatible
 
     stem = Path(video_path).stem
-    base_working_dir = Path(cfg.WORKING_DIR) / _build_versioned_stem(stem, None)
-    if base_working_dir.resolve() == tagged_working_dir.resolve():
-        return False
-
     tagged_transcript = load_cached_transcript(str(tagged_working_dir))
     if tagged_transcript is not None and transcript_cache_is_compatible(tagged_transcript, cfg):
         log.info(f"Loading cached transcript from {tagged_working_dir / 'transcript.json'}")
         return True
 
-    base_transcript_path = base_working_dir / "transcript.json"
-    base_transcript = load_cached_transcript(str(base_working_dir))
-    if base_transcript is None:
-        return False
-    if not transcript_cache_is_compatible(base_transcript, cfg):
+    for source_working_dir in _iter_transcript_reuse_candidates(stem, tagged_working_dir, cfg):
+        source_transcript_path = source_working_dir / "transcript.json"
+        source_transcript = load_cached_transcript(str(source_working_dir))
+        if source_transcript is None:
+            continue
+        if not transcript_cache_is_compatible(source_transcript, cfg):
+            log.info(
+                "Prior transcript exists but is older, raw, or invalid; "
+                f"redo cannot reuse it: {source_transcript_path}"
+            )
+            continue
+        if not _transcript_source_matches_video(source_transcript, video_path):
+            log.info(f"Prior transcript belongs to a different source video; skipping: {source_transcript_path}")
+            continue
+
+        tagged_working_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_transcript_path, tagged_working_dir / "transcript.json")
+
+        source_raw_checkpoint = source_working_dir / "transcript.raw_checkpoint.json"
+        if source_raw_checkpoint.exists():
+            shutil.copy2(source_raw_checkpoint, tagged_working_dir / "transcript.raw_checkpoint.json")
+
         log.info(
-            "Base transcript exists but is older, raw, or invalid; "
-            f"redo will transcribe again: {base_transcript_path}"
+            "Reusing compatible aligned transcript from prior run for redo: "
+            f"{source_transcript_path} -> {tagged_working_dir / 'transcript.json'}"
         )
+        return True
+
+    return False
+
+
+def _iter_transcript_reuse_candidates(stem: str, tagged_working_dir: Path, cfg) -> list[Path]:
+    working_root = Path(cfg.WORKING_DIR)
+    base_working_dir = working_root / _build_versioned_stem(stem, None)
+    tagged_resolved = _safe_resolve(tagged_working_dir)
+    candidates: list[Path] = []
+
+    if _safe_resolve(base_working_dir) != tagged_resolved:
+        candidates.append(base_working_dir)
+
+    prefix = f"{stem}__"
+    try:
+        siblings = [
+            path for path in working_root.iterdir()
+            if path.is_dir()
+            and path.name.startswith(prefix)
+            and _safe_resolve(path) != tagged_resolved
+            and path not in candidates
+        ]
+    except FileNotFoundError:
+        siblings = []
+
+    candidates.extend(siblings)
+    candidates.sort(key=_transcript_candidate_mtime, reverse=True)
+    return candidates
+
+
+def _transcript_source_matches_video(transcript: dict, video_path: str) -> bool:
+    source_video_path = transcript.get("metadata", {}).get("source_video_path")
+    if not source_video_path:
+        return True
+    try:
+        return str(Path(source_video_path).resolve()).casefold() == str(Path(video_path).resolve()).casefold()
+    except Exception:
         return False
 
-    tagged_working_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(base_transcript_path, tagged_working_dir / "transcript.json")
-    log.info(
-        "Reusing compatible aligned transcript from first run for redo: "
-        f"{base_transcript_path} -> {tagged_working_dir / 'transcript.json'}"
-    )
-    return True
+
+def _safe_resolve(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except Exception:
+        return path
+
+
+def _transcript_candidate_mtime(path: Path) -> float:
+    transcript_path = path / "transcript.json"
+    try:
+        if transcript_path.exists():
+            return transcript_path.stat().st_mtime
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
 
 
 if __name__ == "__main__":

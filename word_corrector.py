@@ -18,6 +18,7 @@ import logging
 import re
 
 log = logging.getLogger("proya.corrector")
+_PATTERN_CACHE = {}
 
 
 def build_correction_patterns(corrections: dict) -> list[tuple]:
@@ -38,6 +39,17 @@ def build_correction_patterns(corrections: dict) -> list[tuple]:
         patterns.append((pattern, right))
 
     log.debug(f"Built {len(patterns)} correction patterns")
+    return patterns
+
+
+def get_correction_patterns(corrections: dict) -> list[tuple]:
+    key = tuple(sorted((str(k), str(v)) for k, v in (corrections or {}).items()))
+    cached = _PATTERN_CACHE.get(key)
+    if cached is not None:
+        return cached
+    patterns = build_correction_patterns(corrections)
+    _PATTERN_CACHE.clear()
+    _PATTERN_CACHE[key] = patterns
     return patterns
 
 
@@ -73,7 +85,7 @@ def apply_corrections_to_transcript(transcript: dict, cfg) -> dict:
         log.info("No word corrections configured — skipping")
         return transcript
 
-    patterns = build_correction_patterns(corrections)
+    patterns = get_correction_patterns(corrections)
     
     segments_fixed = 0
     words_fixed = 0
@@ -136,7 +148,7 @@ def preview_corrections(transcript: dict, cfg, max_examples: int = 20) -> list[d
     if not corrections:
         return []
 
-    patterns = build_correction_patterns(corrections)
+    patterns = get_correction_patterns(corrections)
     examples = []
 
     for seg in transcript.get("segments", []):
@@ -165,7 +177,7 @@ def apply_corrections_to_subtitle_words(words: list, cfg) -> list:
     if not corrections:
         return words
 
-    patterns = build_correction_patterns(corrections)
+    patterns = get_correction_patterns(corrections)
     result = []
     for w in words:
         fixed = dict(w)

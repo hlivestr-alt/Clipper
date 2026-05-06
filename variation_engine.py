@@ -25,10 +25,9 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 import logging
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 log = logging.getLogger("proya.variation")
@@ -184,6 +183,76 @@ def apply_variant_to_cfg(base_cfg, variant: VariantConfig):
 #  VARIANT GENERATION
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _draw_style_pairs(
+    count: int,
+    rng: random.Random,
+) -> list[tuple[tuple[Any, ...], tuple[Any, ...]]]:
+    """
+    Draw subtitle/hook style pairs without repeating visible identities first.
+
+    The common six-variant setup needs five mutated versions. There are enough
+    subtitle palettes and hook palettes to make those all visibly distinct, so
+    do not let random choice burn render time on duplicate identities.
+    """
+    if count <= 0:
+        return []
+    if not SUBTITLE_PALETTES:
+        raise ValueError("SUBTITLE_PALETTES must contain at least one palette")
+    if not HOOK_PALETTES:
+        raise ValueError("HOOK_PALETTES must contain at least one palette")
+
+    pairs = []
+    seen = set()
+    round_index = 0
+    max_unique = len(SUBTITLE_PALETTES) * len(HOOK_PALETTES)
+    warned_reuse = False
+
+    while len(pairs) < count:
+        if len(seen) >= max_unique:
+            if not warned_reuse:
+                log.warning(
+                    "Requested %s mutated variants but only %s unique "
+                    "subtitle/hook identities exist; reusing identities after "
+                    "the full style matrix is exhausted.",
+                    count,
+                    max_unique,
+                )
+                warned_reuse = True
+            seen.clear()
+            round_index = 0
+
+        subtitle_order = list(SUBTITLE_PALETTES)
+        hook_order = list(HOOK_PALETTES)
+        rng.shuffle(subtitle_order)
+        rng.shuffle(hook_order)
+
+        made_progress = False
+        for subtitle_pos, subtitle in enumerate(subtitle_order):
+            if len(pairs) >= count:
+                break
+
+            for hook_offset in range(len(hook_order)):
+                hook = hook_order[
+                    (subtitle_pos + round_index + hook_offset) % len(hook_order)
+                ]
+                style_key = (subtitle[0], hook[0])
+                if style_key in seen:
+                    continue
+
+                pairs.append((subtitle, hook))
+                seen.add(style_key)
+                made_progress = True
+                break
+
+        if not made_progress:
+            seen.clear()
+            round_index = 0
+        else:
+            round_index += 1
+
+    return pairs
+
+
 def generate_variants(base_cfg, n_variants: int, seed: int | None = None) -> list[VariantConfig]:
     """
     Generate `n_variants` VariantConfig objects.
@@ -202,6 +271,7 @@ def generate_variants(base_cfg, n_variants: int, seed: int | None = None) -> lis
     """
     rng = random.Random(seed)
     variants = []
+    style_pairs = _draw_style_pairs(max(0, n_variants - 1), rng)
 
     hook_dur_base = getattr(base_cfg, "HOOK_DURATION", 0.0)
 
@@ -219,11 +289,12 @@ def generate_variants(base_cfg, n_variants: int, seed: int | None = None) -> lis
                 hook_duration=hook_dur_base,
             )
         else:
-            palette_name, font, active_color, inactive_op, stroke_c, stroke_w = rng.choice(SUBTITLE_PALETTES)
-            hook_name, hook_col, hook_stroke_c, hook_stroke_w, hook_fs_mult = rng.choice(HOOK_PALETTES)
+            subtitle_palette, hook_palette = style_pairs[i - 1]
+            palette_name, font, active_color, inactive_op, stroke_c, stroke_w = subtitle_palette
+            hook_name, hook_col, hook_stroke_c, hook_stroke_w, hook_fs_mult = hook_palette
 
             vc = VariantConfig(
-                variant_id=f"v{i}_{palette_name}",
+                variant_id=f"v{i}_{palette_name}_{hook_name}",
                 variant_index=i,
                 mirror=rng.random() < 0.30,                      # 30% chance flip
                 font_subtitle=font,
@@ -366,6 +437,35 @@ def build_ffmpeg_atempo(speed: float) -> list[str]:
     return ["-af", f"atempo={round(speed, 4)}"]
 
 
+def _probe_video_dimensions(input_video: str) -> tuple[int, int]:
+    import json
+    import subprocess
+
+    try:
+        r = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "json",
+                input_video,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if r.returncode == 0:
+            payload = json.loads(r.stdout or "{}")
+            stream = (payload.get("streams") or [{}])[0]
+            width = int(stream.get("width") or 0)
+            height = int(stream.get("height") or 0)
+            if width > 0 and height > 0:
+                return width, height
+    except Exception as exc:
+        log.warning(f"Could not probe source dimensions for variant cut: {exc}")
+    return 1080, 1920
+
+
 def cut_raw_clip_with_variant(
     input_video: str,
     start: float,
@@ -407,7 +507,8 @@ def cut_raw_clip_with_variant(
 
     # Variant filters
     if variant is not None:
-        vf = build_ffmpeg_vf_chain(variant, frame_w=1080, frame_h=1920)
+        frame_w, frame_h = _probe_video_dimensions(input_video)
+        vf = build_ffmpeg_vf_chain(variant, frame_w=frame_w, frame_h=frame_h)
         if vf:
             cmd += ["-vf", vf]
         af = build_ffmpeg_atempo(getattr(variant, "speed_ramp", 1.0))
@@ -436,37 +537,6 @@ def cut_raw_clip_with_variant(
 # ─────────────────────────────────────────────────────────────────────────────
 #  THROUGHPUT MATH HELPER
 # ─────────────────────────────────────────────────────────────────────────────
-
-def estimate_throughput(
-    livestream_duration_hours: float,
-    avg_clip_duration_s: float = 20.0,
-    avg_edit_time_s: float = 8.0,
-    n_variants: int = 6,
-    parallel_workers: int = 4,
-) -> dict:
-    """
-    Estimate how many clips can be produced in 24 hours.
-
-    Returns dict with key metrics.
-    """
-    total_seconds = 24 * 3600
-    moments_per_hour = 60  # conservative LLM detection estimate
-    base_moments = int(livestream_duration_hours * moments_per_hour)
-    total_clips = base_moments * n_variants
-
-    # Time to edit all clips with N parallel workers
-    total_edit_time = (total_clips * avg_edit_time_s) / parallel_workers
-    clips_per_24h = int((total_seconds / avg_edit_time_s) * parallel_workers)
-
-    return {
-        "base_moments_detected": base_moments,
-        "variants_per_clip": n_variants,
-        "total_clips_to_render": total_clips,
-        "estimated_edit_time_hours": round(total_edit_time / 3600, 1),
-        "clips_per_24h_at_current_settings": clips_per_24h,
-        "bottleneck": "editing" if total_edit_time > total_seconds else "moment_detection",
-    }
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  CONFIG ADDITIONS (paste these into config.py)

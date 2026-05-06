@@ -9,6 +9,7 @@ import logging
 import re
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from hook_text import build_hook_payload
@@ -18,122 +19,13 @@ log = logging.getLogger("proya.moment_detector")
 MOMENT_DETECTOR_VERSION = "quality_v2"
 
 # ── System prompt (Bahasa Indonesia + English fallback) ──────────────────────
-SYSTEM_PROMPT = """Kamu adalah editor video TikTok profesional untuk brand skincare PROYA 5X Vitamin C.
 
-TUJUAN UTAMA:
-Pilih momen yang PALING KUAT dalam menjelaskan MANFAAT PRODUK (product benefits).
-Fokus utama adalah membuat clip yang membuat orang ingin membeli karena hasil/manfaatnya jelas.
-
-PRIORITAS WAJIB (HARUS DIPATUHI):
-1. Setiap clip HARUS mengandung penjelasan manfaat produk yang jelas.
-2. Jika tidak ada manfaat produk → JANGAN dipilih, walaupun lucu atau menarik.
-3. Utamakan kalimat yang:
-   - Menjelaskan hasil (kulit jadi apa)
-   - Menjelaskan perubahan (sebelum vs sesudah)
-   - Menjelaskan efek nyata (cerah, glowing, jerawat berkurang, dll)
-
-FILTER KERAS (WAJIB):
-- Clip WAJIB mengandung minimal 1 "attention_benefits"
-- Clip tanpa manfaat langsung → SKIP
-- Promo TANPA manfaat → SKIP
-- Humor TANPA manfaat → SKIP
-- QnA TANPA manfaat → SKIP
-- Welcome orang join live → SKIP
-
-PRIORITAS SKOR (RE-WEIGHTED):
-- Penjelasan manfaat produk jelas → 10 (WAJIB ADA)
-- Demo + menjelaskan manfaat → 9-10
-- Testimoni / hasil nyata → 9-10
-- Before-after / perubahan → 9-10
-- Penjelasan Vitamin C + efek ke kulit → 8-9
-
-SECONDARY (hanya jika ada benefit):
-- Promo + manfaat → 8-9
-- QnA + manfaat → 7-8
-- Tips + manfaat → 7-8
-
-PENALTI:
-- Tidak fokus ke produk → -3
-- Tidak ada hasil/manfaat jelas → -5 (AUTO REJECT)
-- Terlalu umum / tidak spesifik → -2
-
-DEFINISI "MANFAAT PRODUK" (WAJIB PAHAM):
-Manfaat = hasil POSITIF yang dirasakan user setelah pakai produk
-
-Contoh VALID:
-- "bikin kulit glowing"
-- "jerawat cepat kering"
-- "kulit jadi cerah dalam 3 hari"
-- "pori-pori terlihat lebih kecil"
-- "kulit jadi lembap dan halus"
-
-Contoh TIDAK VALID:
-- "ini bagus banget"
-- "produk ini viral"
-- "lagi promo"
-
-STRATEGI PEMILIHAN:
-- Cari kalimat yang mengandung PERUBAHAN (before → after)
-- Cari kata kerja hasil: bikin, membuat, membantu, menghilangkan, meredakan
-- Cari klaim hasil nyata / cepat
-
-OUTPUT RULE TAMBAHAN:
-- Pastikan 80%+ clip yang dipilih adalah "attention_benefits"
-- Jika dalam 1 chunk tidak ada benefit kuat → return []
-
-KATEGORI KEYWORD — untuk setiap momen, identifikasi kata kunci dominan dari 3 kategori.
-
-PENTING: Kategorisasi berdasarkan KONTEKS kalimat, bukan hanya kata itu sendiri.
-- "jerawat" dalam "meredakan jerawat" atau "ampuh untuk jerawat" = attention_benefits (manfaat)
-- "jerawat" dalam "kulit berjerawat parah" atau "masalah jerawat saya" = pain_problem
-- "kusam" dalam "bikin kusam hilang" = attention_benefits
-- "kusam" dalam "kulit saya kusam banget" = pain_problem
-- Selalu baca frasa lengkap sebelum dan sesudah kata kunci sebelum mengkategorikan.
-
-1. "attention_benefits" — manfaat produk, hasil positif, atau masalah yang SUDAH diatasi:
-   Contoh: cerah, glowing, putih, bersih, vitamin C, antioksidan, terbaik, rekomendasi,
-           meredakan jerawat, menghilangkan flek, kulit lembap, tidak kusam lagi
-
-2. "result_proof" — klaim kecepatan, bukti nyata, atau perbandingan sebelum/sesudah:
-   Contoh: 3 hari, 7 hari, langsung, instan, terbukti, hasil nyata, sebelum sesudah, efektif,
-           sudah terbukti, bisa dilihat, nyata hasilnya
-
-3. "pain_problem" — masalah kulit yang BELUM diatasi, kondisi negatif yang sedang dialami:
-   Contoh: kulit berjerawat, masalah flek, kulit kusam banget, pori-pori besar,
-           kering parah, berminyak terus, kulit tidak merata
-
-FORMAT OUTPUT:
-Kembalikan HANYA JSON array yang valid. Tidak ada teks lain, tidak ada markdown, tidak ada penjelasan.
-Format setiap objek:
-{
-  "start": <float, detik dari awal video — awal segmen PERTAMA>,
-  "end": <float, detik dari awal video — akhir segmen TERAKHIR>,
-  "segments": [
-    {"start": <float>, "end": <float>, "description": "<isi segmen singkat>"},
-    {"start": <float>, "end": <float>, "description": "<isi segmen singkat>"}
-  ],
-  "score": <float 1-10>,
-  "hook": "<headline besar untuk top text TikTok, fokus hasil/perubahan, max 8 kata, dalam Bahasa Indonesia>",
-  "reason": "<alasan singkat dalam Bahasa Indonesia>",
-  "product": "<nama produk jika disebutkan, atau 'general' jika tidak spesifik>",
-  "clip_type": "<demo|testimoni|tips|promo|qna|humor>",
-  "keyword_category": "<attention_benefits|result_proof|pain_problem>",
-  "keywords_found": [{"word": "<kata kunci>", "category": "<attention_benefits|result_proof|pain_problem>", "context": "<frasa 3-5 kata sekitar kata kunci>"}]
-}
-
-PENTING:
-- Minimum durasi clip: 20 detik
-- Maksimum durasi clip: 60 detik
-- Hanya sertakan momen dengan skor >= 6
-- Boleh ada beberapa momen yang tumpang tindih jika berbeda konteksnya
-- Jika tidak ada momen bagus di chunk ini, kembalikan array kosong: []
-- keyword_category: pilih kategori yang PALING dominan di momen tersebut
-"""
 
 # Quality-first prompt override. The original prompt above was benefit-heavy,
 # but it still allowed weak timestamps and generic moments through. This version
 # explicitly targets product-selling clips and rejects dead air/repetition.
-SYSTEM_PROMPT = """Kamu adalah editor TikTok direct-response untuk livestream skincare PROYA 5X Vitamin C.
+SYSTEM_PROMPT = """
+Kamu adalah editor TikTok direct-response untuk livestream skincare PROYA 5X Vitamin C.
 
 TUJUAN:
 Pilih sedikit clip yang benar-benar layak jual. Lebih baik return [] daripada memilih clip yang random, sepi, atau host hanya mengulang kata.
@@ -157,7 +49,7 @@ ATURAN TIMESTAMP:
 - Gunakan timestamp dari transkrip yang diberikan. Jangan menebak timestamp.
 - Start harus di awal kalimat relevan pertama.
 - End harus di akhir kalimat relevan terakhir.
-- Pilih rentang natural 15-45 detik. Jangan membuat clip 8-10 detik kecuali sangat kuat.
+- Pilih rentang natural 25-60 detik. Jangan membuat clip 8-10 detik kecuali sangat kuat.
 - Jika momen bagus terlalu pendek, gabungkan dengan kalimat relevan berikutnya, bukan dengan silence.
 
 SKOR:
@@ -191,7 +83,8 @@ Format setiap objek:
   ]
 }
 
-Jika tidak ada clip yang memenuhi filter keras di chunk ini, return [].
+Jika ada clip yang MUNGKIN bagus tapi kamu tidak yakin, tetap masukkan dengan score 7.
+Hanya return [] jika chunk ini benar-benar tidak ada konten produk/benefit/promo sama sekali.
 """
 
 
@@ -650,8 +543,12 @@ def detect_moments(chunks: list, working_dir: str, cfg) -> list:
     moments_path = Path(working_dir) / "moments.json"
 
     if moments_path.exists():
-        with open(moments_path, "r", encoding="utf-8") as f:
-            cached_moments = json.load(f)
+        try:
+            with open(moments_path, "r", encoding="utf-8") as f:
+                cached_moments = json.load(f)
+        except Exception as exc:
+            log.warning(f"Ignoring unreadable moments cache {moments_path}: {exc}")
+            cached_moments = None
         if _cached_moments_are_current(cached_moments):
             log.info(f"Loading cached moments from {moments_path}")
             return cached_moments
@@ -673,14 +570,12 @@ def detect_moments(chunks: list, working_dir: str, cfg) -> list:
 
     log.info(f"Connected to LM Studio at {cfg.LM_STUDIO_BASE_URL}")
     log.info(f"Model: {cfg.LM_STUDIO_MODEL}")
-    log.info(f"Processing {len(chunks)} transcript chunks...")
+    max_workers = max(1, int(getattr(cfg, "MOMENT_DETECTOR_WORKERS", 1) or 1))
+    max_workers = min(max_workers, max(1, len(chunks)))
+    log.info(f"Processing {len(chunks)} transcript chunks with {max_workers} worker(s)...")
 
-    all_moments = []
-    failed_chunks = 0
-
-    for i, chunk in enumerate(chunks):
-        log.info(f"  Chunk {i+1}/{len(chunks)} | t={chunk['chunk_start']:.0f}s–{chunk['chunk_end']:.0f}s")
-
+    def process_chunk(i: int, chunk: dict) -> tuple[int, list]:
+        log.info(f"  Chunk {i+1}/{len(chunks)} | t={chunk['chunk_start']:.0f}s-{chunk['chunk_end']:.0f}s")
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {
@@ -694,27 +589,54 @@ def detect_moments(chunks: list, working_dir: str, cfg) -> list:
             },
         ]
 
-        try:
-            raw = _call_lm_studio(client, messages, cfg)
-            raw_moments = _parse_moments_json(raw)
+        raw = _call_lm_studio(client, messages, cfg)
+        raw_moments = _parse_moments_json(raw)
+        valid_moments = []
+        for m in raw_moments:
+            validated = _validate_moment(m, chunk, cfg)
+            if validated:
+                valid_moments.append(validated)
 
-            valid = 0
-            for m in raw_moments:
-                validated = _validate_moment(m, chunk, cfg)
-                if validated:
-                    all_moments.append(validated)
-                    valid += 1
+        log.info(f"    Chunk {i+1}: {len(raw_moments)} detected, {len(valid_moments)} valid (score>={cfg.MIN_SCORE})")
+        return i, valid_moments
 
-            log.info(f"    → {len(raw_moments)} detected, {valid} valid (score≥{cfg.MIN_SCORE})")
+    failed_chunks = 0
+    chunk_results = {}
 
-        except Exception as e:
-            log.error(f"    ✗ LM Studio error on chunk {i+1}: {e}")
-            failed_chunks += 1
-            if failed_chunks > 5:
-                log.error("Too many LM Studio failures. Check that LM Studio is running and a model is loaded.")
-                raise
-            time.sleep(3)
-            continue
+    if max_workers == 1:
+        for i, chunk in enumerate(chunks):
+            try:
+                result_index, valid_moments = process_chunk(i, chunk)
+                chunk_results[result_index] = valid_moments
+            except Exception as e:
+                log.error(f"    LM Studio error on chunk {i+1}: {e}")
+                failed_chunks += 1
+                if failed_chunks > 5:
+                    log.error("Too many LM Studio failures. Check that LM Studio is running and a model is loaded.")
+                    raise
+                time.sleep(3)
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(process_chunk, i, chunk): i
+                for i, chunk in enumerate(chunks)
+            }
+            for future in as_completed(future_map):
+                i = future_map[future]
+                try:
+                    result_index, valid_moments = future.result()
+                    chunk_results[result_index] = valid_moments
+                except Exception as e:
+                    log.error(f"    LM Studio error on chunk {i+1}: {e}")
+                    failed_chunks += 1
+                    if failed_chunks > 5:
+                        log.error("Too many LM Studio failures. Check that LM Studio is running and a model is loaded.")
+                        raise
+                    time.sleep(3)
+
+    all_moments = []
+    for i in sorted(chunk_results):
+        all_moments.extend(chunk_results[i])
 
     # ── Deduplicate overlapping moments ──────────────────────────────────────
     all_moments = _deduplicate_moments(all_moments)

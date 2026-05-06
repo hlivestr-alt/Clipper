@@ -6,13 +6,13 @@
 
 import json
 import logging
-import os
 from pathlib import Path
 
 import cv2
 
 log = logging.getLogger("proya.vision")
 VISION_CACHE_SCHEMA_VERSION = 3
+_MODEL_CACHE = {}
 
 
 # ── Training ──────────────────────────────────────────────────────────────────
@@ -83,7 +83,17 @@ def _load_model(cfg):
             "Run the training step first or check your config.py YOLO_WEIGHTS path."
         )
 
+    cache_key = (
+        str(Path(cfg.YOLO_WEIGHTS).resolve()).casefold(),
+        str(getattr(cfg, "YOLO_DEVICE", "cpu")),
+    )
+    model = _MODEL_CACHE.get(cache_key)
+    if model is not None:
+        return model
+
     model = YOLO(cfg.YOLO_WEIGHTS)
+    _MODEL_CACHE.clear()
+    _MODEL_CACHE[cache_key] = model
     log.info(f"Loaded YOLO model: {cfg.YOLO_WEIGHTS}")
     log.info(f"Classes: {model.names}")
     return model
@@ -114,6 +124,90 @@ def build_scan_ranges_from_moments(moments: list, cfg) -> list:
     return _normalize_scan_ranges(ranges, merge_gap=merge_gap)
 
 
+def _vision_cache_meta_path(detections_path: Path) -> Path:
+    return detections_path.with_name(f"{detections_path.stem}.meta.json")
+
+
+def _path_identity(path: str | Path) -> dict:
+    candidate = Path(path)
+    try:
+        resolved = candidate.resolve()
+        stat = resolved.stat()
+        return {
+            "path": str(resolved).casefold(),
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        }
+    except OSError:
+        return {
+            "path": str(candidate).casefold(),
+            "size": None,
+            "mtime_ns": None,
+        }
+
+
+def _vision_cache_fingerprint(video_path: str, cfg, scan_ranges: list | None = None) -> dict:
+    normalized_scan_ranges = [
+        [round(start, 3), round(end, 3)]
+        for start, end in _normalize_scan_ranges(
+            scan_ranges or [],
+            merge_gap=max(0.0, float(getattr(cfg, "YOLO_SCAN_RANGE_MERGE_GAP", 0.0))),
+        )
+    ]
+    return {
+        "schema_version": VISION_CACHE_SCHEMA_VERSION,
+        "video": _path_identity(video_path),
+        "weights": _path_identity(getattr(cfg, "YOLO_WEIGHTS", "")),
+        "yolo": {
+            "confidence": float(getattr(cfg, "YOLO_CONF_THRESHOLD", 0.55)),
+            "frame_skip": int(getattr(cfg, "YOLO_FRAME_SKIP", 1)),
+            "roi": dict(getattr(cfg, "ROI", {}) or {}),
+            "imgsz": int(getattr(cfg, "YOLO_IMGSZ", 640)),
+            "half": bool(getattr(cfg, "YOLO_HALF", False)),
+            "device": str(getattr(cfg, "YOLO_DEVICE", "cpu")),
+            "scan_only_moments": bool(getattr(cfg, "YOLO_SCAN_ONLY_MOMENTS", False)),
+        },
+        "scan_ranges": normalized_scan_ranges,
+    }
+
+
+def _load_vision_cache_meta(detections_path: Path) -> dict | None:
+    meta_path = _vision_cache_meta_path(detections_path)
+    if not meta_path.exists():
+        return None
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        return meta if isinstance(meta, dict) else None
+    except Exception as exc:
+        log.warning(f"Ignoring unreadable product detection metadata {meta_path}: {exc}")
+        return None
+
+
+def _vision_cache_fingerprint_matches(
+    detections_path: Path,
+    video_path: str,
+    cfg,
+    scan_ranges: list | None = None,
+) -> bool:
+    meta = _load_vision_cache_meta(detections_path)
+    if not meta:
+        return False
+    return meta.get("fingerprint") == _vision_cache_fingerprint(video_path, cfg, scan_ranges)
+
+
+def _write_vision_cache_meta(
+    detections_path: Path,
+    video_path: str,
+    cfg,
+    scan_ranges: list | None = None,
+) -> None:
+    meta_path = _vision_cache_meta_path(detections_path)
+    payload = {"fingerprint": _vision_cache_fingerprint(video_path, cfg, scan_ranges)}
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+
 def scan_video_for_products(video_path: str, working_dir: str, cfg, scan_ranges: list | None = None) -> list:
     """
     Scan the video for product appearances inside the configured ROI.
@@ -125,14 +219,22 @@ def scan_video_for_products(video_path: str, working_dir: str, cfg, scan_ranges:
 
     if detections_path.exists():
         log.info(f"Loading cached product detections from {detections_path}")
-        with open(detections_path, "r") as f:
-            cached_events = json.load(f)
-        if _is_valid_cached_events(cached_events):
+        try:
+            with open(detections_path, "r", encoding="utf-8") as f:
+                cached_events = json.load(f)
+        except Exception as exc:
+            log.warning(f"Ignoring unreadable product detection cache {detections_path}: {exc}")
+            cached_events = None
+        if (
+            _is_valid_cached_events(cached_events)
+            and _vision_cache_fingerprint_matches(detections_path, video_path, cfg, scan_ranges)
+        ):
             return cached_events
-        log.info("Cached product detections are outdated; rebuilding vision scan")
+        log.info("Cached product detections are outdated or fingerprint changed; rebuilding vision scan")
 
+    frame_skip = max(1, int(getattr(cfg, "YOLO_FRAME_SKIP", 1)))
     log.info(f"Scanning video for PROYA products: {video_path}")
-    log.info(f"ROI: {cfg.ROI} | Frame skip: {cfg.YOLO_FRAME_SKIP} | Conf: {cfg.YOLO_CONF_THRESHOLD}")
+    log.info(f"ROI: {cfg.ROI} | Frame skip: {frame_skip} | Conf: {cfg.YOLO_CONF_THRESHOLD}")
 
     model = _load_model(cfg)
     cap = cv2.VideoCapture(video_path)
@@ -174,6 +276,7 @@ def scan_video_for_products(video_path: str, working_dir: str, cfg, scan_ranges:
         log.info("YOLO full-video scan enabled")
 
     detections = []
+    sampled_frames = []
     scanned = 0
     total_target_frames = sum(
         max(0, int(end * fps + 0.999) - int(start * fps))
@@ -198,54 +301,59 @@ def scan_video_for_products(video_path: str, working_dir: str, cfg, scan_ranges:
             if not ret:
                 break
 
-            if frame_idx % cfg.YOLO_FRAME_SKIP == 0:
+            if frame_idx % frame_skip == 0:
                 timestamp = frame_idx / fps
                 roi_frame = frame[roi_y1:roi_y2, roi_x1:roi_x2]
-
-                results = model(
-                    roi_frame,
-                    conf=cfg.YOLO_CONF_THRESHOLD,
-                    verbose=False,
-                    device=getattr(cfg, "YOLO_DEVICE", "cpu"),
-                    imgsz=getattr(cfg, "YOLO_IMGSZ", 640),
-                    half=getattr(cfg, "YOLO_HALF", False),
-                )
-
-                for result in results:
-                    if result.boxes is None:
-                        continue
-                    for box in result.boxes:
-                        class_id = int(box.cls[0])
-                        conf = float(box.conf[0])
-                        xyxy = box.xyxy[0].tolist()
-
-                        full_bbox = [
-                            xyxy[0] + roi_x1,
-                            xyxy[1] + roi_y1,
-                            xyxy[2] + roi_x1,
-                            xyxy[3] + roi_y1,
-                        ]
-
-                        detections.append({
-                            "time": round(timestamp, 3),
-                            "frame": frame_idx,
-                            "class_id": class_id,
-                            "class_name": cfg.PRODUCT_CLASSES.get(class_id, f"class_{class_id}"),
-                            "confidence": round(conf, 3),
-                            "bbox": [round(v, 1) for v in full_bbox],
-                            "frame_w": frame_w,
-                            "frame_h": frame_h,
-                        })
+                sampled_frames.append({
+                    "frame": roi_frame,
+                    "timestamp": timestamp,
+                    "frame_idx": frame_idx,
+                })
 
                 scanned += 1
                 if scanned % 500 == 0:
                     progress_frames = max(1, min(total_target_frames, frame_idx + 1))
                     pct = (progress_frames / max(1, total_target_frames)) * 100.0
-                    log.info(f"  Scanned {scanned} frames ({pct:.1f}%) | {len(detections)} detections so far")
+                    log.info(f"  Sampled {scanned} frames ({pct:.1f}%)")
 
             frame_idx += 1
 
     cap.release()
+
+    if sampled_frames:
+        results = model.predict(
+            [sample["frame"] for sample in sampled_frames],
+            conf=cfg.YOLO_CONF_THRESHOLD,
+            verbose=False,
+            device=getattr(cfg, "YOLO_DEVICE", "cpu"),
+            imgsz=getattr(cfg, "YOLO_IMGSZ", 640),
+            half=getattr(cfg, "YOLO_HALF", False),
+        )
+        for sample, result in zip(sampled_frames, results):
+            if result.boxes is None:
+                continue
+            for box in result.boxes:
+                class_id = int(box.cls[0])
+                conf = float(box.conf[0])
+                xyxy = box.xyxy[0].tolist()
+
+                full_bbox = [
+                    xyxy[0] + roi_x1,
+                    xyxy[1] + roi_y1,
+                    xyxy[2] + roi_x1,
+                    xyxy[3] + roi_y1,
+                ]
+
+                detections.append({
+                    "time": round(sample["timestamp"], 3),
+                    "frame": sample["frame_idx"],
+                    "class_id": class_id,
+                    "class_name": cfg.PRODUCT_CLASSES.get(class_id, f"class_{class_id}"),
+                    "confidence": round(conf, 3),
+                    "bbox": [round(v, 1) for v in full_bbox],
+                    "frame_w": frame_w,
+                    "frame_h": frame_h,
+                })
     log.info(f"Scan complete: {len(detections)} product detections across {scanned} frames")
 
     # Group into events (consecutive detections = one event)
@@ -255,6 +363,7 @@ def scan_video_for_products(video_path: str, working_dir: str, cfg, scan_ranges:
     Path(working_dir).mkdir(parents=True, exist_ok=True)
     with open(detections_path, "w") as f:
         json.dump(events, f, indent=2)
+    _write_vision_cache_meta(detections_path, video_path, cfg, scan_ranges)
 
     return events
 

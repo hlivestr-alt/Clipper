@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import json
-import math
 import subprocess
 from collections import Counter
 from datetime import datetime, timedelta
@@ -26,6 +26,7 @@ DEFAULT_STATE_CANDIDATES = [
     Path("state.json"),
     Path("working") / "video_queue_state.json",
 ]
+TREND_PRODUCTS = ["Cleanser", "Serum", "Toner", "Eye Cream", "Sheet Mask", "Moisturizer"]
 
 
 def resolve_default_state_path() -> Path:
@@ -305,6 +306,9 @@ st.markdown(
 
     .pipeline-stage {
         text-align: center;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
     }
 
     .stage-ring {
@@ -324,7 +328,12 @@ st.markdown(
     .stage-name {
         color: var(--text);
         font-size: 0.95rem;
+        line-height: 1.18;
+        min-height: 2.25rem;
         margin-bottom: 0.45rem;
+        display: flex;
+        align-items: center;
+        justify-content: center;
     }
 
     .stage-count {
@@ -662,11 +671,18 @@ def infer_run_completed_at(run: dict[str, Any]) -> datetime | None:
     return max(finished_times) if finished_times else None
 
 
-def average_per_elapsed_bucket(total: int, elapsed_seconds: float, bucket_seconds: int) -> float:
-    if total <= 0 or elapsed_seconds <= 0:
+def average_completed_bucket(counter: Counter) -> float:
+    if not counter:
         return 0.0
-    bucket_count = max(math.ceil(elapsed_seconds / bucket_seconds), 1)
-    return total / bucket_count
+    return sum(counter.values()) / len(counter)
+
+
+def floor_to_minute(value: datetime) -> datetime:
+    return value.replace(second=0, microsecond=0)
+
+
+def floor_to_hour(value: datetime) -> datetime:
+    return value.replace(minute=0, second=0, microsecond=0)
 
 
 @st.cache_data(ttl=2, show_spinner=False)
@@ -713,6 +729,413 @@ def load_manifest_clip_count(output_dir: str | None) -> int:
         if isinstance(payload.get("items"), list):
             return len(payload["items"])
     return 0
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def load_score_rows(output_dirs: tuple[str, ...]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for output_dir in output_dirs:
+        folder = Path(output_dir)
+        summary_path = folder / "scores_summary.json"
+        if not summary_path.exists():
+            continue
+        try:
+            payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        source_video, run_tag = split_output_folder_name(folder.name)
+        groups = payload.get("groups", []) if isinstance(payload, dict) else []
+        if isinstance(groups, list) and groups:
+            for group in groups:
+                if isinstance(group, dict):
+                    rows.extend(build_group_score_rows(group, source_video, run_tag))
+            continue
+
+        clips = payload.get("clips", []) if isinstance(payload, dict) else []
+        if isinstance(clips, list):
+            for group in synthesize_score_groups_from_clips(clips):
+                rows.extend(build_group_score_rows(group, source_video, run_tag))
+    rows.sort(key=lambda row: row["_scored_at_sort"], reverse=True)
+    return rows
+
+
+def split_output_folder_name(folder_name: str) -> tuple[str, str]:
+    if "__" not in folder_name:
+        return folder_name, ""
+    source_video, run_tag = folder_name.rsplit("__", 1)
+    return source_video, run_tag
+
+
+def build_score_key(clip: dict[str, Any]) -> str:
+    raw = str(clip.get("clip_path") or clip.get("output_file") or clip.get("clip_id") or "")
+    return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def build_group_score_rows(group: dict[str, Any], source_video: str, run_tag: str) -> list[dict[str, Any]]:
+    base_key = build_score_key(
+        {
+            "clip_id": group.get("base_clip_id") or group.get("clip_id"),
+            "clip_path": group.get("representative_clip_path") or group.get("representative_output_file"),
+        }
+    )
+    scored_at = group.get("scored_at", "")
+    variant_search_text = " ".join(
+        str(item.get("clip_id", "")) + " " + str(item.get("output_file", ""))
+        for item in group.get("variants", [])
+        if isinstance(item, dict)
+    )
+    base_row = {
+        "Source Video": source_video,
+        "Run Tag": run_tag,
+        "Clip ID": group.get("base_clip_id") or group.get("clip_id", ""),
+        "Product": group.get("product", "general") or "general",
+        "Total Score": score_float(group.get("total_score")),
+        "Content": score_float(group.get("content_score")),
+        "Visual": score_float(group.get("visual_score")),
+        "Host Focus": score_float(group.get("host_focus_score")),
+        "Hook": score_float(group.get("hook_score")),
+        "Quality": score_float(group.get("quality_score")),
+        "Engagement": score_float(group.get("engagement_score")),
+        "Similarity": score_float(group.get("average_similarity_score")),
+        "Variants": int(score_float(group.get("variant_count")) or 0),
+        "Flags": ", ".join(str(flag) for flag in group.get("flags", [])[:8]),
+        "Summary": group.get("summary", ""),
+        "Output File": group.get("representative_output_file", ""),
+        "Clip Path": group.get("representative_clip_path", ""),
+        "Variant Clips": variant_search_text,
+        "Exported": bool(group.get("exported", True)),
+        "Scored At": scored_at,
+        "_scored_at_sort": parse_timestamp(scored_at) or datetime.min,
+        "_score_key": base_key,
+        "_base_score_key": base_key,
+        "_base_clip_id": group.get("base_clip_id") or group.get("clip_id", ""),
+        "_row_type": "base",
+        "_variant_index": -1,
+        "_raw": group,
+        "_base_raw": group,
+    }
+    rows = [base_row]
+    variants = group.get("variants", [])
+    if not isinstance(variants, list):
+        return rows
+
+    for variant in sorted(
+        (item for item in variants if isinstance(item, dict)),
+        key=lambda item: (
+            int(score_float(item.get("variant_index")) or 0),
+            str(item.get("variant_id") or ""),
+            str(item.get("clip_id") or ""),
+        ),
+    ):
+        variant_scored_at = variant.get("scored_at") or scored_at
+        variant_flags = variant.get("flags") or variant.get("similarity_flags", [])
+        rows.append(
+            {
+                "Source Video": source_video,
+                "Run Tag": run_tag,
+                "Clip ID": variant.get("clip_id", ""),
+                "Product": group.get("product", "general") or "general",
+                "Total Score": score_float(group.get("total_score")),
+                "Content": score_float(group.get("content_score")),
+                "Visual": score_float(group.get("visual_score")),
+                "Host Focus": score_float(group.get("host_focus_score")),
+                "Hook": score_float(group.get("hook_score")),
+                "Quality": score_float(group.get("quality_score")),
+                "Engagement": score_float(group.get("engagement_score")),
+                "Similarity": score_float(variant.get("similarity_score")),
+                "Variants": None,
+                "Flags": ", ".join(str(flag) for flag in variant_flags[:8]) or "inherits base",
+                "Summary": group.get("summary", ""),
+                "Output File": variant.get("output_file", ""),
+                "Clip Path": variant.get("clip_path", ""),
+                "Variant Clips": "",
+                "Exported": bool(variant.get("exported", group.get("exported", True))),
+                "Scored At": variant_scored_at,
+                "_scored_at_sort": parse_timestamp(variant_scored_at) or datetime.min,
+                "_score_key": build_score_key(variant),
+                "_base_score_key": base_key,
+                "_base_clip_id": group.get("base_clip_id") or group.get("clip_id", ""),
+                "_row_type": "variant",
+                "_variant_index": int(score_float(variant.get("variant_index")) or 0),
+                "_raw": variant,
+                "_base_raw": group,
+            }
+        )
+    return rows
+
+
+def synthesize_score_groups_from_clips(clips: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for clip in clips:
+        if not isinstance(clip, dict):
+            continue
+        base_clip_id = str(clip.get("base_clip_id") or base_clip_id_for_scores_ui(str(clip.get("clip_id") or "")))
+        grouped.setdefault(base_clip_id, []).append(clip)
+
+    groups = []
+    for base_clip_id, variants in grouped.items():
+        representative = sorted(
+            variants,
+            key=lambda item: (
+                0 if "v0" in str(item.get("clip_id") or "").lower() or "original" in str(item.get("clip_id") or "").lower() else 1,
+                str(item.get("clip_id") or ""),
+            ),
+        )[0]
+        variant_rows = []
+        for variant in variants:
+            variant_rows.append(
+                {
+                    "clip_id": variant.get("clip_id"),
+                    "base_clip_id": base_clip_id,
+                    "variant_id": variant.get("variant_id") or variant_id_for_scores_ui(str(variant.get("clip_id") or ""), base_clip_id),
+                    "variant_index": variant.get("variant_index"),
+                    "version_dir": variant.get("version_dir", ""),
+                    "output_file": variant.get("output_file", ""),
+                    "clip_path": variant.get("clip_path", ""),
+                    "similarity_score": variant.get("similarity_score"),
+                    "similarity_flags": variant.get("similarity_flags", []),
+                    "similarity_metrics": (variant.get("metrics") or {}).get("similarity", {}),
+                    "exported": bool(variant.get("exported", True)),
+                    "scored_at": variant.get("scored_at", ""),
+                }
+            )
+        groups.append(
+            {
+                **representative,
+                "score_level": "base",
+                "clip_id": base_clip_id,
+                "base_clip_id": base_clip_id,
+                "representative_clip_id": representative.get("clip_id"),
+                "representative_output_file": representative.get("output_file", ""),
+                "representative_clip_path": representative.get("clip_path", ""),
+                "variant_count": len(variant_rows),
+                "average_similarity_score": average_score_value(
+                    variant.get("similarity_score") for variant in variant_rows
+                ),
+                "variants": variant_rows,
+            }
+        )
+    return groups
+
+
+def base_clip_id_for_scores_ui(clip_id: str) -> str:
+    match = re_match_score_id(r"^(clip_\d+)(?:_v\d+(?:_|$).*)?$", clip_id)
+    if match:
+        return match
+    match = re_match_score_id(r"^(.+?)_v\d+(?:_|$).*$", clip_id)
+    return match or clip_id
+
+
+def variant_id_for_scores_ui(clip_id: str, base_clip_id: str) -> str:
+    if base_clip_id and clip_id.startswith(base_clip_id + "_"):
+        return clip_id[len(base_clip_id) + 1 :]
+    return "original"
+
+
+def re_match_score_id(pattern: str, text: str) -> str | None:
+    import re
+
+    match = re.match(pattern, str(text or ""), flags=re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def average_score_value(values: Any) -> float | None:
+    numeric = [score_float(value) for value in values]
+    numeric = [value for value in numeric if value is not None]
+    if not numeric:
+        return None
+    return round(sum(numeric) / len(numeric), 2)
+
+
+def score_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def scorer_thresholds() -> tuple[float, float]:
+    try:
+        import config as cfg
+
+        export_threshold = float(getattr(cfg, "SCORER_EXPORT_READY_THRESHOLD", 7.0) or 7.0)
+        review_threshold = float(getattr(cfg, "SCORER_REVIEW_THRESHOLD", 5.0) or 5.0)
+        return export_threshold, review_threshold
+    except Exception:
+        return 7.0, 5.0
+
+
+def scorer_vision_debug_enabled() -> bool:
+    try:
+        import config as cfg
+
+        return bool(getattr(cfg, "SCORER_VISION_DEBUG", False))
+    except Exception:
+        return False
+
+
+def score_tier_label(value: Any) -> str:
+    total = score_float(value)
+    export_threshold, review_threshold = scorer_thresholds()
+    if total is None:
+        return "Rejected"
+    if total >= export_threshold:
+        return "Export Ready"
+    if total >= review_threshold:
+        return "Review Needed"
+    return "Rejected"
+
+
+def trend_product_bucket(value: Any) -> str:
+    text = str(value or "").lower()
+    if "cleanser" in text or "clean" in text:
+        return "Cleanser"
+    if "serum" in text:
+        return "Serum"
+    if "toner" in text:
+        return "Toner"
+    if "eye" in text and "cream" in text:
+        return "Eye Cream"
+    if "sheet" in text or "mask" in text or "masker" in text:
+        return "Sheet Mask"
+    if "moist" in text or "cream" in text or "krim" in text:
+        return "Moisturizer"
+    return ""
+
+
+def split_flags_for_trends(value: Any) -> list[str]:
+    flags = []
+    for part in str(value or "").split(","):
+        clean = part.strip()
+        if clean and clean != "inherits base":
+            flags.append(clean)
+    return flags
+
+
+def _output_root_mtime_ns(root: Path) -> int:
+    try:
+        return root.stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def _discover_score_output_dirs_cached(
+    existing_dirs: tuple[str, ...],
+    root_path: str,
+    root_mtime_ns: int,
+) -> tuple[str, ...]:
+    output_dirs: list[str] = list(existing_dirs)
+    seen = {item.casefold() for item in output_dirs}
+    root = Path(root_path)
+    if not root.exists():
+        return tuple(output_dirs)
+    for folder in root.iterdir():
+        if not folder.is_dir() or not (folder / "scores_summary.json").exists():
+            continue
+        normalized = str(folder)
+        key = normalized.casefold()
+        if key not in seen:
+            output_dirs.append(normalized)
+            seen.add(key)
+    return tuple(output_dirs)
+
+
+def collect_score_output_dirs(summary: dict[str, Any]) -> tuple[str, ...]:
+    output_dirs: list[str] = []
+    seen = set()
+    for video in summary.get("videos", []):
+        for run in video.get("runs", []):
+            output_dir = run.get("output_dir")
+            if not output_dir:
+                continue
+            normalized = str(output_dir)
+            key = normalized.casefold()
+            if key not in seen:
+                output_dirs.append(normalized)
+                seen.add(key)
+
+    root = resolve_output_root()
+    return _discover_score_output_dirs_cached(
+        tuple(output_dirs),
+        str(root),
+        _output_root_mtime_ns(root),
+    )
+
+
+def resolve_output_root() -> Path:
+    try:
+        import config as cfg
+
+        return Path(getattr(cfg, "OUTPUT_DIR", r"D:\output_clips"))
+    except Exception:
+        return Path(r"D:\output_clips")
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def load_focus_debug_rows(output_dirs: tuple[str, ...]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for output_dir in output_dirs:
+        folder = Path(output_dir)
+        if not folder.exists():
+            continue
+        source_video, run_tag = split_output_folder_name(folder.name)
+        for json_path in sorted(folder.rglob("*_focus_debug.json")):
+            try:
+                payload = json.loads(json_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(payload, list):
+                continue
+            image_path = json_path.with_suffix(".jpg")
+            clip_id = json_path.name.removesuffix("_focus_debug.json")
+            rows.append(
+                {
+                    "Source Video": source_video,
+                    "Run Tag": run_tag,
+                    "Clip ID": clip_id,
+                    "Image Path": str(image_path),
+                    "JSON Path": str(json_path),
+                    "Frames": len(payload),
+                    "Breakdown": payload,
+                    "_sort_key": json_path.stat().st_mtime if json_path.exists() else 0,
+                }
+            )
+    rows.sort(key=lambda item: (item["_sort_key"], item["Clip ID"]), reverse=True)
+    return rows
+
+
+def as_nonnegative_int(value: Any, default: int = 0) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def get_ffmpeg_stage(run: dict[str, Any]) -> dict[str, Any]:
+    stage_state = (run.get("stages") or {}).get("ffmpeg", {})
+    return stage_state if isinstance(stage_state, dict) else {}
+
+
+def get_live_clip_count(run: dict[str, Any]) -> int:
+    return as_nonnegative_int(get_ffmpeg_stage(run).get("clips_created"))
+
+
+def get_run_clip_count(run: dict[str, Any]) -> int:
+    manifest_count = load_manifest_clip_count(run.get("output_dir"))
+    live_count = get_live_clip_count(run)
+    return max(manifest_count, live_count)
+
+
+def infer_run_clip_timestamp(run: dict[str, Any]) -> datetime | None:
+    completed_at = infer_run_completed_at(run)
+    if completed_at:
+        return completed_at
+    if get_live_clip_count(run) <= 0:
+        return None
+    return parse_timestamp(get_ffmpeg_stage(run).get("last_progress_at"))
 
 
 @st.cache_data(ttl=3, show_spinner=False)
@@ -848,7 +1271,7 @@ def collect_video_runs(video: dict[str, Any]) -> list[dict[str, Any]]:
 
 def aggregate_video_entry(video: dict[str, Any]) -> dict[str, Any]:
     runs = collect_video_runs(video)
-    total_clips_all_runs = sum(load_manifest_clip_count(run.get("output_dir")) for run in runs)
+    total_clips_all_runs = sum(get_run_clip_count(run) for run in runs)
     aggregate = dict(video)
     aggregate["runs"] = runs
     aggregate["redo_count"] = max(0, len(runs) - 1)
@@ -869,9 +1292,10 @@ def summarize_state(state: dict[str, Any]) -> dict[str, Any]:
     queue_items = {stage_key: [] for stage_key, _, _, _ in STAGES}
     throughput_counters = {stage_key: Counter() for stage_key, _, _, _ in STAGES}
     hourly_clips = Counter()
+    minute_clip_buckets = Counter()
+    hour_clip_buckets = Counter()
+    day_clip_buckets = Counter()
     timeline_points: list[dict[str, Any]] = []
-    created_times = []
-    finish_times = []
     table_rows = []
     top_video_rows = []
     total_clips = 0
@@ -879,11 +1303,6 @@ def summarize_state(state: dict[str, Any]) -> dict[str, Any]:
     for video in videos:
         created_at = parse_timestamp(video.get("created_at"))
         completed_at = infer_run_completed_at(video)
-
-        if created_at:
-            created_times.append(created_at)
-        if completed_at:
-            finish_times.append(completed_at)
 
         stages = video.get("stages", {})
         stage_bucket = video.get("current_stage")
@@ -906,18 +1325,21 @@ def summarize_state(state: dict[str, Any]) -> dict[str, Any]:
                 stage_bucket = stage_key
 
         for run in video.get("runs", []):
-            run_completed_at = infer_run_completed_at(run)
-            run_clips = load_manifest_clip_count(run.get("output_dir"))
-            if run_completed_at and run_clips:
-                bucket = run_completed_at.replace(minute=0, second=0, microsecond=0)
+            run_clip_time = infer_run_clip_timestamp(run)
+            run_clips = get_run_clip_count(run)
+            if run_clip_time and run_clips:
+                bucket = floor_to_hour(run_clip_time)
                 timeline_points.append({"timestamp": bucket, "clips": run_clips})
-                hourly_clips[run_completed_at.hour] += run_clips
+                hourly_clips[run_clip_time.hour] += run_clips
+                minute_clip_buckets[floor_to_minute(run_clip_time)] += run_clips
+                hour_clip_buckets[bucket] += run_clips
+                day_clip_buckets[run_clip_time.date()] += run_clips
 
             run_stages = run.get("stages", {}) or {}
             for stage_key, _, _, _ in STAGES:
                 finished_at = parse_timestamp(run_stages.get(stage_key, {}).get("finished_at"))
                 if finished_at:
-                    throughput_counters[stage_key][finished_at.replace(minute=0, second=0, microsecond=0)] += 1
+                    throughput_counters[stage_key][floor_to_hour(finished_at)] += 1
 
         clips_generated = int(video.get("clips_generated_total", 0))
         total_clips += clips_generated
@@ -989,21 +1411,19 @@ def summarize_state(state: dict[str, Any]) -> dict[str, Any]:
             points = [{"timestamp": now.replace(minute=0, second=0, microsecond=0), "count": 0}]
         throughput_frames[stage_key] = pd.DataFrame(points).sort_values("timestamp").tail(16)
 
-    top_videos_df = (
-        pd.DataFrame(top_video_rows)
-        .sort_values(["Clips", "Video"], ascending=[False, True])
-        .head(5)
-        .reset_index(drop=True)
-    )
-
-    if created_times:
-        elapsed_seconds = ((max(finish_times) if finish_times else now) - min(created_times)).total_seconds()
+    if top_video_rows:
+        top_videos_df = (
+            pd.DataFrame(top_video_rows)
+            .sort_values(["Clips", "Video"], ascending=[False, True])
+            .head(5)
+            .reset_index(drop=True)
+        )
     else:
-        elapsed_seconds = 0.0
+        top_videos_df = pd.DataFrame(columns=["Video", "Status", "Clips"])
 
-    clips_per_minute = average_per_elapsed_bucket(total_clips, elapsed_seconds, 60)
-    clips_per_hour = average_per_elapsed_bucket(total_clips, elapsed_seconds, 3600)
-    clips_per_day = average_per_elapsed_bucket(total_clips, elapsed_seconds, 86400)
+    clips_per_minute = average_completed_bucket(minute_clip_buckets)
+    clips_per_hour = average_completed_bucket(hour_clip_buckets)
+    clips_per_day = average_completed_bucket(day_clip_buckets)
 
     table_df = pd.DataFrame(table_rows)
     if not table_df.empty:
@@ -1167,27 +1587,6 @@ def render_kpi_card(title: str, value: int, subtitle: str, icon: str, accent: st
     )
 
 
-def render_nav() -> None:
-    items = [
-        ("home", "Overview", True),
-        ("video", "Videos", False),
-        ("chart", "Analytics", False),
-        ("list", "Queues", False),
-        ("gear", "Settings", False),
-    ]
-    html = []
-    for icon, label, active in items:
-        html.append(
-            f"""
-            <div class="nav-item{' active' if active else ''}">
-                <div class="nav-icon">{svg_icon(icon, '#dbeafe', size=16, stroke=1.8)}</div>
-                <div>{label}</div>
-            </div>
-            """
-        )
-    st.markdown("".join(html), unsafe_allow_html=True)
-
-
 def render_system_metric(label: str, percent: float | None, trailing: str) -> None:
     pct_text = "N/A" if percent is None else f"{percent:.0f}%"
     progress = 0.0 if percent is None else max(0.0, min(percent / 100.0, 1.0))
@@ -1207,14 +1606,25 @@ def render_system_metric(label: str, percent: float | None, trailing: str) -> No
         st.markdown(f"<div class='small-muted'>{trailing}</div>", unsafe_allow_html=True)
 
 
+def queue_fill_ratio(queued_count: int, running_count: int) -> float:
+    active_count = queued_count + running_count
+    if active_count <= 0:
+        return 0.0
+    return max(0.0, min(queued_count / active_count, 1.0))
+
+
 def render_nav_controls(active_tab: str) -> None:
     items = [
         ("overview", "Overview", "home"),
         ("videos", "Videos", "video"),
         ("analytics", "Analytics", "chart"),
+        ("scores", "Scores", "check-circle"),
+        ("trends", "Trends", "chart"),
         ("queues", "Queues", "list"),
         ("settings", "Settings", "gear"),
     ]
+    if scorer_vision_debug_enabled():
+        items.insert(5, ("focus_debug", "Focus Debug", "focus"))
     for tab_key, label, icon_name in items:
         cols = st.columns([0.24, 1], gap="small")
         with cols[0]:
@@ -1277,6 +1687,8 @@ def render_header(updated_at: datetime | None) -> None:
             if st.button("\u21bb", key="header_refresh", help="Refresh now", use_container_width=True):
                 load_state.clear()
                 load_manifest_clip_count.clear()
+                load_score_rows.clear()
+                load_focus_debug_rows.clear()
                 st.rerun()
         with action_cols[2]:
             with st.popover("\u2699", use_container_width=True):
@@ -1303,6 +1715,8 @@ def render_header(updated_at: datetime | None) -> None:
                     st.session_state.state_path_value = pending_state_path
                     load_state.clear()
                     load_manifest_clip_count.clear()
+                    load_score_rows.clear()
+                    load_focus_debug_rows.clear()
                     st.rerun()
 
 
@@ -1452,17 +1866,17 @@ def render_overview_tab(summary: dict[str, Any]) -> None:
             st.markdown("<div style='height:0.8rem'></div>", unsafe_allow_html=True)
             st.divider()
             st.markdown("<div class='panel-title' style='font-size:1rem;'>Queues</div>", unsafe_allow_html=True)
-            total_videos = max(len(summary["videos"]), 1)
             for stage_key, label, _, _ in STAGES:
                 queued_count = summary["stage_queued"].get(stage_key, 0)
                 running_count = summary["stage_running"].get(stage_key, 0)
+                active_count = queued_count + running_count
                 q_cols = st.columns([1.15, 2.4, 0.55], gap="small")
                 with q_cols[0]:
                     st.markdown(f"<div class='queue-label'>{label.replace(' Processing', '')} Queue</div>", unsafe_allow_html=True)
                 with q_cols[1]:
-                    st.progress(min(queued_count / total_videos, 1.0))
+                    st.progress(queue_fill_ratio(queued_count, running_count))
                 with q_cols[2]:
-                    st.markdown(f"<div class='queue-count'>{queued_count} / {running_count + queued_count}</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div class='queue-count'>{queued_count} / {active_count}</div>", unsafe_allow_html=True)
 
     with center_cols[1]:
         with st.container(border=True):
@@ -1621,6 +2035,699 @@ def render_analytics_tab(summary: dict[str, Any]) -> None:
             st.dataframe(summary["top_videos_df"], use_container_width=True, hide_index=True)
 
 
+def render_scores_tab(summary: dict[str, Any]) -> None:
+    render_page_intro("Scores", "Ranked post-render quality scores for finished clips.")
+    score_rows = load_score_rows(collect_score_output_dirs(summary))
+    if not score_rows:
+        with st.container(border=True):
+            st.info("No scores found yet. New render batches will write scores_summary.json automatically.")
+        return
+
+    score_df = pd.DataFrame(score_rows)
+    base_score_df = score_df[score_df["_row_type"] == "base"].copy()
+    if base_score_df.empty:
+        base_score_df = score_df.copy()
+    products = ["All Products"] + sorted(
+        product for product in base_score_df["Product"].dropna().astype(str).unique() if product
+    )
+
+    controls = st.columns([1.0, 1.25, 0.75, 0.95, 0.65, 0.65], gap="small")
+    with controls[0]:
+        product_filter = st.selectbox("Product", products, key="scores_product_filter")
+    with controls[1]:
+        search_term = st.text_input("Search", placeholder="Clip, source, flag...", key="scores_search")
+    with controls[2]:
+        min_score = st.slider("Min Score", 0.0, 10.0, 0.0, 0.1, key="scores_min_score")
+    with controls[3]:
+        sort_by = st.selectbox(
+            "Sort",
+            [
+                "Scored At",
+                "Total Score",
+                "Host Focus",
+                "Content",
+                "Visual",
+                "Quality",
+                "Engagement",
+                "Hook",
+                "Similarity",
+                "Variants",
+                "Clip ID",
+                "Product",
+            ],
+            key="scores_sort_by",
+        )
+    with controls[4]:
+        descending = st.toggle("Desc", value=True, key="scores_sort_desc")
+    with controls[5]:
+        if st.button("Refresh", key="scores_refresh", use_container_width=True):
+            load_score_rows.clear()
+            st.rerun(scope="fragment")
+
+    filtered = base_score_df.copy()
+    if product_filter != "All Products":
+        filtered = filtered[filtered["Product"] == product_filter]
+    filtered = filtered[filtered["Total Score"].fillna(-1) >= min_score]
+    if search_term:
+        haystack_cols = ["Source Video", "Run Tag", "Clip ID", "Flags", "Summary", "Output File", "Variant Clips"]
+        mask = pd.Series(False, index=filtered.index)
+        for col in haystack_cols:
+            mask = mask | filtered[col].astype(str).str.contains(search_term, case=False, na=False)
+        filtered = filtered[mask]
+
+    sort_column = "_scored_at_sort" if sort_by == "Scored At" else sort_by
+    filtered = filtered.sort_values(sort_column, ascending=not descending, na_position="last").reset_index(drop=True)
+    if filtered.empty:
+        with st.container(border=True):
+            st.info("No scored clips match the current filters.")
+        return
+
+    expanded_base_key = str(st.session_state.get("expanded_score_base_key", ""))
+    visible_base_keys = set(filtered["_base_score_key"].astype(str))
+    if expanded_base_key and expanded_base_key not in visible_base_keys:
+        expanded_base_key = ""
+        st.session_state.expanded_score_base_key = ""
+
+    selected_key = str(st.session_state.get("selected_score_key", ""))
+    if selected_key and selected_key in set(score_df["_score_key"].astype(str)):
+        selected = score_df[score_df["_score_key"].astype(str) == selected_key].iloc[0]
+    else:
+        selected = filtered.iloc[0]
+        selected_key = str(selected.get("_score_key", ""))
+        st.session_state.selected_score_key = selected_key
+
+    metric_cols = st.columns(4, gap="medium")
+    average_score = filtered["Total Score"].dropna().mean()
+    if pd.isna(average_score):
+        average_score = 0.0
+    high_count = int((filtered["Total Score"] >= 7).sum())
+    low_count = int((filtered["Total Score"] < 4).sum())
+    metric_items = [
+        ("Base Clips", f"{len(filtered):,}", "Filtered"),
+        ("Average", f"{average_score:.2f}", "Total score"),
+        ("7+", f"{high_count:,}", "Strong"),
+        ("<4", f"{low_count:,}", "Needs review"),
+    ]
+    for col, (label, value, sub) in zip(metric_cols, metric_items):
+        with col:
+            st.markdown(
+                f"""
+                <div class="mini-stat">
+                    <div class="mini-stat-label">{label}</div>
+                    <div class="mini-stat-value">{value}</div>
+                    <div class="mini-stat-sub">{sub}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    selected_key = render_scores_click_table(filtered, score_df, selected_key)
+    if selected_key and selected_key in set(score_df["_score_key"].astype(str)):
+        selected = score_df[score_df["_score_key"].astype(str) == selected_key].iloc[0]
+    render_score_detail(selected)
+    render_score_methodology()
+
+
+def render_trends_tab(summary: dict[str, Any]) -> None:
+    render_page_intro("Trends", "Score trends by product, dimension, tier, and recurring flags.")
+    score_rows = load_score_rows(collect_score_output_dirs(summary))
+    if not score_rows:
+        with st.container(border=True):
+            st.info("No score trend data found yet.")
+        return
+
+    score_df = pd.DataFrame(score_rows)
+    clip_df = score_df[score_df["_row_type"].isin(["base", "variant"])].copy()
+    if clip_df.empty:
+        clip_df = score_df.copy()
+
+    clip_df["Product Bucket"] = clip_df["Product"].apply(trend_product_bucket)
+    product_rows = []
+    for product in TREND_PRODUCTS:
+        values = clip_df.loc[clip_df["Product Bucket"] == product, "Total Score"].dropna()
+        product_rows.append(
+            {
+                "Product": product,
+                "Average Total": round(float(values.mean()), 2) if not values.empty else None,
+                "Clips": int(values.count()),
+            }
+        )
+    product_df = pd.DataFrame(product_rows)
+
+    dimension_rows = []
+    for label, column in [
+        ("Content", "Content"),
+        ("Visual", "Visual"),
+        ("Quality", "Quality"),
+        ("Engagement", "Engagement"),
+    ]:
+        values = clip_df[column].dropna()
+        dimension_rows.append(
+            {
+                "Dimension": label,
+                "Average Score": round(float(values.mean()), 2) if not values.empty else None,
+            }
+        )
+    dimension_df = pd.DataFrame(dimension_rows)
+
+    tier_order = ["Export Ready", "Review Needed", "Rejected"]
+    tier_counts = Counter(score_tier_label(value) for value in clip_df["Total Score"])
+    tier_df = pd.DataFrame(
+        [{"Tier": tier, "Clips": int(tier_counts.get(tier, 0))} for tier in tier_order]
+    )
+
+    flag_counter: Counter[str] = Counter()
+    for value in clip_df["Flags"]:
+        flag_counter.update(split_flags_for_trends(value))
+    flags_df = pd.DataFrame(
+        [{"Flag": flag, "Count": count} for flag, count in flag_counter.most_common(10)]
+    )
+
+    top_df = (
+        clip_df.sort_values("Total Score", ascending=False, na_position="last")
+        .head(3)[["Clip ID", "Product", "Total Score", "Summary"]]
+        .reset_index(drop=True)
+    )
+
+    chart_cols = st.columns([1, 1], gap="medium")
+    with chart_cols[0]:
+        with st.container(border=True):
+            st.markdown("<div class='panel-title'>Average Total by Product</div>", unsafe_allow_html=True)
+            chart = (
+                alt.Chart(product_df)
+                .mark_bar(color="#22c55e", cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
+                .encode(
+                    x=alt.X("Product:N", sort=TREND_PRODUCTS, title=None, axis=alt.Axis(labelColor="#94a3b8")),
+                    y=alt.Y("Average Total:Q", title=None, scale=alt.Scale(domain=[0, 10]), axis=alt.Axis(labelColor="#94a3b8", gridColor="rgba(148,163,184,0.12)")),
+                    tooltip=["Product", "Average Total", "Clips"],
+                )
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+    with chart_cols[1]:
+        with st.container(border=True):
+            st.markdown("<div class='panel-title'>Average by Dimension</div>", unsafe_allow_html=True)
+            chart = (
+                alt.Chart(dimension_df)
+                .mark_bar(color="#3b82f6", cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
+                .encode(
+                    x=alt.X("Dimension:N", title=None, axis=alt.Axis(labelColor="#94a3b8")),
+                    y=alt.Y("Average Score:Q", title=None, scale=alt.Scale(domain=[0, 10]), axis=alt.Axis(labelColor="#94a3b8", gridColor="rgba(148,163,184,0.12)")),
+                    tooltip=["Dimension", "Average Score"],
+                )
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+    lower_cols = st.columns([0.8, 1.2], gap="medium")
+    with lower_cols[0]:
+        with st.container(border=True):
+            st.markdown("<div class='panel-title'>Score Tiers</div>", unsafe_allow_html=True)
+            chart = (
+                alt.Chart(tier_df)
+                .mark_bar(color="#fbbf24", cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
+                .encode(
+                    x=alt.X("Tier:N", sort=tier_order, title=None, axis=alt.Axis(labelColor="#94a3b8")),
+                    y=alt.Y("Clips:Q", title=None, axis=alt.Axis(labelColor="#94a3b8", gridColor="rgba(148,163,184,0.12)")),
+                    tooltip=["Tier", "Clips"],
+                )
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+    with lower_cols[1]:
+        with st.container(border=True):
+            st.markdown("<div class='panel-title'>Most Common Flags</div>", unsafe_allow_html=True)
+            if flags_df.empty:
+                st.info("No flags found.")
+            else:
+                chart = (
+                    alt.Chart(flags_df)
+                    .mark_bar(color="#8b5cf6", cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
+                    .encode(
+                        x=alt.X("Count:Q", title=None, axis=alt.Axis(labelColor="#94a3b8", gridColor="rgba(148,163,184,0.12)")),
+                        y=alt.Y("Flag:N", sort="-x", title=None, axis=alt.Axis(labelColor="#94a3b8")),
+                        tooltip=["Flag", "Count"],
+                    )
+                )
+                st.altair_chart(chart, use_container_width=True)
+
+    with st.container(border=True):
+        st.markdown("<div class='panel-title'>Top 3 Clips Overall</div>", unsafe_allow_html=True)
+        st.dataframe(top_df, use_container_width=True, hide_index=True)
+
+
+def render_focus_debug_tab(summary: dict[str, Any]) -> None:
+    render_page_intro("Focus Debug", "Sampled host-focus frames and A/B/C classifications.")
+    if not scorer_vision_debug_enabled():
+        with st.container(border=True):
+            st.info("Focus debug is disabled. Set SCORER_VISION_DEBUG = True to collect contact sheets.")
+        return
+
+    rows = load_focus_debug_rows(collect_score_output_dirs(summary))
+    if not rows:
+        with st.container(border=True):
+            st.info("No focus debug artifacts found yet.")
+        return
+
+    labels = [
+        f"{row['Clip ID']} | {row['Source Video']} {row['Run Tag']}".strip()
+        for row in rows
+    ]
+    selected_label = st.selectbox("Clip", labels, key="focus_debug_clip")
+    selected_index = labels.index(selected_label)
+    selected = rows[selected_index]
+
+    with st.container(border=True):
+        st.markdown("<div class='panel-title'>Contact Sheet</div>", unsafe_allow_html=True)
+        image_path = Path(selected["Image Path"])
+        if image_path.exists():
+            st.image(str(image_path), use_container_width=True)
+        else:
+            st.warning(f"Missing contact sheet: {image_path}")
+
+    breakdown = selected.get("Breakdown", [])
+    if isinstance(breakdown, list) and breakdown:
+        frame = pd.DataFrame(breakdown)
+        visible_cols = [
+            col
+            for col in [
+                "frame_index",
+                "timestamp_seconds",
+                "label",
+                "confidence",
+                "outlier_dropped",
+                "raw_response",
+            ]
+            if col in frame.columns
+        ]
+        with st.container(border=True):
+            st.markdown("<div class='panel-title'>Per-Frame Breakdown</div>", unsafe_allow_html=True)
+            st.dataframe(frame[visible_cols], use_container_width=True, hide_index=True)
+
+
+def expand_score_group_rows(base_rows: pd.DataFrame, all_rows: pd.DataFrame) -> pd.DataFrame:
+    expanded = []
+    for _, base_row in base_rows.iterrows():
+        base_key = str(base_row.get("_base_score_key", base_row.get("_score_key", "")))
+        expanded.append(base_row)
+        variants = all_rows[
+            (all_rows["_base_score_key"].astype(str) == base_key)
+            & (all_rows["_row_type"].astype(str) == "variant")
+        ].sort_values(["_variant_index", "Clip ID"], na_position="last")
+        for _, variant_row in variants.iterrows():
+            expanded.append(variant_row)
+    return pd.DataFrame(expanded).reset_index(drop=True)
+
+
+def render_scores_click_table(filtered: pd.DataFrame, all_rows: pd.DataFrame, selected_key: str) -> str:
+    page_size = st.selectbox("Base Rows", [10, 20, 50], index=1, key="scores_rows")
+    total_rows = len(filtered)
+    total_pages = max((total_rows - 1) // page_size + 1, 1)
+    page = min(max(int(st.session_state.get("scores_page", 1)), 1), total_pages)
+    st.session_state.scores_page = page
+
+    start_idx = (page - 1) * page_size
+    end_idx = min(start_idx + page_size, total_rows)
+    page_df = filtered.iloc[start_idx:end_idx]
+    selected_key = render_scores_compact_table(page_df, all_rows, selected_key)
+
+    pager_cols = st.columns([0.55, 0.85, 0.55, 3.0], gap="small")
+    with pager_cols[0]:
+        if st.button("\u2039", key="scores_prev", use_container_width=True, disabled=page <= 1):
+            st.session_state.scores_page = max(1, page - 1)
+            st.rerun(scope="fragment")
+    with pager_cols[1]:
+        st.caption(f"Page {page} / {total_pages}")
+    with pager_cols[2]:
+        if st.button("\u203a", key="scores_next", use_container_width=True, disabled=page >= total_pages):
+            st.session_state.scores_page = min(total_pages, page + 1)
+            st.rerun(scope="fragment")
+    with pager_cols[3]:
+        st.caption(f"Showing base clips {start_idx + 1} to {end_idx} of {total_rows}")
+    return selected_key
+
+
+def render_scores_compact_table(page_df: pd.DataFrame, all_rows: pd.DataFrame, selected_key: str) -> str:
+    st.markdown(
+        """
+        <style>
+        .score-grid-header {
+            display: grid;
+            grid-template-columns: 0.24fr 1.12fr 0.55fr 1.28fr 0.8fr 0.42fr 0.42fr 0.42fr 0.58fr 0.42fr 0.42fr 0.52fr 0.68fr 0.4fr 1.55fr;
+            gap: 0.42rem;
+            align-items: center;
+            color: #94a3b8;
+            font-size: 0.76rem;
+            font-weight: 700;
+            padding: 0.22rem 0.4rem;
+            border-bottom: 1px solid rgba(148, 163, 184, 0.14);
+        }
+        .score-accordion-shell {
+            border: 1px solid rgba(148, 163, 184, 0.16);
+            border-radius: 8px;
+            overflow: hidden;
+            background: rgba(2, 8, 23, 0.22);
+        }
+        .score-cell {
+            font-size: 0.78rem;
+            line-height: 1.1;
+            max-height: 2.2rem;
+            overflow: hidden;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            word-break: break-word;
+            padding-top: 0.2rem;
+        }
+        .score-variant-panel {
+            margin: 0.12rem 1.1rem 0.6rem 2.65rem;
+            border-left: 2px solid rgba(96, 165, 250, 0.35);
+            padding-left: 1rem;
+        }
+        .score-variant-card {
+            border: 1px solid rgba(148, 163, 184, 0.12);
+            border-radius: 8px;
+            overflow: hidden;
+            background: rgba(15, 23, 42, 0.45);
+        }
+        .score-variant-title {
+            color: #e2e8f0;
+            font-size: 0.82rem;
+            font-weight: 700;
+            padding: 0.62rem 0.86rem;
+            border-bottom: 1px solid rgba(148, 163, 184, 0.10);
+        }
+        .score-sim-wrap {
+            display: flex;
+            align-items: center;
+            gap: 0.48rem;
+            min-width: 0;
+        }
+        .score-sim-value {
+            min-width: 2.2rem;
+            color: #e2e8f0;
+            font-variant-numeric: tabular-nums;
+        }
+        .score-sim-track {
+            height: 0.28rem;
+            width: 5.4rem;
+            border-radius: 999px;
+            background: rgba(148, 163, 184, 0.18);
+            overflow: hidden;
+        }
+        .score-sim-fill {
+            height: 100%;
+            border-radius: 999px;
+            background: #60a5fa;
+        }
+        .score-selected-strip {
+            height: 2px;
+            background: rgba(96, 165, 250, 0.85);
+            border-radius: 999px;
+            margin: 0.08rem 0;
+        }
+        div[data-testid="stButton"] > button {
+            min-height: 2.05rem;
+            max-height: 2.35rem;
+            padding: 0.1rem 0.35rem;
+            font-size: 0.77rem;
+            line-height: 1.05;
+            overflow: hidden;
+        }
+        </style>
+        <div class="score-accordion-shell">
+        <div class="score-grid-header">
+            <div></div>
+            <div>Source Video</div>
+            <div>Run Tag</div>
+            <div>Clip ID</div>
+            <div>Type</div>
+            <div>Total</div>
+            <div>Content</div>
+            <div>Visual</div>
+            <div>Host Focus</div>
+            <div>Hook</div>
+            <div>Quality</div>
+            <div>Engage</div>
+            <div>Similarity</div>
+            <div>Vars</div>
+            <div>Flags</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    for row_index, row in page_df.iterrows():
+        key = str(row.get("_score_key", ""))
+        base_key = str(row.get("_base_score_key", key))
+        selected = key == selected_key
+        expanded_key = str(st.session_state.get("expanded_score_base_key", ""))
+        expanded = expanded_key == base_key
+        if selected:
+            st.markdown("<div class='score-selected-strip'></div>", unsafe_allow_html=True)
+
+        cols = st.columns([0.24, 1.12, 0.55, 1.28, 0.8, 0.42, 0.42, 0.42, 0.58, 0.42, 0.42, 0.52, 0.68, 0.4, 1.55], gap="small")
+        variant_count = row.get("Variants")
+        cells = [
+            str(row.get("Source Video", "")),
+            str(row.get("Run Tag", "")) or "-",
+            str(row.get("Product", "")),
+            score_format(row.get("Total Score")),
+            score_format(row.get("Content")),
+            score_format(row.get("Visual")),
+            score_format(row.get("Host Focus")),
+            score_format(row.get("Hook")),
+            score_format(row.get("Quality")),
+            score_format(row.get("Engagement")),
+            score_format(row.get("Similarity")),
+            str(int(score_float(variant_count) or 0)),
+            str(row.get("Flags", "")) or "-",
+        ]
+
+        with cols[0]:
+            if st.button(
+                "v" if expanded else ">",
+                key=f"score_expand_{base_key}_{row_index}",
+                help="Show variants",
+                use_container_width=True,
+            ):
+                st.session_state.expanded_score_base_key = "" if expanded else base_key
+                expanded = not expanded
+        with cols[1]:
+            st.markdown(f"<div class='score-cell'>{html.escape(cells[0])}</div>", unsafe_allow_html=True)
+        with cols[2]:
+            st.markdown(f"<div class='score-cell'>{html.escape(cells[1])}</div>", unsafe_allow_html=True)
+        with cols[3]:
+            button_label = str(row.get("Clip ID", ""))
+            if st.button(
+                button_label,
+                key=f"score_clip_button_{key}_{row_index}",
+                help="Show this clip's score breakdown below",
+                use_container_width=True,
+                type="primary" if selected else "secondary",
+            ):
+                selected_key = key
+                st.session_state.selected_score_key = key
+        for col, value in zip(cols[4:12], cells[2:10]):
+            with col:
+                st.markdown(f"<div class='score-cell'>{html.escape(value)}</div>", unsafe_allow_html=True)
+        with cols[12]:
+            st.markdown(render_similarity_bar(row.get("Similarity")), unsafe_allow_html=True)
+        with cols[13]:
+            st.markdown(f"<div class='score-cell'>{html.escape(cells[11])}</div>", unsafe_allow_html=True)
+        with cols[14]:
+            st.markdown(f"<div class='score-cell'>{html.escape(cells[12])}</div>", unsafe_allow_html=True)
+
+        if expanded:
+            variants = variants_for_score_base(all_rows, base_key)
+            selected_key = render_score_variants_panel(variants, base_key, selected_key)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+    return selected_key
+
+
+def variants_for_score_base(all_rows: pd.DataFrame, base_key: str) -> pd.DataFrame:
+    if all_rows.empty:
+        return all_rows
+    return (
+        all_rows[
+            (all_rows["_base_score_key"].astype(str) == str(base_key))
+            & (all_rows["_row_type"].astype(str) == "variant")
+        ]
+        .sort_values(["_variant_index", "Clip ID"], na_position="last")
+        .reset_index(drop=True)
+    )
+
+
+def render_score_variants_panel(variants: pd.DataFrame, base_key: str, selected_key: str) -> str:
+    indent_cols = st.columns([0.35, 11.65], gap="small")
+    with indent_cols[1]:
+        with st.container(border=True):
+            st.markdown(f"**Variants ({len(variants)})**")
+            header = st.columns([2.45, 0.7, 1.35, 2.1], gap="small")
+            for col, label in zip(header, ["Variant Clip ID", "Type", "Similarity", "Flags"]):
+                with col:
+                    st.markdown(f"<div class='score-grid-header' style='display:block; padding-left:0;'>{label}</div>", unsafe_allow_html=True)
+
+            if variants.empty:
+                st.caption("No variants found for this clip.")
+                return selected_key
+
+            for row_index, row in variants.iterrows():
+                key = str(row.get("_score_key", ""))
+                selected = key == selected_key
+                if selected:
+                    st.markdown("<div class='score-selected-strip'></div>", unsafe_allow_html=True)
+                cols = st.columns([2.45, 0.7, 1.35, 2.1], gap="small")
+                with cols[0]:
+                    if st.button(
+                        str(row.get("Clip ID", "")),
+                        key=f"score_variant_clip_button_{base_key}_{key}_{row_index}",
+                        help="Show this variant's score breakdown below",
+                        use_container_width=True,
+                        type="primary" if selected else "secondary",
+                    ):
+                        selected_key = key
+                        st.session_state.selected_score_key = key
+                with cols[1]:
+                    st.markdown("<div class='score-cell'>variant</div>", unsafe_allow_html=True)
+                with cols[2]:
+                    st.markdown(render_similarity_bar(row.get("Similarity")), unsafe_allow_html=True)
+                with cols[3]:
+                    flags = str(row.get("Flags", "") or "inherits base")
+                    st.markdown(f"<div class='score-cell'>{html.escape(flags)}</div>", unsafe_allow_html=True)
+    return selected_key
+
+
+def render_similarity_bar(value: Any) -> str:
+    numeric = score_float(value)
+    if numeric is None:
+        return "<div class='score-cell'>-</div>"
+    pct = max(0.0, min(float(numeric) / 10.0 * 100.0, 100.0))
+    return (
+        "<div class='score-cell score-sim-wrap'>"
+        f"<span class='score-sim-value'>{numeric:.2f}</span>"
+        "<span class='score-sim-track'>"
+        f"<span class='score-sim-fill' style='width:{pct:.1f}%;'></span>"
+        "</span>"
+        "</div>"
+    )
+
+
+def score_band_color(score: float | None) -> str:
+    if score is None:
+        return "rgba(148, 163, 184, 0.08)"
+    if score >= 7:
+        return "rgba(34, 197, 94, 0.16)"
+    if score >= 4:
+        return "rgba(251, 191, 36, 0.16)"
+    return "rgba(239, 68, 68, 0.16)"
+
+
+def score_format(value: Any) -> str:
+    numeric = score_float(value)
+    return "-" if numeric is None else f"{numeric:.2f}"
+
+
+def render_score_detail(selected: pd.Series) -> None:
+    raw = selected.get("_raw", {}) if isinstance(selected.get("_raw", {}), dict) else {}
+    base_raw = selected.get("_base_raw", {}) if isinstance(selected.get("_base_raw", {}), dict) else {}
+    is_variant = str(selected.get("_row_type", "base")) == "variant"
+    with st.container(border=True):
+        st.markdown("<div class='panel-title'>Score Breakdown</div>", unsafe_allow_html=True)
+        st.markdown(f"**{html.escape(str(selected.get('Clip ID', '')))}**")
+        st.caption(str(selected.get("Output File", "")))
+        if is_variant:
+            st.caption(
+                f"Variant of {selected.get('_base_clip_id', '')}; base scores are inherited, similarity is variant-specific."
+            )
+
+        breakdown_cols = st.columns(8, gap="medium")
+        items = [
+            ("Total", selected.get("Total Score")),
+            ("Content", selected.get("Content")),
+            ("Visual", selected.get("Visual")),
+            ("Host Focus", selected.get("Host Focus")),
+            ("Hook", selected.get("Hook")),
+            ("Quality", selected.get("Quality")),
+            ("Engagement", selected.get("Engagement")),
+            ("Similarity", selected.get("Similarity")),
+        ]
+        for col, (label, value) in zip(breakdown_cols, items):
+            numeric = score_float(value)
+            accent = score_text_color(numeric)
+            with col:
+                st.markdown(
+                    f"""
+                    <div class="mini-stat">
+                        <div class="mini-stat-label">{label}</div>
+                        <div class="mini-stat-value" style="color:{accent};">{score_format(value)}</div>
+                        <div class="mini-stat-sub">{score_band_label(numeric)}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+        summary = str(selected.get("Summary", "") or "No summary available.")
+        st.markdown(f"<div class='small-muted'>{html.escape(summary)}</div>", unsafe_allow_html=True)
+        flags = str(selected.get("Flags", "") or "-")
+        st.markdown(f"Flags: `{flags}`")
+
+        metrics = base_raw.get("metrics", {}) if isinstance(base_raw, dict) else {}
+        if is_variant and isinstance(raw, dict):
+            variant_metrics = raw.get("similarity_metrics", {})
+            if variant_metrics:
+                metrics = {**metrics, "similarity": variant_metrics}
+        if metrics:
+            with st.expander("Raw score metrics"):
+                st.json(metrics)
+
+
+def render_score_methodology() -> None:
+    with st.container(border=True):
+        st.markdown("<div class='panel-title'>How Scores Are Calculated</div>", unsafe_allow_html=True)
+        st.markdown(
+            """
+            **Total Score** is a weighted average of available dimensions: Content 46.7%, Quality 20%, Engagement 33.3%. Visual scoring is disabled. Host Focus receives 20% only when the vision scorer returns a score, with the other weights scaled down proportionally.
+
+            Base clip scores are calculated once per original clip ID, then inherited by all rendered variants of that clip.
+
+            **Content** uses Qwen text scoring on the clip transcript plus deterministic keyword checks to label actual focus: promo, demo, benefit, ingredient, or product-only. Clips that only discuss price or promotion without benefit, demo, ingredient, or product explanation are capped low on content.
+
+            **Visual** is no longer scored and does not contribute to Total Score.
+
+            **Host Focus** is optional Qwen2.5-VL scoring. Every configured sample frame is classified as A engaged with livestream, B looking down at a personal device, or C not attending to the stream. Score = A frames / scored frames * 10.
+
+            **Hook** scores the first 8 seconds when word timestamps are available. It is collected for tuning and is not included in Total Score yet.
+
+            **Quality** uses FFprobe/FFmpeg for clip duration, loudness, and silence detection.
+
+            **Engagement** is returned by the same text-model pass as Content, with the keyword scanner kept as fallback for price/promo, product mentions, demo signals, and benefit claims.
+
+            **Similarity** is variant-only. OpenCV samples frames from sibling variants of the same base clip and compares HSV histograms; higher scores mean the variant looks more visually distinct from its siblings.
+            """
+        )
+
+
+def score_text_color(score: float | None) -> str:
+    if score is None:
+        return "#94a3b8"
+    if score >= 7:
+        return "#22c55e"
+    if score >= 4:
+        return "#fbbf24"
+    return "#ef4444"
+
+
+def score_band_label(score: float | None) -> str:
+    if score is None:
+        return "Unavailable"
+    if score >= 7:
+        return "Green"
+    if score >= 4:
+        return "Yellow"
+    return "Red"
+
+
 def render_queues_tab(summary: dict[str, Any]) -> None:
     render_page_intro("Queues", "Queue depth, pending items, and per-stage throughput at a glance.")
     top_cards = st.columns(4, gap="medium")
@@ -1683,6 +2790,10 @@ def render_queues_tab(summary: dict[str, Any]) -> None:
 
 def render_settings_tab() -> None:
     render_page_intro("Settings", "General controls for refresh, pipeline behavior, and future worker settings.")
+    try:
+        import config as runtime_cfg
+    except Exception:
+        runtime_cfg = None
     settings_tabs = st.tabs(["General", "Pipeline", "Workers", "Paths", "Notifications", "Advanced"])
     with settings_tabs[0]:
         cols = st.columns(2, gap="medium")
@@ -1698,11 +2809,12 @@ def render_settings_tab() -> None:
                 if st.button("Save Changes", key="save_general"):
                     st.session_state.cfg_app_name = app_name
                     st.session_state.cfg_refresh = refresh_interval
+                    st.session_state.refresh_seconds_value = int(refresh_interval)
                     st.session_state.cfg_timezone = timezone
                     st.session_state.cfg_auto_start = auto_start
                     st.session_state.cfg_scan_new = scan_new
                     st.session_state.cfg_scan_interval = scan_interval
-                    st.success("General settings saved")
+                    st.success("General settings saved. Queue automation toggles require restarting the queue runner.")
         with cols[1]:
             with st.container(border=True):
                 st.markdown("<div class='panel-title'>Pipeline Settings</div>", unsafe_allow_html=True)
@@ -1710,8 +2822,11 @@ def render_settings_tab() -> None:
                 retry_delay = st.number_input("Retry Delay (seconds)", min_value=0, max_value=3600, value=int(st.session_state.get("cfg_retry_delay", 30)))
                 delete_source = st.toggle("Delete Source After Processing", value=st.session_state.get("cfg_delete_source", False))
                 auto_generate = st.toggle("Auto Generate Clips", value=st.session_state.get("cfg_auto_generate", True))
-                min_clip = st.number_input("Min Clip Duration (seconds)", min_value=1, max_value=600, value=int(st.session_state.get("cfg_min_clip", 30)))
-                max_clip = st.number_input("Max Clip Duration (seconds)", min_value=1, max_value=600, value=int(st.session_state.get("cfg_max_clip", 120)))
+                min_default = int(getattr(runtime_cfg, "MIN_CLIP_DURATION", st.session_state.get("cfg_min_clip", 30)))
+                max_default = int(getattr(runtime_cfg, "MAX_CLIP_DURATION", st.session_state.get("cfg_max_clip", 120)))
+                min_clip = st.number_input("Min Clip Duration (seconds)", min_value=1, max_value=600, value=min_default)
+                max_clip = st.number_input("Max Clip Duration (seconds)", min_value=1, max_value=600, value=max_default)
+                st.caption("Clip duration values are hot-applied to this Streamlit process. Queue runner policy changes require restart.")
                 if st.button("Save Changes", key="save_pipeline"):
                     st.session_state.cfg_max_retries = max_retries
                     st.session_state.cfg_retry_delay = retry_delay
@@ -1719,7 +2834,12 @@ def render_settings_tab() -> None:
                     st.session_state.cfg_auto_generate = auto_generate
                     st.session_state.cfg_min_clip = min_clip
                     st.session_state.cfg_max_clip = max_clip
-                    st.success("Pipeline settings saved")
+                    if runtime_cfg is not None:
+                        runtime_cfg.MIN_CLIP_DURATION = int(min_clip)
+                        runtime_cfg.MAX_CLIP_DURATION = int(max_clip)
+                        st.success("Pipeline settings saved. Runtime clip duration config updated; queue runner-only controls require restart.")
+                    else:
+                        st.warning("Settings saved for this dashboard session, but config.py could not be imported.")
 
     for tab in settings_tabs[1:]:
         with tab:
@@ -1870,6 +2990,12 @@ def render_dashboard() -> None:
             render_videos_tab(summary)
         elif active_tab == "analytics":
             render_analytics_tab(summary)
+        elif active_tab == "scores":
+            render_scores_tab(summary)
+        elif active_tab == "trends":
+            render_trends_tab(summary)
+        elif active_tab == "focus_debug":
+            render_focus_debug_tab(summary)
         elif active_tab == "queues":
             render_queues_tab(summary)
         elif active_tab == "settings":

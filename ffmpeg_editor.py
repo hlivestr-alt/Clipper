@@ -41,8 +41,8 @@ import os
 import random
 import re
 import subprocess
-import tempfile
 import threading
+import atexit
 from pathlib import Path
 from typing import Optional
 
@@ -74,6 +74,98 @@ _HIGHLIGHT_CATEGORY_ALIASES = {
     "pain": "pain",
     "red": "pain",
 }
+_HIGHLIGHT_CONFIG_CACHE = {
+    "path": None,
+    "stamp": None,
+    "payload": None,
+    "dirty": False,
+    "version": 0,
+}
+_HIGHLIGHT_MATCHER_CACHE: dict[tuple, "_HighlightMatcher"] = {}
+_HIGHLIGHT_FLUSH_REGISTERED = False
+
+
+class _HighlightMatcher:
+    def __init__(self, rules: list[dict]) -> None:
+        self.root: dict = {}
+        for rule in rules:
+            tokens = rule.get("tokens") or []
+            if not tokens:
+                continue
+            node = self.root
+            for token in tokens:
+                node = node.setdefault(token, {})
+            node.setdefault("_rules", []).append(
+                {
+                    "length": len(tokens),
+                    "color": rule.get("color"),
+                    "source_order": int(rule.get("source_order", 0)),
+                }
+            )
+
+    def resolve_word_colors(self, karaoke_words: list) -> list[Optional[str]]:
+        if not karaoke_words or not self.root:
+            return [None] * len(karaoke_words)
+
+        token_entries = []
+        for word_idx, word_data in enumerate(karaoke_words):
+            for token in _normalized_highlight_tokens(word_data.get("word", "")):
+                token_entries.append({
+                    "token": token,
+                    "word_idx": word_idx,
+                })
+
+        if not token_entries:
+            return [None] * len(karaoke_words)
+
+        token_colors: list[Optional[str]] = [None] * len(token_entries)
+        token_match_lengths = [0] * len(token_entries)
+        token_source_orders = [10**12] * len(token_entries)
+        total_tokens = len(token_entries)
+
+        for start_idx in range(total_tokens):
+            node = self.root
+            token_idx = start_idx
+            while token_idx < total_tokens:
+                token = token_entries[token_idx]["token"]
+                node = node.get(token)
+                if node is None:
+                    break
+
+                for rule in node.get("_rules", []):
+                    length = rule["length"]
+                    source_order = rule["source_order"]
+                    color = rule["color"]
+                    end_idx = start_idx + length
+                    for matched_idx in range(start_idx, end_idx):
+                        current_len = token_match_lengths[matched_idx]
+                        current_order = token_source_orders[matched_idx]
+                        if length > current_len or (length == current_len and source_order < current_order):
+                            token_match_lengths[matched_idx] = length
+                            token_source_orders[matched_idx] = source_order
+                            token_colors[matched_idx] = color
+
+                token_idx += 1
+
+        word_colors: list[Optional[str]] = [None] * len(karaoke_words)
+        word_match_lengths = [0] * len(karaoke_words)
+        word_source_orders = [10**12] * len(karaoke_words)
+        for token_idx, entry in enumerate(token_entries):
+            color = token_colors[token_idx]
+            if not color:
+                continue
+            word_idx = entry["word_idx"]
+            match_len = token_match_lengths[token_idx]
+            source_order = token_source_orders[token_idx]
+            if (
+                match_len > word_match_lengths[word_idx]
+                or (match_len == word_match_lengths[word_idx] and source_order < word_source_orders[word_idx])
+            ):
+                word_match_lengths[word_idx] = match_len
+                word_source_orders[word_idx] = source_order
+                word_colors[word_idx] = color
+
+        return word_colors
 
 
 # =============================================================================
@@ -230,6 +322,7 @@ def edit_clip(
             W=W, H=H,
             clip_duration=clip_duration,
             clip_fps=clip_fps,
+            has_audio=info.get("has_audio", False),
             moment=moment,
             prod_trigger=prod_trigger,
             face_zooms=face_zooms,
@@ -468,7 +561,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 def _build_and_run(
     raw_clip_path, output_path, ass_path,
-    W, H, clip_duration, clip_fps,
+    W, H, clip_duration, clip_fps, has_audio,
     moment, prod_trigger, face_zooms,
     zoom_dur, zoom_scale, hook_end,
     extra_inputs, sfx_events, cfg,
@@ -589,7 +682,7 @@ def _build_and_run(
                 stroke_width=hook_sw,
                 stroke_color=hook_sc,
                 shadow_color=hook_shadow,
-                center_y=int(H * float(getattr(cfg, "HOOK_TOP_Y_POS", 0.10))),
+                center_y=int(H * float(getattr(cfg, "HOOK_TOP_Y_POS", 0.20))),
                 start_t=0.0,
                 end_t=hook_end_t,
                 block_tag="vhooktop",
@@ -608,7 +701,7 @@ def _build_and_run(
                 stroke_width=max(2, int(hook_sw * 0.75)),
                 stroke_color=hook_sc,
                 shadow_color=hook_shadow,
-                center_y=int(H * float(getattr(cfg, "HOOK_MID_Y_POS", 0.80))),
+                center_y=int(H * float(getattr(cfg, "HOOK_MID_Y_POS", 0.60))),
                 start_t=0.0,
                 end_t=hook_end_t,
                 block_tag="vhookmid",
@@ -628,7 +721,7 @@ def _build_and_run(
                 stroke_width=hook_sw,
                 stroke_color=hook_sc,
                 shadow_color=hook_shadow,
-                center_y=int(H * float(getattr(cfg, "HOOK_BOTTOM_Y_POS", 0.85))),
+                center_y=int(H * float(getattr(cfg, "HOOK_BOTTOM_Y_POS", 0.65))),
                 start_t=0.0,
                 end_t=hook_end_t,
                 block_tag="vhookbtm",
@@ -695,7 +788,12 @@ def _build_and_run(
 
     # ── 8. Audio — SFX amix ───────────────────────────────────────────────────
     n_sfx = len(sfx_events)
-    aud = "[0:a]"
+    aud = "[0:a]" if has_audio else "[abase]"
+    if not has_audio:
+        fc.append(
+            f"anullsrc=channel_layout=stereo:sample_rate=44100,"
+            f"atrim=0:{clip_duration:.3f}[abase]"
+        )
     sfx_input_offset = 1 + len(extra_inputs)  # inputs: raw + extra_images + sfx
 
     if n_sfx > 0:
@@ -731,6 +829,7 @@ def _build_and_run(
     fps    = output_fps
     ab     = getattr(cfg, "OUTPUT_AUDIO_BITRATE", "128k")
 
+    fc_clean = []
     if fc:
         fc_clean = [f for f in fc if f and f.strip()]
 
@@ -738,7 +837,8 @@ def _build_and_run(
         if getattr(cfg, "LOG_FFMPEG_FILTER_COMPLEX", False):
             log.debug("FILTER_COMPLEX:\n" + ";\n".join(fc_clean))
 
-    cmd += ["-filter_complex", ";".join(fc_clean)]
+    if fc_clean:
+        cmd += ["-filter_complex", ";".join(fc_clean)]
 
     if vid == "[0:v]":
         cmd += ["-map", "0:v"]
@@ -1406,15 +1506,71 @@ def _save_highlight_phrase_config_unlocked(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f"{path.name}.tmp")
     with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(_normalize_highlight_phrase_config(payload), f, indent=2, ensure_ascii=True)
+        json.dump(payload, f, indent=2, ensure_ascii=True)
         f.write("\n")
     os.replace(tmp_path, path)
+
+
+def _highlight_path_stamp(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _register_highlight_flush_unlocked() -> None:
+    global _HIGHLIGHT_FLUSH_REGISTERED
+    if _HIGHLIGHT_FLUSH_REGISTERED:
+        return
+    atexit.register(flush_highlight_phrase_config)
+    _HIGHLIGHT_FLUSH_REGISTERED = True
+
+
+def _cached_highlight_phrase_config_unlocked(path: Path) -> dict:
+    cache_path = _HIGHLIGHT_CONFIG_CACHE.get("path")
+    cached_payload = _HIGHLIGHT_CONFIG_CACHE.get("payload")
+    current_stamp = _highlight_path_stamp(path)
+    cache_matches = cache_path == path and cached_payload is not None
+
+    if cache_matches and _HIGHLIGHT_CONFIG_CACHE.get("dirty"):
+        return cached_payload
+
+    if cache_matches and _HIGHLIGHT_CONFIG_CACHE.get("stamp") == current_stamp:
+        return cached_payload
+
+    payload = _load_highlight_phrase_config_unlocked(path)
+    _HIGHLIGHT_CONFIG_CACHE.update({
+        "path": path,
+        "stamp": current_stamp,
+        "payload": payload,
+        "dirty": False,
+        "version": int(_HIGHLIGHT_CONFIG_CACHE.get("version", 0)) + 1,
+    })
+    _HIGHLIGHT_MATCHER_CACHE.clear()
+    _register_highlight_flush_unlocked()
+    return payload
 
 
 def _load_highlight_phrase_config(cfg) -> dict:
     path = _highlight_phrase_config_path(cfg)
     with _HIGHLIGHT_CONFIG_LOCK:
-        return _load_highlight_phrase_config_unlocked(path)
+        return _cached_highlight_phrase_config_unlocked(path)
+
+
+def flush_highlight_phrase_config(cfg=None) -> None:
+    path = _highlight_phrase_config_path(cfg) if cfg is not None else _HIGHLIGHT_CONFIG_CACHE.get("path")
+    if path is None:
+        return
+
+    with _HIGHLIGHT_CONFIG_LOCK:
+        payload = _HIGHLIGHT_CONFIG_CACHE.get("payload")
+        if not _HIGHLIGHT_CONFIG_CACHE.get("dirty") or payload is None:
+            return
+        _save_highlight_phrase_config_unlocked(Path(path), payload)
+        _HIGHLIGHT_CONFIG_CACHE["stamp"] = _highlight_path_stamp(Path(path))
+        _HIGHLIGHT_CONFIG_CACHE["dirty"] = False
+        log.info(f"Flushed learned highlight phrases to {path}")
 
 
 def _index_highlight_phrases(phrase_config: dict) -> dict[str, str]:
@@ -1459,7 +1615,7 @@ def _learn_highlight_phrases_from_moment(moment: Optional[dict], cfg) -> dict:
     candidates = _discover_highlight_phrase_candidates(moment)
 
     with _HIGHLIGHT_CONFIG_LOCK:
-        phrase_config = _load_highlight_phrase_config_unlocked(path)
+        phrase_config = _cached_highlight_phrase_config_unlocked(path)
         if not candidates:
             return phrase_config
 
@@ -1486,9 +1642,16 @@ def _learn_highlight_phrases_from_moment(moment: Optional[dict], cfg) -> dict:
             learned.append(candidate)
 
         if learned:
-            _save_highlight_phrase_config_unlocked(path, phrase_config)
+            _HIGHLIGHT_CONFIG_CACHE["dirty"] = True
+            _HIGHLIGHT_CONFIG_CACHE["version"] = int(_HIGHLIGHT_CONFIG_CACHE.get("version", 0)) + 1
+            _HIGHLIGHT_MATCHER_CACHE.clear()
+            log.info(
+                "Learned %d highlight phrase(s) from moment config=%s",
+                len(learned),
+                str(path),
+            )
             for item in learned:
-                log.info(
+                log.debug(
                     "Learned highlight phrase category=%s phrase=%r source=%s config=%s",
                     item["category"],
                     item["phrase"],
@@ -1526,6 +1689,31 @@ def _build_highlight_rules(cfg, phrase_config: Optional[dict] = None) -> list[di
     return rules
 
 
+def _highlight_color_key(cfg) -> tuple[str, str, str]:
+    return (
+        str(getattr(cfg, "HIGHLIGHT_YELLOW_COLOR", "#FFD600")),
+        str(getattr(cfg, "HIGHLIGHT_GREEN_COLOR", "#00C853")),
+        str(getattr(cfg, "HIGHLIGHT_RED_COLOR", "#FF3B30")),
+    )
+
+
+def _get_highlight_matcher(cfg, phrase_config: Optional[dict] = None) -> _HighlightMatcher:
+    path = _highlight_phrase_config_path(cfg)
+    with _HIGHLIGHT_CONFIG_LOCK:
+        if phrase_config is None:
+            phrase_config = _cached_highlight_phrase_config_unlocked(path)
+        version = int(_HIGHLIGHT_CONFIG_CACHE.get("version", 0))
+        cache_key = (path, version, _highlight_color_key(cfg))
+        matcher = _HIGHLIGHT_MATCHER_CACHE.get(cache_key)
+        if matcher is None:
+            rules = _build_highlight_rules(cfg, phrase_config=phrase_config)
+            matcher = _HighlightMatcher(rules)
+            _HIGHLIGHT_MATCHER_CACHE.clear()
+            _HIGHLIGHT_MATCHER_CACHE[cache_key] = matcher
+            log.debug(f"Built highlight matcher with {len(rules)} phrase rules")
+        return matcher
+
+
 def _highlight_color_for_category(category: str, cfg) -> Optional[str]:
     normalized = _coerce_highlight_category(category)
     if normalized == "benefit":
@@ -1537,7 +1725,10 @@ def _highlight_color_for_category(category: str, cfg) -> Optional[str]:
     return None
 
 
-def _resolve_highlight_word_colors(karaoke_words: list, highlight_rules: list[dict]) -> list[Optional[str]]:
+def _resolve_highlight_word_colors(karaoke_words: list, highlight_rules) -> list[Optional[str]]:
+    if isinstance(highlight_rules, _HighlightMatcher):
+        return highlight_rules.resolve_word_colors(karaoke_words)
+
     if not karaoke_words or not highlight_rules:
         return [None] * len(karaoke_words)
 
@@ -1592,7 +1783,7 @@ def _build_highlight_plan(clip_words: list, cfg, moment: Optional[dict] = None) 
         word_data["_highlight_idx"] = idx
 
     phrase_config = _learn_highlight_phrases_from_moment(moment, cfg)
-    highlight_rules = _build_highlight_rules(cfg, phrase_config=phrase_config)
+    highlight_rules = _get_highlight_matcher(cfg, phrase_config=phrase_config)
 
     word_colors = _resolve_highlight_word_colors(karaoke_words, highlight_rules)
     return {
@@ -1745,7 +1936,9 @@ def _probe_video(path: str) -> Optional[dict]:
             capture_output=True, text=True, timeout=30,
         )
         data = json.loads(r.stdout)
-        for s in data.get("streams", []):
+        streams = data.get("streams", [])
+        has_audio = any(s.get("codec_type") == "audio" for s in streams)
+        for s in streams:
             if s.get("codec_type") == "video":
                 fps = _parse_ffprobe_fps(
                     s.get("avg_frame_rate")
@@ -1757,6 +1950,7 @@ def _probe_video(path: str) -> Optional[dict]:
                     "height":   int(s["height"]),
                     "duration": float(data["format"].get("duration", s.get("duration", 30))),
                     "fps":      fps,
+                    "has_audio": has_audio,
                 }
     except Exception as e:
         log.error(f"ffprobe failed for {path}: {e}")

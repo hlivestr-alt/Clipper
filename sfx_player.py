@@ -29,6 +29,7 @@ from pathlib import Path
 log = logging.getLogger("proya.sfx")
 
 AUDIO_EXTS = {".wav", ".mp3", ".ogg", ".aac", ".flac", ".m4a"}
+_SFX_FILE_CACHE = {}
 
 
 def _format_rupiah_compact(amount_text: str) -> str:
@@ -59,7 +60,15 @@ def _get_random_sfx(folder: str | Path) -> Path | None:
     folder = Path(folder)
     if not folder.exists():
         return None
-    files = [f for f in folder.iterdir() if f.suffix.lower() in AUDIO_EXTS]
+    try:
+        stamp = (str(folder.resolve()).casefold(), folder.stat().st_mtime_ns)
+    except OSError:
+        stamp = (str(folder).casefold(), None)
+    files = _SFX_FILE_CACHE.get(stamp)
+    if files is None:
+        files = [f for f in folder.iterdir() if f.suffix.lower() in AUDIO_EXTS]
+        _SFX_FILE_CACHE.clear()
+        _SFX_FILE_CACHE[stamp] = files
     if not files:
         log.debug(f"SFX folder empty: {folder}")
         return None
@@ -191,67 +200,6 @@ def build_sfx_events(
         f"(block interval={block_interval})"
     )
     return events
-
-
-# -----------------------------------------------------------------------------
-#  AUDIO MIXER
-# -----------------------------------------------------------------------------
-
-def mix_sfx_into_clip(video_clip, sfx_events: list, clip_duration: float):
-    """
-    Mix SFX audio events into a VideoFileClip's audio track.
-
-    Uses MoviePy's CompositeAudioClip to overlay all SFX on the original audio.
-    Returns the video_clip with mixed audio set, or the original clip if no
-    SFX events or if audio mixing fails.
-    """
-    if not sfx_events:
-        return video_clip
-
-    try:
-        from moviepy.editor import AudioFileClip, CompositeAudioClip
-    except ImportError:
-        log.warning("moviepy not available for SFX mixing")
-        return video_clip
-
-    audio_clips = []
-
-    if video_clip.audio is not None:
-        audio_clips.append(video_clip.audio)
-
-    loaded = 0
-    for ev in sfx_events:
-        t = ev["t"]
-        volume = ev["volume"]
-        sfx_path = ev["sfx_path"]
-
-        if t >= clip_duration:
-            continue
-
-        try:
-            sfx_audio = AudioFileClip(str(sfx_path))
-
-            max_dur = clip_duration - t
-            if sfx_audio.duration > max_dur:
-                sfx_audio = sfx_audio.subclip(0, max_dur)
-
-            sfx_audio = sfx_audio.volumex(volume)
-            sfx_audio = sfx_audio.set_start(t)
-
-            audio_clips.append(sfx_audio)
-            loaded += 1
-        except Exception as e:
-            log.debug(f"SFX load failed ({sfx_path.name}): {e}")
-
-    if loaded == 0:
-        return video_clip
-
-    try:
-        mixed = CompositeAudioClip(audio_clips).set_duration(clip_duration)
-        return video_clip.set_audio(mixed)
-    except Exception as e:
-        log.warning(f"SFX audio mix failed: {e}")
-        return video_clip
 
 
 # -----------------------------------------------------------------------------

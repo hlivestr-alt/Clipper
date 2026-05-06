@@ -251,8 +251,12 @@ def load_cached_transcript(output_dir: str) -> Optional[dict]:
     transcript_path = Path(output_dir) / "transcript.json"
     if not transcript_path.exists():
         return None
-    with open(transcript_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(transcript_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as exc:
+        log.warning(f"Ignoring unreadable transcript cache {transcript_path}: {exc}")
+        return None
 
 
 def load_cached_raw_transcription_checkpoint(output_dir: str, video_path: str, cfg) -> Optional[dict]:
