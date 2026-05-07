@@ -199,7 +199,7 @@ WORD_CORRECTIONS = {
     "trexamide"      : "tranexamic",
     "exit"           : "acid",
     "asitanya"       : "acid",
-
+    "seritmennnya"   : "treatmentnya",
 
  }
 # Apply corrections to subtitle text displayed on clips (in addition to transcript)
@@ -213,6 +213,8 @@ LM_STUDIO_MOMENT_MODEL_ID = "qwen/qwen3.6-27b"
 LM_STUDIO_MODEL    = LM_STUDIO_MOMENT_MODEL_ID          # match the model name shown in LM Studio
 LM_STUDIO_TIMEOUT  = 360                       # seconds per request
 LM_STUDIO_MODEL_MANAGEMENT_ENABLED = True
+LM_STUDIO_MODEL_UNLOAD_TIMEOUT = 600           # Qwen 3.6 can take minutes to fully free VRAM
+LM_STUDIO_MODEL_UNLOAD_LOG_INTERVAL = 30       # log wait progress so unloads do not look frozen
 MOMENT_DETECTOR_WORKERS = 2                    # limited parallel LM Studio calls
 
 # ── Whisper ───────────────────────────────────────────────────────────────────
@@ -283,6 +285,8 @@ FONT_HOOK       = "assets/fonts/Anton-Regular.ttf"              # or "Bebas-Neue
 FONT_LABEL      = "assets/fonts/Montserrat-SemiBold.ttf"  # or "Poppins-Medium", "Arial-Bold"
 FONT_SUBTITLE   = "assets/fonts/Montserrat-ExtraBold.ttf"    # or "Arial-Bold"
 FONT_PRODUCT    = "assets/fonts/PlayfairDisplay-Italic-VariableFont_wght.ttf"  # for zoom caption
+SUBTITLE_FONT_RANDOMIZE = True
+SUBTITLE_FONT_DIR = "assets/fonts/subtitle"
 
 # ── Hook / Title overlay ──────────────────────────────────────────────────────
 HOOK_FONTSIZE       = 150           # 110–150 range; scales with text length
@@ -335,9 +339,7 @@ EMOJI_CONFIG = {
 # Persistent registry path + category colors
 HIGHLIGHT_PHRASES_PATH = "highlight_phrases.json"
 HIGHLIGHT_YELLOW_COLOR = "#FFD600"
-
 HIGHLIGHT_GREEN_COLOR = "#00C853"
-
 HIGHLIGHT_RED_COLOR = "#FF3B30"
 
 # ── Products ──────────────────────────────────────────────────────────────────
@@ -434,6 +436,18 @@ SFX_VOLUME_RED         = 0.10    # pain / problem words
 # 2 means: trigger on a highlighted block, skip the next block, then allow again.
 SFX_HIGHLIGHT_BLOCK_INTERVAL = 2
 
+# ── BGM (Background Music) ───────────────────────────────────────────────────
+# Drop music beds into assets/bgm/. If the folder is empty/missing, rendering
+# continues with the original voice/SFX audio only.
+BGM_ENABLED              = True
+BGM_DIR                  = "assets/bgm"
+BGM_VOLUME               = 0.08    # 10-15% is the sweet spot under livestream voice
+BGM_DUCKING_ENABLED      = True    # lower BGM automatically when speech/SFX is present
+BGM_DUCKING_THRESHOLD    = 0.03
+BGM_DUCKING_RATIO        = 8.0
+BGM_DUCKING_ATTACK_MS    = 50
+BGM_DUCKING_RELEASE_MS   = 350
+
 # Quality-first overrides for product-selling clips.
 # Stricter values reduce random cuts, silent clips, and weak filler moments.
 CHUNK_DURATION = 300
@@ -466,7 +480,7 @@ RAW_CUT_PRESET  = "ultrafast"
 SCORER_ENABLED = True
 SCORER_FRAME_SAMPLE_RATE = 10
 SCORER_MIN_SCORE_TO_EXPORT = 0.0
-SCORER_WEIGHTS = {"content": 0.466667, "visual": 0.0, "quality": 0.2, "engagement": 0.333333}
+SCORER_WEIGHTS = {"content": 0.466667, "quality": 0.2, "engagement": 0.333333}
 SCORER_HOST_FOCUS_WEIGHT = 0.0
 SCORER_HOOK_WEIGHT = 0.0
 SCORER_APPLY_CAPS = True
@@ -482,15 +496,19 @@ SCORER_VISION_BASE_URL = "http://localhost:1234/v1"
 SCORER_VISION_API_KEY = "lm-studio"
 SCORER_VISION_MODEL_ID = "qwen2.5-vl-32b-instruct"
 SCORER_VISION_MODEL = SCORER_VISION_MODEL_ID
-SCORER_VISION_TIMEOUT = 120
+SCORER_VISION_TIMEOUT = 600
 SCORER_VISION_DEBUG = False
 SCORER_FOCUS_DROP_OUTLIERS = True
 SCORER_FOCUS_SKIP_FIRST_FRAME = True
 SCORER_BATCH_FLUSH_EVERY = 5
 SCORER_SIMILARITY_FRAME_SAMPLE_RATE = 30
 SCORER_SIMILARITY_MAX_FRAMES = 24
-SCORER_PRODUCT_VISIBLE_MIN_RATIO = 0.05
-SCORER_GENERIC_PRODUCT_LABELS = ["bottle", "cup"]
+
+# Pre-subtitle advertising compliance checks for Indonesian skincare claims.
+COMPLIANCE_ENABLED = True
+COMPLIANCE_AUTO_FIX = True
+COMPLIANCE_BLOCK_HIGH = True
+COMPLIANCE_LM_TIMEOUT = 60
 
 # ── Variation Engine ──────────────────────────────────────────────────────────
 # How many style variants to render per detected moment.
@@ -505,3 +523,26 @@ VARIANT_SEED = 42
 # Bake mirror/speed/grade/crop into the FFmpeg raw-cut step (recommended).
 # True = fastest (pure FFmpeg, GPU-accelerated). False = MoviePy (slower).
 VARIANT_FFMPEG_BAKE = True
+
+# Optional local B-roll intro variants.
+# Drop short vertical/horizontal intro videos into assets/broll_intro/.
+# When files exist, a deterministic 20-40% of generated variants use B-roll
+# behind the hook text instead of the before/after image.
+BROLL_INTRO_ENABLED = True
+BROLL_INTRO_DIR = "assets/broll_intro"
+BROLL_INTRO_MIN_VARIANT_RATE = 0.20
+BROLL_INTRO_MAX_VARIANT_RATE = 0.40
+BROLL_INTRO_APPLY_TO_ORIGINAL = False
+BROLL_INTRO_MAX_DURATION = 2.5
+BROLL_INTRO_FADE_IN = 0.0
+BROLL_INTRO_FADE_OUT = 0.20
+BROLL_INTRO_REQUIRE_PRODUCT_MATCH = True
+BROLL_INTRO_ALLOW_GENERIC_ROOT = False
+BROLL_INTRO_PRODUCT_ALIASES = {
+    "Cleanser": ["cleanser", "face wash", "sabun muka"],
+    "Eye Cream": ["eye cream", "eyecream", "krim mata"],
+    "Mask": ["mask", "masker"],
+    "Serum": ["serum"],
+    "Skin Cream": ["skin cream", "cream", "moisturizer", "moisturiser", "krim"],
+    "Toner": ["toner"],
+}

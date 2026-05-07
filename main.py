@@ -31,6 +31,7 @@
 # =============================================================================
 
 import argparse
+import copy
 import json
 import logging
 import os
@@ -116,6 +117,26 @@ def _process_clip_job(job: dict, video_path: str, transcript_words: list, produc
     raw_path    = job["raw_path"]
     os.makedirs(Path(output_path).parent, exist_ok=True)
 
+    clip_words = job.get("clip_words")
+    if clip_words is None:
+        clip_words = get_words_for_clip(transcript_words, job["start"], job["end"])
+
+    compliance_result = _prepare_job_compliance(job, clip_words, cfg)
+    if compliance_result is not None:
+        if compliance_result.get("blocked"):
+            return {
+                "clip_id": job["clip_id"],
+                "status": "compliance_blocked",
+                "output_filename": job["output_filename"],
+                "manifest": _build_manifest_row(job, 0, "compliance_blocked"),
+            }
+        try:
+            from compliance_checker import apply_compliance_to_words
+
+            clip_words = apply_compliance_to_words(clip_words, compliance_result)
+        except Exception as exc:
+            log.warning(f"Compliance subtitle auto-fix failed for {job['clip_id']}: {exc}")
+
     if Path(output_path).exists():
         return {
             "clip_id": job["clip_id"],
@@ -174,9 +195,6 @@ def _process_clip_job(job: dict, video_path: str, transcript_words: list, produc
     else:
         edit_cfg = cfg
 
-    clip_words = job.get("clip_words")
-    if clip_words is None:
-        clip_words = get_words_for_clip(transcript_words, job["start"], job["end"])
     clip_product_events = job.get("clip_product_events")
     if clip_product_events is None:
         clip_product_events = get_events_for_clip(product_events, job["start"], job["end"])
@@ -215,9 +233,85 @@ def _process_clip_job(job: dict, video_path: str, transcript_words: list, produc
     }
 
 
+def _ensure_job_hook_payload(job: dict) -> dict:
+    if isinstance(job.get("hook_payload"), dict):
+        return job["hook_payload"]
+    try:
+        from hook_text import ensure_hook_payload
+
+        payload = ensure_hook_payload(job["moment"])
+    except Exception:
+        moment = job.get("moment", {})
+        payload = {
+            "headline": str(moment.get("hook") or "").strip(),
+            "subtext": "",
+            "cta": "",
+        }
+    job["hook_payload"] = payload
+    return payload
+
+
+def _prepare_job_compliance(job: dict, clip_words: list, cfg) -> dict | None:
+    if not bool(getattr(cfg, "COMPLIANCE_ENABLED", True)):
+        return None
+    try:
+        from compliance_checker import (
+            apply_compliance_to_hook_payload,
+            check_compliance,
+            compliance_path_for_clip,
+            should_block_result,
+            write_compliance_result,
+        )
+    except Exception as exc:
+        log.warning(f"Compliance checker unavailable; continuing without compliance scan: {exc}")
+        return None
+
+    result = copy.deepcopy(job.get("compliance_result")) if job.get("compliance_result") else None
+    hook_payload = _ensure_job_hook_payload(job)
+    if result is None:
+        result = check_compliance(
+            clip_words,
+            job.get("product", "general"),
+            hook_text=hook_payload,
+            cfg=cfg,
+        )
+
+    result["blocked"] = should_block_result(result, cfg)
+    if not result.get("blocked"):
+        patched_hook = apply_compliance_to_hook_payload(hook_payload, result)
+        if patched_hook != hook_payload:
+            job["moment"]["hook_overlay"] = patched_hook
+            job["moment"]["hook"] = patched_hook.get("headline", job["moment"].get("hook", ""))
+            job["hook_payload"] = patched_hook
+    compliance_path = compliance_path_for_clip(job["output_path"], job["clip_id"])
+    write_compliance_result(compliance_path, result)
+    job["compliance_result"] = result
+    job["compliance_json_path"] = _relative_to_output_path(compliance_path, Path(job["output_path"]))
+
+    if result.get("blocked"):
+        violations = [
+            str(item.get("original_text") or "")
+            for item in result.get("violations", [])
+            if isinstance(item, dict) and item.get("severity") == "high"
+        ]
+        log.warning(
+            "    Compliance blocked %s: %s",
+            job["clip_id"],
+            "; ".join(violations[:5]) or result.get("compliance_summary", ""),
+        )
+    elif result.get("violation_count"):
+        log.info(
+            "    Compliance flagged %s: violations=%s auto_fixed=%s",
+            job["clip_id"],
+            result.get("violation_count", 0),
+            result.get("auto_fixed", False),
+        )
+    return result
+
+
 def _build_manifest_row(job: dict, product_event_count: int, status: str) -> dict:
     moment = job["moment"]
-    return {
+    row = {
         "clip_id": job["clip_id"],
         "version_dir": job.get("version_dir") or "",
         "output_file": job.get("output_relative_path") or job["output_filename"],
@@ -226,12 +320,39 @@ def _build_manifest_row(job: dict, product_event_count: int, status: str) -> dic
         "duration": round(job["end"] - job["start"], 1),
         "score": job["score"],
         "hook": moment.get("hook", ""),
+        "hook_overlay": moment.get("hook_overlay", {}),
         "product": job["product"],
         "clip_type": job["clip_type"],
         "reason": moment.get("reason", ""),
         "product_events": product_event_count,
         "status": status,
     }
+    compliance_result = job.get("compliance_result")
+    if isinstance(compliance_result, dict):
+        row["compliance_passed"] = bool(compliance_result.get("passed", False))
+        row["violation_count"] = int(compliance_result.get("violation_count") or 0)
+        row["auto_fixed"] = bool(compliance_result.get("auto_fixed", False))
+        row["compliance_blocked"] = bool(compliance_result.get("blocked", False))
+        row["compliance_summary"] = str(compliance_result.get("compliance_summary") or "")
+        if job.get("compliance_json_path"):
+            row["compliance_file"] = job["compliance_json_path"]
+    variant = moment.get("_variant")
+    broll_intro_path = str(getattr(variant, "broll_intro_path", "") or "") if variant is not None else ""
+    if broll_intro_path:
+        row["broll_intro"] = True
+        row["broll_intro_file"] = broll_intro_path
+        row["broll_intro_duration"] = float(getattr(variant, "broll_intro_duration", 0.0) or 0.0)
+        row["broll_intro_product"] = str(getattr(variant, "broll_intro_product", "") or "")
+    return row
+
+
+def _relative_to_output_path(path: str | Path, output_path: Path) -> str:
+    target = Path(path)
+    output_root = output_path.parent.parent if output_path.parent.name.startswith("v") else output_path.parent
+    try:
+        return str(target.resolve().relative_to(output_root.resolve())).replace("\\", "/")
+    except Exception:
+        return str(target)
 
 
 def _build_clip_word_index(words: list) -> dict:
@@ -310,6 +431,52 @@ def _attach_precomputed_clip_contexts(jobs: list, transcript_words: list, produc
         job["clip_product_events"] = context["clip_product_events"]
 
 
+def _attach_precomputed_compliance(jobs: list, cfg) -> None:
+    if not bool(getattr(cfg, "COMPLIANCE_ENABLED", True)):
+        return
+    try:
+        from compliance_checker import check_compliance, transcript_to_text_with_spans
+    except Exception as exc:
+        log.warning(f"Compliance checker unavailable; skipping pre-scan: {exc}")
+        return
+
+    result_cache: dict[tuple, dict] = {}
+    scanned = 0
+    flagged = 0
+    qwen_calls = 0
+    for job in jobs:
+        clip_words = job.get("clip_words") or []
+        hook_payload = _ensure_job_hook_payload(job)
+        transcript_text, _spans = transcript_to_text_with_spans(clip_words)
+        key = (
+            round(float(job.get("start", 0.0)), 3),
+            round(float(job.get("end", 0.0)), 3),
+            str(job.get("product", "general")).casefold(),
+            transcript_text,
+            str(hook_payload),
+        )
+        result = result_cache.get(key)
+        if result is None:
+            result = check_compliance(
+                clip_words,
+                job.get("product", "general"),
+                hook_text=hook_payload,
+                cfg=cfg,
+            )
+            result_cache[key] = result
+            scanned += 1
+            flagged += 1 if result.get("violation_count") else 0
+            qwen_calls += 1 if result.get("qwen_called") else 0
+        job["compliance_result"] = copy.deepcopy(result)
+
+    log.info(
+        "  Compliance pre-scan: %s unique transcript(s), %s flagged, %s Qwen call(s)",
+        scanned,
+        flagged,
+        qwen_calls,
+    )
+
+
 def _score_rendered_clips(jobs: list, manifest: list, output_dir: str, cfg, progress_callback=None) -> list:
     if not getattr(cfg, "SCORER_ENABLED", True):
         return []
@@ -328,7 +495,7 @@ def _score_rendered_clips(jobs: list, manifest: list, output_dir: str, cfg, prog
     score_jobs = []
     for job in jobs:
         row = manifest_by_clip.get(job.get("clip_id"))
-        if not row or row.get("status") == "failed":
+        if not row or row.get("status") in {"failed", "compliance_blocked"}:
             continue
         output_path = Path(job["output_path"])
         if output_path.exists():
@@ -356,6 +523,12 @@ def _score_rendered_clips(jobs: list, manifest: list, output_dir: str, cfg, prog
                 "hook": row.get("hook", ""),
                 "clip_type": row.get("clip_type", ""),
                 "source_moment_score": row.get("score"),
+                "compliance_passed": row.get("compliance_passed"),
+                "violation_count": row.get("violation_count"),
+                "auto_fixed": row.get("auto_fixed"),
+                "compliance_blocked": row.get("compliance_blocked"),
+                "compliance_summary": row.get("compliance_summary", ""),
+                "compliance_file": row.get("compliance_file", ""),
             }
         )
 
@@ -387,7 +560,15 @@ def _score_rendered_clips(jobs: list, manifest: list, output_dir: str, cfg, prog
             )
 
     if scores:
-        artifacts = write_score_artifacts(scores, output_dir, groups=groups, optimization_stats=stats, cfg=cfg)
+        finalize_scores = not bool(getattr(cfg, "SCORER_VISION_ENABLED", False))
+        artifacts = write_score_artifacts(
+            scores,
+            output_dir,
+            groups=groups,
+            optimization_stats=stats,
+            cfg=cfg,
+            finalize=finalize_scores,
+        )
         log.info(
             "  Grouped scoring saved %s full scoring call(s): previous=%s actual=%s",
             stats.get("saved_scoring_calls", 0),
@@ -408,6 +589,9 @@ def _score_rendered_clips(jobs: list, manifest: list, output_dir: str, cfg, prog
         log.info(f"  Scores summary: {artifacts.get('summary_path')}")
         if artifacts.get("scores_report_path"):
             log.info(f"  Scores report:  {artifacts.get('scores_report_path')}")
+        elif not finalize_scores:
+            log.info("  Text-only scores saved as draft; final tier sorting waits for host-focus scoring")
+        _apply_score_sort_moves_to_manifest(manifest, artifacts)
 
     return scores
 
@@ -420,22 +604,23 @@ def _score_rendered_clip_host_focus(
     progress_callback=None,
 ) -> list:
     if not scores or not bool(getattr(cfg, "SCORER_VISION_ENABLED", False)):
-        log.info("Skipping Qwen-VL host-focus scoring (disabled or no text scores)")
+        log.info("Host-focus vision scoring disabled or no text scores; Qwen-VL not needed")
         return scores
 
     log.info("\n-- STAGE 6: HOST FOCUS VISION SCORING (Qwen-VL) --------------------------")
     _report(progress_callback, "scoring", 99, "Scoring host focus with Qwen-VL...")
-    vision_ready = _start_vision_model_stage(cfg)
+    vision_ready = _start_vision_model_stage(
+        cfg,
+        active_stage="stage 6 host focus vision scoring",
+    )
     if not vision_ready and _model_management_enabled(cfg):
-        log.warning("Skipping host-focus scoring because Qwen-VL did not become ready")
         _finish_vision_model_stage(cfg)
-        return scores
+        raise RuntimeError("Qwen-VL did not become ready for host-focus scoring")
 
     try:
         from clip_scorer import apply_host_focus_vision_scores, write_score_artifacts
     except Exception as exc:
-        log.warning(f"Clip scorer vision stage unavailable: {exc}")
-        return scores
+        raise RuntimeError(f"Clip scorer vision stage unavailable: {exc}") from exc
 
     try:
         updated_scores, updated_groups, vision_stats = apply_host_focus_vision_scores(
@@ -468,9 +653,27 @@ def _score_rendered_clip_host_focus(
             vision_stats.get("vision_base_group_count", 0),
         )
         log.info(f"  Updated scores summary: {artifacts.get('summary_path')}")
+        _apply_score_sort_moves_to_manifest(manifest, artifacts)
         return updated_scores
     finally:
-        _finish_vision_model_stage(cfg)
+        _finish_vision_model_stage(cfg, active_stage="stage 6 host focus vision scoring cleanup")
+
+
+def _apply_score_sort_moves_to_manifest(manifest: list, artifacts: dict | None) -> None:
+    tier_move = (artifacts or {}).get("tier_move", {})
+    moves = {
+        str(move.get("clip_id")): move
+        for move in tier_move.get("moves", [])
+        if isinstance(move, dict) and move.get("clip_id")
+    }
+    if not moves:
+        return
+    for row in manifest:
+        if not isinstance(row, dict):
+            continue
+        move = moves.get(str(row.get("clip_id") or ""))
+        if move and move.get("output_file"):
+            row["output_file"] = move["output_file"]
 
 
 def _attach_score_to_manifest(row: dict, score: dict, cfg) -> None:
@@ -478,7 +681,7 @@ def _attach_score_to_manifest(row: dict, score: dict, cfg) -> None:
     row["scorer_variant_id"] = score.get("variant_id")
     row["scorer_total_score"] = score.get("total_score")
     row["scorer_content_score"] = score.get("content_score")
-    row["scorer_visual_score"] = score.get("visual_score")
+    row.pop("scorer_visual_score", None)
     row["scorer_host_focus_score"] = score.get("host_focus_score")
     row["scorer_quality_score"] = score.get("quality_score")
     row["scorer_engagement_score"] = score.get("engagement_score")
@@ -697,7 +900,11 @@ def run_pipeline(
     write_stage_fingerprint(Path(working_dir) / "transcript.json", video_path, cfg, "transcribe")
     _report(progress_callback, "transcribe", 20, f"Transcript: {len(transcript['words'])} words")
 
-    if (not skip_moments) or bool(getattr(cfg, "SCORER_ENABLED", True)):
+    if (
+        (not skip_moments)
+        or bool(getattr(cfg, "SCORER_ENABLED", True))
+        or bool(getattr(cfg, "COMPLIANCE_ENABLED", True))
+    ):
         text_model_stage_started = _start_text_model_stage(cfg)
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -829,11 +1036,13 @@ def run_pipeline(
     clips_created = 0
     clips_failed  = 0
     clips_skipped = 0
+    clips_blocked = 0
     manifest      = []
     manifest_path = Path(output_dir) / "manifest.json"
 
     jobs = [_build_clip_job(moment, i, output_dir, raw_dir) for i, moment in enumerate(moments)]
     _attach_precomputed_clip_contexts(jobs, transcript["words"], product_events)
+    _attach_precomputed_compliance(jobs, cfg)
     max_workers = max(1, int(getattr(cfg, "MAX_PARALLEL_CLIPS", 6)))
     edit_log_every = max(1, int(getattr(cfg, "EDIT_LOG_EVERY_N", 25)))
     log.info(f"  Total jobs: {len(jobs)} | Parallel workers: {max_workers}")
@@ -858,6 +1067,7 @@ def run_pipeline(
         clips_created=0,
         clips_failed=0,
         clips_skipped=0,
+        clips_blocked=0,
     )
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
@@ -896,6 +1106,9 @@ def run_pipeline(
                     clips_created += 1
                     if getattr(cfg, "EDIT_LOG_CREATED_CLIPS", False):
                         log.info(f"    Created: {result['output_filename']}")
+                elif result["status"] == "compliance_blocked":
+                    clips_blocked += 1
+                    log.warning(f"    Compliance blocked export for {job['clip_id']}")
                 else:
                     clips_failed += 1
                     log.error(f"    Edit failed for {job['clip_id']}")
@@ -917,23 +1130,31 @@ def run_pipeline(
                 clips_created=clips_created,
                 clips_failed=clips_failed,
                 clips_skipped=clips_skipped,
+                clips_blocked=clips_blocked,
             )
 
             if completed % edit_log_every == 0 or completed == len(jobs):
                 log.info(
                     f"    Editing progress: {completed}/{len(jobs)} done | "
-                    f"created={clips_created} failed={clips_failed} skipped={clips_skipped}"
+                    f"created={clips_created} failed={clips_failed} skipped={clips_skipped} blocked={clips_blocked}"
                 )
 
     # ══════════════════════════════════════════════════════════════════════════
     # DONE
     # ══════════════════════════════════════════════════════════════════════════
     clip_scores = _score_rendered_clips(jobs, manifest, output_dir, cfg, progress_callback)
+    vision_scoring_requested = bool(
+        clip_scores and getattr(cfg, "SCORER_VISION_ENABLED", False)
+    )
     text_model_unloaded = True
     if text_model_stage_started:
-        text_model_unloaded = _finish_text_model_stage(cfg)
+        text_model_unloaded = _finish_text_model_stage(
+            cfg,
+            active_stage="stage 5 clip scoring",
+            required=vision_scoring_requested,
+        )
 
-    if clip_scores and bool(getattr(cfg, "SCORER_VISION_ENABLED", False)):
+    if vision_scoring_requested:
         if text_model_unloaded or not _model_management_enabled(cfg):
             clip_scores = _score_rendered_clip_host_focus(
                 clip_scores,
@@ -943,10 +1164,9 @@ def run_pipeline(
                 progress_callback,
             )
         else:
-            log.warning(
-                "Skipping Qwen-VL host-focus scoring because %s is still loaded; "
-                "this avoids loading both large models at the same time.",
-                _text_model_id(cfg),
+            raise RuntimeError(
+                "Host-focus vision scoring cannot start because "
+                f"{_text_model_id(cfg)} is still loaded after text scoring."
             )
 
     try:
@@ -967,6 +1187,12 @@ def run_pipeline(
         extra={"max_clips": max_clips, "cut_only": cut_only},
     )
     scores_summary_path = Path(output_dir) / "scores_summary.json" if clip_scores else None
+    try:
+        from compliance_checker import update_scores_summary_with_compliance
+
+        update_scores_summary_with_compliance(output_dir, manifest)
+    except Exception as exc:
+        log.warning(f"Could not merge compliance fields into score summary: {exc}")
 
     log.info("\n" + "=" * 70)
     log.info("PIPELINE COMPLETE")
@@ -975,6 +1201,7 @@ def run_pipeline(
     log.info(f"  Clips created:  {clips_created}")
     log.info(f"  Clips failed:   {clips_failed}")
     log.info(f"  Clips skipped:  {clips_skipped} (already existed)")
+    log.info(f"  Clips blocked:  {clips_blocked} (compliance)")
     log.info(f"  Clips scored:   {len(clip_scores)}")
     log.info(f"  Output dir:     {output_dir}")
     log.info(f"  Manifest:       {manifest_path}")
@@ -993,6 +1220,7 @@ def run_pipeline(
         clips_created=clips_created,
         clips_failed=clips_failed,
         clips_skipped=clips_skipped,
+        clips_blocked=clips_blocked,
         output_dir=output_dir,
         manifest_path=str(manifest_path),
         scores_summary_path=str(scores_summary_path) if scores_summary_path else None,
@@ -1002,6 +1230,7 @@ def run_pipeline(
         "clips_created": clips_created,
         "clips_failed": clips_failed,
         "clips_skipped": clips_skipped,
+        "clips_blocked": clips_blocked,
         "moments_found": len(moments),
         "total_time": total_time,
         "output_dir": output_dir,
@@ -1032,6 +1261,24 @@ def _vision_model_id(cfg) -> str:
 
 def _model_management_enabled(cfg) -> bool:
     return bool(getattr(cfg, "LM_STUDIO_MODEL_MANAGEMENT_ENABLED", True))
+
+
+def _model_unload_timeout(cfg) -> float:
+    return max(
+        1.0,
+        float(
+            getattr(
+                cfg,
+                "LM_STUDIO_MODEL_UNLOAD_TIMEOUT",
+                getattr(cfg, "SCORER_VISION_TIMEOUT", 600),
+            )
+            or 600
+        ),
+    )
+
+
+def _model_unload_log_interval(cfg) -> float:
+    return max(1.0, float(getattr(cfg, "LM_STUDIO_MODEL_UNLOAD_LOG_INTERVAL", 30) or 30))
 
 
 def _model_manager_module(cfg):
@@ -1066,7 +1313,12 @@ def _enforce_text_model_priority_at_pipeline_start(cfg) -> None:
                 vision_id,
             )
             manager.unload_model(vision_id, cfg=cfg)
-            _wait_until_model_unloaded(vision_id, cfg, timeout=120)
+            _wait_until_model_unloaded(
+                vision_id,
+                cfg,
+                timeout=_model_unload_timeout(cfg),
+                active_stage="pipeline startup",
+            )
     except Exception as exc:
         log.warning(f"Could not inspect LM Studio loaded models at startup: {exc}")
 
@@ -1087,32 +1339,84 @@ def _start_text_model_stage(cfg) -> bool:
                 vision_id,
                 model_id,
             )
-            manager.unload_model(vision_id, cfg=cfg, timeout=120)
-            _wait_until_model_unloaded(vision_id, cfg, timeout=120)
-        manager.load_model(model_id, cfg=cfg, timeout=120)
-        manager.wait_until_ready(model_id, cfg=cfg, timeout=120)
+            manager.unload_model(vision_id, cfg=cfg, timeout=_model_unload_timeout(cfg))
+            if not _wait_until_model_unloaded(
+                vision_id,
+                cfg,
+                timeout=_model_unload_timeout(cfg),
+                active_stage="stage 1/2 text model startup",
+            ):
+                raise RuntimeError(
+                    f"Timed out waiting for {vision_id} to unload before loading {model_id}"
+                )
+        loaded = manager.load_model(model_id, cfg=cfg, timeout=120)
+        ready = manager.wait_until_ready(model_id, cfg=cfg, timeout=120) if loaded else False
+        if not loaded or not ready:
+            raise RuntimeError(f"LM Studio text model {model_id} did not become ready")
         return True
     except Exception as exc:
-        log.warning(f"LM Studio text model load failed; continuing without crashing: {exc}")
-        return True
+        raise RuntimeError(f"LM Studio text model load failed: {exc}") from exc
 
 
-def _finish_text_model_stage(cfg) -> bool:
+def _finish_text_model_stage(
+    cfg,
+    active_stage: str = "text model stage",
+    required: bool = False,
+) -> bool:
     manager = _model_manager_module(cfg)
     if manager is None:
         return True
     model_id = _text_model_id(cfg)
     if not model_id:
         return True
-    log.info("LM Studio text stage complete: unloading Qwen text model: %s", model_id)
+    timeout = _model_unload_timeout(cfg)
+    log.info(
+        "LM Studio text stage complete: unloading Qwen text model %s "
+        "(unload attempted during stage: %s; timeout=%.0fs)",
+        model_id,
+        active_stage,
+        timeout,
+    )
     try:
-        manager.unload_model(model_id, cfg=cfg, timeout=120)
+        requested = manager.unload_model(model_id, cfg=cfg, timeout=timeout)
     except Exception as exc:
-        log.warning(f"LM Studio text model unload failed: {exc}")
-    return _wait_until_model_unloaded(model_id, cfg, timeout=120)
+        message = (
+            f"LM Studio text model unload request failed for {model_id} "
+            f"during {active_stage}: {exc}"
+        )
+        log.error(message)
+        if required:
+            raise RuntimeError(message) from exc
+        return False
+    if not requested:
+        message = (
+            f"LM Studio did not accept the unload request for {model_id} "
+            f"during {active_stage}"
+        )
+        log.error(message)
+        if required:
+            raise RuntimeError(message)
+        return False
+
+    unloaded = _wait_until_model_unloaded(
+        model_id,
+        cfg,
+        timeout=timeout,
+        active_stage=active_stage,
+    )
+    if not unloaded and required:
+        raise RuntimeError(
+            f"Timed out after {timeout:.0f}s waiting for {model_id} to unload "
+            f"before host-focus scoring. Unload was attempted during stage: {active_stage}. "
+            f"Loaded models still reported: {_loaded_model_ids_for_log(manager, cfg)}"
+        )
+    return unloaded
 
 
-def _start_vision_model_stage(cfg) -> bool:
+def _start_vision_model_stage(
+    cfg,
+    active_stage: str = "stage 6 host focus vision scoring",
+) -> bool:
     if not bool(getattr(cfg, "SCORER_VISION_ENABLED", False)):
         return False
     manager = _model_manager_module(cfg)
@@ -1120,52 +1424,135 @@ def _start_vision_model_stage(cfg) -> bool:
         return True
     text_id = _text_model_id(cfg)
     if text_id and manager.is_model_loaded(text_id, cfg):
-        log.warning("Refusing to load Qwen-VL because text model %s is still loaded.", text_id)
-        return False
+        log.info(
+            "Qwen text model %s is still loaded when %s attempted to load Qwen-VL; "
+            "requesting unload now.",
+            text_id,
+            active_stage,
+        )
+        _finish_text_model_stage(cfg, active_stage=active_stage, required=True)
     model_id = _vision_model_id(cfg)
     if not model_id:
         return False
-    log.info("LM Studio vision stage: loading Qwen-VL model: %s", model_id)
+    timeout = max(120.0, float(getattr(cfg, "SCORER_VISION_TIMEOUT", 120) or 120))
+    log.info(
+        "LM Studio vision stage: loading Qwen-VL model %s after %s unload",
+        model_id,
+        text_id or "text model",
+    )
     try:
-        loaded = manager.load_model(model_id, cfg=cfg, timeout=120)
-        ready = manager.wait_until_ready(model_id, cfg=cfg, timeout=120) if loaded else False
-        return bool(loaded and ready)
+        loaded = manager.load_model(model_id, cfg=cfg, timeout=timeout)
+        ready = manager.wait_until_ready(model_id, cfg=cfg, timeout=timeout) if loaded else False
     except Exception as exc:
-        log.warning(f"LM Studio vision model load failed; continuing without crashing: {exc}")
-        return False
+        raise RuntimeError(f"LM Studio vision model load failed during {active_stage}: {exc}") from exc
+    if not loaded or not ready:
+        raise RuntimeError(
+            f"Qwen-VL model {model_id} did not become ready within {timeout:.0f}s "
+            f"after {text_id or 'the text model'} unloaded."
+        )
+    log.info(
+        "LM Studio vision stage: Qwen-VL model %s loaded and ready after %s unloaded",
+        model_id,
+        text_id or "text model",
+    )
+    return True
 
 
-def _finish_vision_model_stage(cfg) -> bool:
+def _finish_vision_model_stage(
+    cfg,
+    active_stage: str = "stage 6 host focus vision scoring cleanup",
+) -> bool:
     manager = _model_manager_module(cfg)
     if manager is None:
         return True
     model_id = _vision_model_id(cfg)
     if not model_id:
         return True
-    log.info("LM Studio vision stage complete: unloading Qwen-VL model: %s", model_id)
+    timeout = _model_unload_timeout(cfg)
+    log.info(
+        "LM Studio vision stage complete: unloading Qwen-VL model %s "
+        "(unload attempted during stage: %s; timeout=%.0fs)",
+        model_id,
+        active_stage,
+        timeout,
+    )
     try:
-        manager.unload_model(model_id, cfg=cfg, timeout=120)
+        manager.unload_model(model_id, cfg=cfg, timeout=timeout)
     except Exception as exc:
-        log.warning(f"LM Studio vision model unload failed: {exc}")
-    return _wait_until_model_unloaded(model_id, cfg, timeout=120)
+        log.error(f"LM Studio vision model unload failed during {active_stage}: {exc}")
+        return False
+    return _wait_until_model_unloaded(
+        model_id,
+        cfg,
+        timeout=timeout,
+        active_stage=active_stage,
+    )
 
 
-def _wait_until_model_unloaded(model_id: str, cfg, timeout: float) -> bool:
+def _wait_until_model_unloaded(
+    model_id: str,
+    cfg,
+    timeout: float,
+    active_stage: str = "unknown",
+) -> bool:
     manager = _model_manager_module(cfg)
     if manager is None:
         return True
-    deadline = time.time() + max(1.0, float(timeout or 120.0))
-    while time.time() < deadline:
+    wait_timeout = max(1.0, float(timeout or 120.0))
+    started = time.monotonic()
+    deadline = started + wait_timeout
+    next_progress = started + _model_unload_log_interval(cfg)
+    while time.monotonic() < deadline:
         try:
             if not manager.is_model_loaded(model_id, cfg):
-                log.info("LM Studio model unloaded: %s", model_id)
+                elapsed = time.monotonic() - started
+                log.info(
+                    "LM Studio model unloaded: %s after %.1fs "
+                    "(unload attempted during stage: %s)",
+                    model_id,
+                    elapsed,
+                    active_stage,
+                )
                 return True
         except Exception as exc:
-            log.warning(f"Could not verify model unload for {model_id}: {exc}")
+            elapsed = time.monotonic() - started
+            log.error(
+                "Could not verify model unload for %s after %.1fs "
+                "(unload attempted during stage: %s): %s",
+                model_id,
+                elapsed,
+                active_stage,
+                exc,
+            )
             return False
-        time.sleep(2.0)
-    log.warning("Timed out waiting for LM Studio model to unload: %s", model_id)
+        now = time.monotonic()
+        if now >= next_progress:
+            log.info(
+                "Waiting for %s to unload... (%ss elapsed)",
+                model_id,
+                int(now - started),
+            )
+            while next_progress <= now:
+                next_progress += _model_unload_log_interval(cfg)
+        time.sleep(min(2.0, max(0.1, deadline - now)))
+    elapsed = time.monotonic() - started
+    log.error(
+        "Timed out after %.1fs waiting for LM Studio model to unload: %s "
+        "(unload attempted during stage: %s; loaded models: %s)",
+        elapsed,
+        model_id,
+        active_stage,
+        _loaded_model_ids_for_log(manager, cfg),
+    )
     return False
+
+
+def _loaded_model_ids_for_log(manager, cfg) -> str:
+    try:
+        loaded_ids = manager.loaded_model_ids(cfg)
+    except Exception as exc:
+        return f"unavailable ({exc})"
+    return ", ".join(loaded_ids) if loaded_ids else "none"
 
 
 def _model_id_matches(left: str, right: str) -> bool:

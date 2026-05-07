@@ -27,10 +27,14 @@ from __future__ import annotations
 import copy
 import logging
 import random
+import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 log = logging.getLogger("proya.variation")
+
+_BROLL_VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -133,6 +137,12 @@ class VariantConfig:
     # Crop X offset
     crop_x_offset: float = 0.0
 
+    # Optional intro B-roll used behind the opening hook text
+    broll_intro_enabled: bool = False
+    broll_intro_path: str = ""
+    broll_intro_duration: float = 0.0
+    broll_intro_product: str = ""
+
 
 def apply_variant_to_cfg(base_cfg, variant: VariantConfig):
     """
@@ -175,6 +185,10 @@ def apply_variant_to_cfg(base_cfg, variant: VariantConfig):
     patched._crop_x_offset = variant.crop_x_offset
     patched._variant_id = variant.variant_id
     patched._variant_index = variant.variant_index
+    patched._broll_intro_enabled = variant.broll_intro_enabled
+    patched._broll_intro_path = variant.broll_intro_path
+    patched._broll_intro_duration = variant.broll_intro_duration
+    patched._broll_intro_product = variant.broll_intro_product
 
     return patched
 
@@ -253,6 +267,133 @@ def _draw_style_pairs(
     return pairs
 
 
+def _discover_broll_intro_assets(base_cfg) -> list[Path]:
+    if not getattr(base_cfg, "BROLL_INTRO_ENABLED", True):
+        return []
+
+    broll_dir = Path(getattr(base_cfg, "BROLL_INTRO_DIR", "assets/broll_intro"))
+    if not broll_dir.exists():
+        return []
+
+    exts = getattr(base_cfg, "BROLL_INTRO_VIDEO_EXTS", _BROLL_VIDEO_EXTS)
+    exts = {str(ext).lower() for ext in exts}
+    try:
+        return sorted(
+            p for p in broll_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in exts
+        )
+    except OSError as exc:
+        log.warning(f"Could not read B-roll intro folder {broll_dir}: {exc}")
+        return []
+
+
+def _normalize_broll_product(text: str) -> str:
+    normalized = re.sub(r"[^\w\s]", " ", str(text).lower(), flags=re.UNICODE)
+    return " ".join(tok for tok in normalized.split() if tok)
+
+
+def _contains_normalized_phrase(haystack: str, needle: str) -> bool:
+    haystack = _normalize_broll_product(haystack)
+    needle = _normalize_broll_product(needle)
+    if not haystack or not needle:
+        return False
+    return f" {needle} " in f" {haystack} "
+
+
+def _discover_broll_intro_assets_by_product(base_cfg) -> dict[str, list[Path]]:
+    if not getattr(base_cfg, "BROLL_INTRO_ENABLED", True):
+        return {}
+
+    broll_dir = Path(getattr(base_cfg, "BROLL_INTRO_DIR", "assets/broll_intro"))
+    if not broll_dir.exists():
+        return {}
+
+    exts = getattr(base_cfg, "BROLL_INTRO_VIDEO_EXTS", _BROLL_VIDEO_EXTS)
+    exts = {str(ext).lower() for ext in exts}
+    product_assets: dict[str, list[Path]] = {}
+    try:
+        for folder in sorted(p for p in broll_dir.iterdir() if p.is_dir()):
+            assets = sorted(
+                p for p in folder.iterdir()
+                if p.is_file() and p.suffix.lower() in exts
+            )
+            if assets:
+                product_key = _normalize_broll_product(folder.name)
+                if product_key:
+                    product_assets[product_key] = assets
+    except OSError as exc:
+        log.warning(f"Could not read product B-roll intro folders in {broll_dir}: {exc}")
+    return product_assets
+
+
+def _broll_intro_has_assets(base_cfg) -> bool:
+    if _discover_broll_intro_assets(base_cfg):
+        return True
+    return any(_discover_broll_intro_assets_by_product(base_cfg).values())
+
+
+def _broll_intro_rate_bounds(base_cfg) -> tuple[float, float]:
+    def _rate(name: str, default: float) -> float:
+        try:
+            return float(getattr(base_cfg, name, default))
+        except (TypeError, ValueError):
+            return default
+
+    lo = max(0.0, min(1.0, _rate("BROLL_INTRO_MIN_VARIANT_RATE", 0.20)))
+    hi = max(0.0, min(1.0, _rate("BROLL_INTRO_MAX_VARIANT_RATE", 0.40)))
+    if hi < lo:
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def _assign_broll_intro_variants(
+    variants: list[VariantConfig],
+    rng: random.Random,
+    base_cfg,
+) -> None:
+    if not variants or not _broll_intro_has_assets(base_cfg):
+        return
+
+    root_assets = _discover_broll_intro_assets(base_cfg)
+    allow_generic_root = (
+        bool(getattr(base_cfg, "BROLL_INTRO_ALLOW_GENERIC_ROOT", False))
+        or not bool(getattr(base_cfg, "BROLL_INTRO_REQUIRE_PRODUCT_MATCH", True))
+    )
+
+    candidate_indices = list(range(len(variants)))
+    if not getattr(base_cfg, "BROLL_INTRO_APPLY_TO_ORIGINAL", False):
+        candidate_indices = [idx for idx in candidate_indices if idx != 0]
+    if not candidate_indices:
+        return
+
+    lo, hi = _broll_intro_rate_bounds(base_cfg)
+    if hi <= 0.0:
+        return
+
+    target_rate = rng.uniform(lo, hi)
+    target_count = int(round(len(variants) * target_rate))
+    if target_count <= 0 and len(variants) >= 3:
+        target_count = 1
+    target_count = min(target_count, len(candidate_indices))
+    if target_count <= 0:
+        return
+
+    try:
+        intro_duration = float(getattr(base_cfg, "BROLL_INTRO_MAX_DURATION", 2.5))
+    except (TypeError, ValueError):
+        intro_duration = 2.5
+    intro_duration = max(0.0, intro_duration)
+
+    for idx in sorted(rng.sample(candidate_indices, target_count)):
+        variant = variants[idx]
+        variant.broll_intro_enabled = True
+        variant.broll_intro_duration = intro_duration
+        if root_assets and allow_generic_root:
+            variant.broll_intro_path = str(rng.choice(root_assets))
+        if "_broll" not in variant.variant_id:
+            variant.variant_id = f"{variant.variant_id}_broll"
+
+
 def generate_variants(base_cfg, n_variants: int, seed: int | None = None) -> list[VariantConfig]:
     """
     Generate `n_variants` VariantConfig objects.
@@ -317,8 +458,144 @@ def generate_variants(base_cfg, n_variants: int, seed: int | None = None) -> lis
 
         variants.append(vc)
 
+    _assign_broll_intro_variants(variants, rng, base_cfg)
+
+    broll_count = sum(1 for variant in variants if variant.broll_intro_enabled)
+    if broll_count:
+        log.info(f"B-roll intro selected for {broll_count}/{len(variants)} variant configs")
+    elif getattr(base_cfg, "BROLL_INTRO_ENABLED", True):
+        log.debug("No B-roll intro assets found; variants render without intro pre-roll")
+
     log.info(f"Generated {len(variants)} variant configs (seed={seed})")
     return variants
+
+
+def _broll_intro_alias_map(base_cfg, product_assets: dict[str, list[Path]]) -> dict[str, set[str]]:
+    aliases: dict[str, set[str]] = {key: {key} for key in product_assets}
+
+    for cls_name in getattr(base_cfg, "PRODUCT_CLASSES", {}).values():
+        key = _normalize_broll_product(cls_name)
+        if key in aliases:
+            aliases[key].add(str(cls_name))
+
+    configured_aliases = getattr(base_cfg, "BROLL_INTRO_PRODUCT_ALIASES", {})
+    if isinstance(configured_aliases, dict):
+        for product_name, product_aliases in configured_aliases.items():
+            key = _normalize_broll_product(product_name)
+            if key not in aliases:
+                continue
+            aliases[key].add(str(product_name))
+            if isinstance(product_aliases, str):
+                aliases[key].add(product_aliases)
+            else:
+                try:
+                    aliases[key].update(str(alias) for alias in product_aliases)
+                except TypeError:
+                    pass
+
+    return aliases
+
+
+def _iter_broll_alias_phrases(aliases: dict[str, set[str]]) -> list[tuple[str, str, str]]:
+    entries = []
+    for key, phrases in aliases.items():
+        for phrase in phrases:
+            phrase_norm = _normalize_broll_product(phrase)
+            if phrase_norm:
+                entries.append((key, str(phrase), phrase_norm))
+    return sorted(entries, key=lambda item: len(item[2]), reverse=True)
+
+
+def _moment_search_text(moment: dict) -> str:
+    parts = [
+        moment.get("product", ""),
+        moment.get("hook", ""),
+        moment.get("reason", ""),
+        moment.get("selected_text", ""),
+    ]
+    hook_overlay = moment.get("hook_overlay")
+    if isinstance(hook_overlay, dict):
+        parts.extend(str(hook_overlay.get(key, "")) for key in ("headline", "subtext", "cta"))
+
+    for segment in moment.get("segments", []) or []:
+        if isinstance(segment, dict):
+            parts.append(str(segment.get("text", "")))
+        else:
+            parts.append(str(segment))
+
+    return " ".join(str(part or "") for part in parts)
+
+
+def _resolve_broll_product_key(
+    moment: dict,
+    base_cfg,
+    product_assets: dict[str, list[Path]],
+) -> str:
+    if not product_assets:
+        return ""
+
+    aliases = _broll_intro_alias_map(base_cfg, product_assets)
+    product_text = str(moment.get("product", "") or "")
+    product_norm = _normalize_broll_product(product_text)
+    generic_products = {"", "general", "unknown", "none", "null", "produk", "product"}
+
+    if product_norm not in generic_products:
+        for key in sorted(product_assets, key=len, reverse=True):
+            if product_norm == key or _contains_normalized_phrase(product_norm, key):
+                return key
+        for key, _phrase, phrase_norm in _iter_broll_alias_phrases(aliases):
+            if (
+                product_norm == phrase_norm
+                or _contains_normalized_phrase(product_norm, phrase_norm)
+                or _contains_normalized_phrase(phrase_norm, product_norm)
+            ):
+                return key
+
+    search_text = _moment_search_text(moment)
+    for key, phrase, _phrase_norm in _iter_broll_alias_phrases(aliases):
+        if _contains_normalized_phrase(search_text, phrase):
+            return key
+
+    return ""
+
+
+def _assign_broll_intro_for_moment(
+    variant: VariantConfig,
+    moment: dict,
+    base_cfg,
+    seed: int,
+    base_clip_id: str,
+) -> None:
+    if not variant.broll_intro_enabled:
+        return
+
+    product_assets = _discover_broll_intro_assets_by_product(base_cfg)
+    product_key = _resolve_broll_product_key(moment, base_cfg, product_assets)
+    choices = product_assets.get(product_key, []) if product_key else []
+    allow_generic_root = (
+        bool(getattr(base_cfg, "BROLL_INTRO_ALLOW_GENERIC_ROOT", False))
+        or not bool(getattr(base_cfg, "BROLL_INTRO_REQUIRE_PRODUCT_MATCH", True))
+    )
+
+    if not choices and variant.broll_intro_path and allow_generic_root:
+        variant.broll_intro_product = "generic"
+        return
+
+    if not choices and allow_generic_root:
+        choices = _discover_broll_intro_assets(base_cfg)
+        product_key = "generic" if choices else ""
+
+    if not choices:
+        variant.broll_intro_enabled = False
+        variant.broll_intro_path = ""
+        variant.broll_intro_product = ""
+        if variant.variant_id.endswith("_broll"):
+            variant.variant_id = variant.variant_id[:-6]
+        return
+
+    picker = random.Random(f"{seed}|{base_clip_id}|{variant.variant_id}|{product_key}")
+    variant.broll_intro_path = str(picker.choice(choices))
+    variant.broll_intro_product = product_key
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -361,10 +638,18 @@ def expand_moments_with_variants(
     for moment in moments:
         base_clip_id = moment.get("clip_id", "clip_unknown")
         for vc in variants:
+            variant_for_moment = copy.deepcopy(vc)
+            _assign_broll_intro_for_moment(
+                variant_for_moment,
+                moment,
+                base_cfg,
+                seed,
+                str(base_clip_id),
+            )
             m = copy.deepcopy(moment)
-            m["_variant"] = vc
+            m["_variant"] = variant_for_moment
             # Give variant its own clip_id so files don't collide
-            m["clip_id"] = f"{base_clip_id}_{vc.variant_id}"
+            m["clip_id"] = f"{base_clip_id}_{variant_for_moment.variant_id}"
             expanded.append(m)
 
     log.info(

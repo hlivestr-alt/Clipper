@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from utils import _path_identity
+
 
 STAGE_CONFIG_KEYS = {
     "transcribe": [
@@ -96,6 +98,10 @@ STAGE_CONFIG_KEYS = {
         "SCORER_WEIGHTS",
         "SCORER_VISION_ENABLED",
         "SCORER_VISION_MODEL",
+        "COMPLIANCE_ENABLED",
+        "COMPLIANCE_AUTO_FIX",
+        "COMPLIANCE_BLOCK_HIGH",
+        "COMPLIANCE_LM_TIMEOUT",
     ],
 }
 
@@ -147,24 +153,6 @@ def stage_fingerprint_matches(
     except Exception:
         return False
     return payload.get("fingerprint") == stage_fingerprint(video_path, cfg, stage, extra=extra)
-
-
-def _path_identity(path: str | Path) -> dict:
-    candidate = Path(path)
-    try:
-        resolved = candidate.resolve()
-        stat = resolved.stat()
-        return {
-            "path": str(resolved).casefold(),
-            "size": stat.st_size,
-            "mtime_ns": stat.st_mtime_ns,
-        }
-    except OSError:
-        return {
-            "path": str(candidate).casefold(),
-            "size": None,
-            "mtime_ns": None,
-        }
 
 
 def _stage_model_name(cfg, stage: str) -> str:

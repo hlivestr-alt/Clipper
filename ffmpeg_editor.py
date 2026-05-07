@@ -30,6 +30,8 @@
 #    ✓ Speed ramp (from variation_engine)
 #    ✓ Crop X offset (from variation_engine)
 #    ✓ SFX audio mixing via amix+adelay
+#    ✓ Optional BGM loop with voice ducking
+#    ✓ Optional local B-roll intro under opening hook text for selected variants
 #    ✓ NVENC hardware encode (h264_nvenc / hevc_nvenc)
 # =============================================================================
 
@@ -47,8 +49,12 @@ from pathlib import Path
 from typing import Optional
 
 from hook_text import ensure_hook_payload
+from utils import _format_rupiah_compact
 
 log = logging.getLogger("proya.ffmpeg_editor")
+
+_AUDIO_EXTS = {".wav", ".mp3", ".ogg", ".aac", ".flac", ".m4a"}
+_VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi"}
 
 # ── NVENC concurrency guard (max 3 simultaneous NVENC sessions) ──────────────
 _NVENC_SEM = threading.Semaphore(3)
@@ -241,7 +247,7 @@ def edit_clip(
 
     # ── Build ASS subtitle file ───────────────────────────────────────────────
     highlight_plan = _build_highlight_plan(clip_words, cfg, moment=moment)
-    ass_path = _write_ass_file(
+    ass_path, ass_fonts_dir = _write_ass_file(
         highlight_plan["words"],
         highlight_plan["word_colors"],
         clip_duration,
@@ -308,6 +314,8 @@ def edit_clip(
         except Exception as e:
             log.debug(f"SFX build failed: {e}")
 
+    bgm_path = _pick_bgm(cfg) if getattr(cfg, "BGM_ENABLED", False) else None
+
     # ── Assemble filter_complex + command ─────────────────────────────────────
     acquired = _NVENC_SEM.acquire(timeout=500)
     if not acquired:
@@ -319,6 +327,7 @@ def edit_clip(
             raw_clip_path=raw_clip_path,
             output_path=output_path,
             ass_path=ass_path,
+            ass_fonts_dir=ass_fonts_dir,
             W=W, H=H,
             clip_duration=clip_duration,
             clip_fps=clip_fps,
@@ -331,6 +340,7 @@ def edit_clip(
             hook_end=hook_end,
             extra_inputs=extra_inputs,
             sfx_events=sfx_events,
+            bgm_path=bgm_path,
             cfg=cfg,
         )
     finally:
@@ -369,7 +379,7 @@ def _write_ass_file(
     W: int,
     H: int,
     cfg,
-) -> Optional[str]:
+) -> tuple[Optional[str], Optional[str]]:
     """
     Generate an ASS subtitle file with karaoke per-word highlighting.
 
@@ -391,9 +401,9 @@ def _write_ass_file(
     ass_dir = Path("temp_ass")
     ass_dir.mkdir(exist_ok=True)
     if not karaoke_words:
-        return None
+        return None, None
 
-    font_sub     = _font_name_from_path(getattr(cfg, "FONT_SUBTITLE", "Arial"))
+    font_sub, subtitle_fonts_dir = _resolve_subtitle_font(cfg)
     fontsize     = getattr(cfg, "SUBTITLE_FONTSIZE", 68)
     sub_y_frac   = getattr(cfg, "SUBTITLE_Y_POS", 0.80)
     stroke_w     = getattr(cfg, "SUBTITLE_STROKE_W", 3)
@@ -552,7 +562,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     with open(ass_path, "w", encoding="utf-8") as f:
         f.write(ass_content)
 
-    return str(ass_path)
+    return str(ass_path), subtitle_fonts_dir
 
 
 # =============================================================================
@@ -560,11 +570,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 # =============================================================================
 
 def _build_and_run(
-    raw_clip_path, output_path, ass_path,
+    raw_clip_path, output_path, ass_path, ass_fonts_dir,
     W, H, clip_duration, clip_fps, has_audio,
     moment, prod_trigger, face_zooms,
     zoom_dur, zoom_scale, hook_end,
-    extra_inputs, sfx_events, cfg,
+    extra_inputs, sfx_events, bgm_path, cfg,
 ) -> bool:
     """
     Assemble -filter_complex string and run FFmpeg.
@@ -572,7 +582,7 @@ def _build_and_run(
     Filter graph:
       [0:v] → variant transforms (hflip, crop, eq) → zoom chain → ass subtitles
             → hook text → product caption drawtext → overlays → [vout]
-      [0:a] → amix with SFX streams → [aout]
+      [0:a] → amix with SFX streams + optional ducked BGM → [aout]
     """
     # ── Variant overrides ─────────────────────────────────────────────────────
     variant_baked  = getattr(cfg, "_variant_transforms_baked", False)
@@ -601,6 +611,20 @@ def _build_and_run(
             cmd += ["-i", ei["path"]]
     for sfx in sfx_events:
         cmd += ["-i", str(sfx["sfx_path"])]
+    bgm_input_idx = None
+    if bgm_path:
+        bgm_input_idx = 1 + len(extra_inputs) + len(sfx_events)
+        cmd += ["-stream_loop", "-1", "-t", f"{clip_duration:.3f}", "-i", str(bgm_path)]
+
+    broll_intro = _prepare_broll_intro(cfg, clip_duration=clip_duration, hook_end=hook_end)
+    broll_input_idx = None
+    if broll_intro:
+        broll_input_idx = 1 + len(extra_inputs) + len(sfx_events) + (1 if bgm_path else 0)
+        cmd += [
+            "-stream_loop", "-1",
+            "-t", f"{broll_intro['duration']:.3f}",
+            "-i", broll_intro["path"],
+        ]
 
     # ── Build filter_complex ──────────────────────────────────────────────────
     fc = []       # filter_complex lines
@@ -649,12 +673,29 @@ def _build_and_run(
         # Windows path escaping for FFmpeg ass= filter:
         # Forward slashes only, and drive colon must be escaped as \:
         # e.g.  C:/Users/... → C\:/Users/...
-        safe_ass = Path(ass_path).as_posix()
-        fc.append(f"{vid}ass={safe_ass}[vsub]")
+        safe_ass = _escape_ass_filter_path(ass_path)
+        ass_filter = f"ass={safe_ass}"
+        if ass_fonts_dir:
+            safe_fonts_dir = _escape_ass_filter_path(ass_fonts_dir)
+            ass_filter += f":fontsdir={safe_fonts_dir}"
+        fc.append(f"{vid}{ass_filter}[vsub]")
         vid = "[vsub]"
 
     # ── 4. Hook title (drawtext) ──────────────────────────────────────────────
-    vid = _add_before_after_overlay_filters(fc, vid, extra_inputs, clip_duration, W, H, cfg)
+    if broll_intro and broll_input_idx is not None:
+        vid = _add_broll_intro_replacement_filters(
+            fc,
+            vid,
+            broll_input_idx,
+            broll_intro,
+            clip_duration,
+            W,
+            H,
+            output_fps,
+            cfg,
+        )
+    else:
+        vid = _add_before_after_overlay_filters(fc, vid, extra_inputs, clip_duration, W, H, cfg)
 
     hook_dur_cfg = getattr(cfg, "HOOK_DURATION", 0.0)
     if hook_dur_cfg > 0:
@@ -813,6 +854,38 @@ def _build_and_run(
             f"{''.join(all_audio)}amix=inputs={len(all_audio)}:duration=first:normalize=0[aout]"
         )
         aud = "[aout]"
+
+    if bgm_input_idx is not None:
+        bgm_volume = _clamp_float(getattr(cfg, "BGM_VOLUME", 0.12), 0.0, 1.0, 0.12)
+        ducking_enabled = has_audio and getattr(cfg, "BGM_DUCKING_ENABLED", True)
+        fc.append(
+            f"[{bgm_input_idx}:a]"
+            f"aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,"
+            f"atrim=0:{clip_duration:.3f},asetpts=PTS-STARTPTS,"
+            f"volume={bgm_volume:.4f}[bgmbase]"
+        )
+
+        bgm_label = "[bgmbase]"
+        aud_for_mix = aud
+        if ducking_enabled:
+            threshold = _clamp_float(getattr(cfg, "BGM_DUCKING_THRESHOLD", 0.03), 0.0001, 1.0, 0.03)
+            ratio = _clamp_float(getattr(cfg, "BGM_DUCKING_RATIO", 8.0), 1.0, 20.0, 8.0)
+            attack_ms = int(_clamp_float(getattr(cfg, "BGM_DUCKING_ATTACK_MS", 50), 1.0, 1000.0, 50.0))
+            release_ms = int(_clamp_float(getattr(cfg, "BGM_DUCKING_RELEASE_MS", 350), 10.0, 5000.0, 350.0))
+            fc.append(f"{aud}asplit=2[audmain][audside]")
+            fc.append(
+                f"[bgmbase][audside]"
+                f"sidechaincompress=threshold={threshold:.4f}:ratio={ratio:.3f}:"
+                f"attack={attack_ms}:release={release_ms}:makeup=1[bgmduck]"
+            )
+            bgm_label = "[bgmduck]"
+            aud_for_mix = "[audmain]"
+
+        fc.append(
+            f"{aud_for_mix}{bgm_label}"
+            f"amix=inputs=2:duration=first:normalize=0[abgm]"
+        )
+        aud = "[abgm]"
 
     # ── 9. Speed ramp audio (atempo) ─────────────────────────────────────────
     if abs(speed_ramp - 1.0) > 0.02:
@@ -980,6 +1053,48 @@ def _build_zoom_expressions(
 # =============================================================================
 #  BEFORE/AFTER OVERLAY
 # =============================================================================
+
+def _add_broll_intro_replacement_filters(
+    fc,
+    vid,
+    broll_input_idx: int,
+    broll_intro: dict,
+    clip_duration: float,
+    W: int,
+    H: int,
+    output_fps: int,
+    cfg,
+) -> str:
+    intro_dur = max(0.0, min(float(broll_intro.get("duration", 0.0) or 0.0), clip_duration))
+    if intro_dur <= 0.01:
+        return vid
+
+    fade_in = max(0.0, min(float(getattr(cfg, "BROLL_INTRO_FADE_IN", 0.0) or 0.0), intro_dur / 2.0))
+    fade_out = max(0.0, min(float(getattr(cfg, "BROLL_INTRO_FADE_OUT", 0.20) or 0.0), intro_dur / 2.0))
+    fade_out_start = max(0.0, intro_dur - fade_out)
+
+    fc.append(
+        f"[{broll_input_idx}:v]"
+        f"trim=0:{intro_dur:.3f},setpts=PTS-STARTPTS,"
+        f"scale={W}:{H}:force_original_aspect_ratio=increase,"
+        f"crop={W}:{H},fps={output_fps},format=rgba,setsar=1[vbrollsrc]"
+    )
+
+    broll_chain = "[vbrollsrc]"
+    if fade_in > 0.0:
+        fc.append(f"{broll_chain}fade=t=in:st=0:d={fade_in:.2f}:alpha=1[vbrollfi]")
+        broll_chain = "[vbrollfi]"
+    if fade_out > 0.0:
+        fc.append(
+            f"{broll_chain}fade=t=out:st={fade_out_start:.2f}:d={fade_out:.2f}:alpha=1[vbrollfade]"
+        )
+        broll_chain = "[vbrollfade]"
+
+    fc.append(
+        f"{vid}{broll_chain}overlay=x=0:y=0:enable='between(t,0,{intro_dur:.2f})'[vbroll]"
+    )
+    return "[vbroll]"
+
 
 def _add_before_after_overlay_filters(fc, vid, extra_inputs, clip_duration, W, H, cfg) -> str:
     ba_input_idx = None
@@ -1792,20 +1907,6 @@ def _build_highlight_plan(clip_words: list, cfg, moment: Optional[dict] = None) 
     }
 
 
-def _format_rupiah_compact(amount_text: str) -> str:
-    digits = re.sub(r"\D", "", str(amount_text))
-    if not digits:
-        return ""
-
-    amount = int(digits)
-    if amount >= 1000:
-        if amount % 1000 == 0:
-            return f"{amount // 1000}rb"
-        compact = f"{amount / 1000:.1f}".rstrip("0").rstrip(".")
-        return f"{compact}rb"
-    return str(amount)
-
-
 def _plan_emoji_overlays(clip_words: list, clip_duration: float, W: int, H: int, cfg) -> list[dict]:
     """Plan emoji overlays from subtitle chunks using real word timestamps."""
     emoji_cfg = getattr(cfg, "EMOJI_CONFIG", {}) or {}
@@ -1921,6 +2022,74 @@ def _pick_before_after(cfg) -> Optional[str]:
     exts = {".jpg", ".jpeg", ".png", ".webp"}
     imgs = [p for p in ba_dir.iterdir() if p.suffix.lower() in exts]
     return str(random.choice(imgs)) if imgs else None
+
+
+def _pick_bgm(cfg) -> Optional[str]:
+    bgm_dir = Path(getattr(cfg, "BGM_DIR", "assets/bgm"))
+    if not bgm_dir.exists():
+        return None
+    tracks = [p for p in bgm_dir.iterdir() if p.is_file() and p.suffix.lower() in _AUDIO_EXTS]
+    if not tracks:
+        log.debug(f"BGM folder empty: {bgm_dir}")
+        return None
+    chosen = random.choice(tracks)
+    log.debug(f"BGM: {chosen.name}")
+    return str(chosen)
+
+
+def _prepare_broll_intro(cfg, clip_duration: Optional[float] = None, hook_end: Optional[float] = None) -> Optional[dict]:
+    if not getattr(cfg, "BROLL_INTRO_ENABLED", True):
+        return None
+
+    intro_path = str(getattr(cfg, "_broll_intro_path", "") or "").strip()
+    if not intro_path:
+        return None
+
+    path = Path(intro_path)
+    if not path.exists() or not path.is_file():
+        log.warning(f"B-roll intro file missing: {intro_path}")
+        return None
+    if path.suffix.lower() not in _VIDEO_EXTS:
+        log.warning(f"B-roll intro file has unsupported extension: {intro_path}")
+        return None
+
+    info = _probe_video(str(path))
+    if not info:
+        return None
+
+    source_duration = max(0.0, float(info.get("duration") or 0.0))
+    if source_duration <= 0.1:
+        return None
+
+    try:
+        requested_duration = float(getattr(cfg, "_broll_intro_duration", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        requested_duration = 0.0
+    if requested_duration <= 0.0:
+        try:
+            requested_duration = float(getattr(cfg, "BROLL_INTRO_MAX_DURATION", 2.5) or 2.5)
+        except (TypeError, ValueError):
+            requested_duration = 2.5
+
+    if hook_end is not None and hook_end > 0.0:
+        requested_duration = min(requested_duration, float(hook_end))
+    if clip_duration is not None and clip_duration > 0.0:
+        requested_duration = min(requested_duration, float(clip_duration))
+
+    duration = max(0.1, requested_duration)
+    return {
+        "path": str(path),
+        "duration": duration,
+        "has_audio": bool(info.get("has_audio", False)),
+    }
+
+
+def _clamp_float(value, lo: float, hi: float, default: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = default
+    return max(lo, min(hi, number))
 
 
 def _probe_video(path: str) -> Optional[dict]:
@@ -2139,6 +2308,69 @@ def _font_name_from_path(font_str: str) -> str:
         # Use stem as display name (e.g. "Montserrat-ExtraBold")
         return p.stem.replace("-", " ").replace("_", " ")
     return font_str  # already a name
+
+
+def _resolve_subtitle_font(cfg) -> tuple[str, Optional[str]]:
+    default_font = getattr(cfg, "FONT_SUBTITLE", "Arial")
+    default_name = _font_name_from_path(default_font)
+
+    if not getattr(cfg, "SUBTITLE_FONT_RANDOMIZE", True):
+        return default_name, None
+
+    font_dir_raw = getattr(cfg, "SUBTITLE_FONT_DIR", "assets/fonts/subtitle")
+    if not font_dir_raw:
+        return default_name, None
+
+    try:
+        font_dir = Path(font_dir_raw)
+        candidates = [
+            p for p in font_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in (".ttf", ".otf")
+        ]
+        if not candidates:
+            return default_name, None
+
+        selected_font = random.choice(candidates)
+        selected_name = _font_name_from_font_file(selected_font)
+        if not selected_name:
+            return default_name, None
+
+        return selected_name, str(font_dir)
+    except Exception:
+        return default_name, None
+
+
+def _font_name_from_font_file(font_path: Path) -> Optional[str]:
+    try:
+        from PIL import ImageFont
+
+        font = ImageFont.truetype(str(font_path), size=32)
+        family, style = font.getname()
+    except Exception:
+        return None
+
+    family = str(family or "").strip()
+    style = str(style or "").strip()
+    if not family:
+        return None
+
+    style_key = re.sub(r"\s+", "", style).lower()
+    family_key = re.sub(r"\s+", "", family).lower()
+    if style_key and style_key not in {"regular", "normal", "book", "roman"} and style_key not in family_key:
+        return f"{family} {style}"
+    return family
+
+
+def _escape_ass_filter_path(path_value: str) -> str:
+    safe = Path(path_value).as_posix()
+    return (
+        safe.replace("\\", "/")
+        .replace(":", r"\:")
+        .replace(",", r"\,")
+        .replace("[", r"\[")
+        .replace("]", r"\]")
+        .replace("'", r"\'")
+    )
 
 
 def _css_to_ffmpeg_color(color: str) -> str:

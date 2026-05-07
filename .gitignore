@@ -1,2 +1,13 @@
 /working/
 pipeline.log
+__pycache__/
+*.py[cod]
+.pytest_cache/
+temp_ass/
+.understand-anything/
+runs/
+*.pt
+assets.csv
+highlight_phrases.json
+assets/broll_intro/
+assets/bgm/

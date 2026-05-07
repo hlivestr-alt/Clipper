@@ -10,6 +10,8 @@ from pathlib import Path
 
 import cv2
 
+from utils import _path_identity
+
 log = logging.getLogger("proya.vision")
 VISION_CACHE_SCHEMA_VERSION = 3
 _MODEL_CACHE = {}
@@ -126,24 +128,6 @@ def build_scan_ranges_from_moments(moments: list, cfg) -> list:
 
 def _vision_cache_meta_path(detections_path: Path) -> Path:
     return detections_path.with_name(f"{detections_path.stem}.meta.json")
-
-
-def _path_identity(path: str | Path) -> dict:
-    candidate = Path(path)
-    try:
-        resolved = candidate.resolve()
-        stat = resolved.stat()
-        return {
-            "path": str(resolved).casefold(),
-            "size": stat.st_size,
-            "mtime_ns": stat.st_mtime_ns,
-        }
-    except OSError:
-        return {
-            "path": str(candidate).casefold(),
-            "size": None,
-            "mtime_ns": None,
-        }
 
 
 def _vision_cache_fingerprint(video_path: str, cfg, scan_ranges: list | None = None) -> dict:

@@ -16,6 +16,9 @@
 #      highlight_red/     <- Pain / Problem words
 #        impact1.wav
 #        ...
+#    assets/bgm/          <- optional music beds, looped under voice
+#      upbeat1.mp3
+#      ...
 #
 #  All audio files are mixed into the clip's original audio track using
 #  MoviePy's CompositeAudioClip. Volume for each category is configurable.
@@ -26,17 +29,12 @@ import random
 import re
 from pathlib import Path
 
+from utils import _format_rupiah_compact
+
 log = logging.getLogger("proya.sfx")
 
 AUDIO_EXTS = {".wav", ".mp3", ".ogg", ".aac", ".flac", ".m4a"}
 _SFX_FILE_CACHE = {}
-
-
-def _format_rupiah_compact(amount_text: str) -> str:
-    digits = re.sub(r"\D", "", str(amount_text))
-    if not digits:
-        return ""
-    return f"{int(digits)}rb"
 
 
 def _normalize_sfx_word(text: str) -> str:
@@ -228,4 +226,9 @@ def create_sfx_folders(cfg):
         files = [f for f in path.iterdir() if f.suffix.lower() in AUDIO_EXTS] if path.exists() else []
         status = f"OK {len(files)} file(s)" if files else "WARN empty - add .wav/.mp3 files here"
         print(f"  [{label:20}]  {path}  ->  {status}")
+    bgm_path = Path(getattr(cfg, "BGM_DIR", "assets/bgm"))
+    bgm_path.mkdir(parents=True, exist_ok=True)
+    bgm_files = [f for f in bgm_path.iterdir() if f.suffix.lower() in AUDIO_EXTS] if bgm_path.exists() else []
+    bgm_status = f"OK {len(bgm_files)} file(s)" if bgm_files else "WARN empty - add music beds here"
+    print(f"  [{'bgm':20}]  {bgm_path}  ->  {bgm_status}")
     print(f"{'='*55}\n")

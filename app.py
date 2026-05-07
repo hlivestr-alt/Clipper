@@ -759,6 +759,171 @@ def load_score_rows(output_dirs: tuple[str, ...]) -> list[dict[str, Any]]:
     return rows
 
 
+@st.cache_data(ttl=10, show_spinner=False)
+def load_compliance_rows(output_dirs: tuple[str, ...]) -> dict[str, Any]:
+    clip_rows: list[dict[str, Any]] = []
+    violation_rows: list[dict[str, Any]] = []
+    seen_compliance_files: set[str] = set()
+
+    for output_dir in output_dirs:
+        folder = Path(output_dir)
+        source_video, run_tag = split_output_folder_name(folder.name)
+        manifest_rows = _load_manifest_rows(folder)
+        for row in manifest_rows:
+            if not isinstance(row, dict):
+                continue
+            compliance_path = _resolve_compliance_path(folder, row)
+            result = _read_compliance_result(compliance_path)
+            if result is None and "compliance_passed" not in row:
+                continue
+            if compliance_path:
+                seen_compliance_files.add(str(compliance_path.resolve()).casefold())
+            clip_record = _build_compliance_clip_row(folder, source_video, run_tag, row, result)
+            clip_rows.append(clip_record)
+            for violation in (result or {}).get("violations", []):
+                if isinstance(violation, dict):
+                    violation_rows.append(_build_violation_row(clip_record, violation))
+
+        compliance_paths = (
+            list(folder.glob("*_compliance.json"))
+            + list(folder.glob("v*/*_compliance.json"))
+            + list(folder.glob("compliance/*_compliance.json"))
+        )
+        for compliance_path in compliance_paths:
+            key = str(compliance_path.resolve()).casefold()
+            if key in seen_compliance_files:
+                continue
+            result = _read_compliance_result(compliance_path)
+            if result is None:
+                continue
+            clip_id = compliance_path.stem.removesuffix("_compliance")
+            row = {
+                "clip_id": clip_id,
+                "product": "general",
+                "status": "unknown",
+                "compliance_file": str(compliance_path.relative_to(folder)).replace("\\", "/"),
+            }
+            clip_record = _build_compliance_clip_row(folder, source_video, run_tag, row, result)
+            clip_rows.append(clip_record)
+            for violation in result.get("violations", []):
+                if isinstance(violation, dict):
+                    violation_rows.append(_build_violation_row(clip_record, violation))
+
+    clip_rows.sort(key=lambda row: row["_checked_at_sort"], reverse=True)
+    violation_rows.sort(key=lambda row: row["_checked_at_sort"], reverse=True)
+    return {
+        "clips": clip_rows,
+        "violations": violation_rows,
+        "summary": {
+            "scanned": len(clip_rows),
+            "passed": sum(1 for row in clip_rows if row.get("Passed")),
+            "blocked": sum(1 for row in clip_rows if row.get("Blocked")),
+            "auto_fixed": sum(1 for row in clip_rows if row.get("Auto Fixed")),
+            "violation_count": sum(int(row.get("Violation Count") or 0) for row in clip_rows),
+        },
+    }
+
+
+def _load_manifest_rows(folder: Path) -> list[dict[str, Any]]:
+    manifest_path = folder / "manifest.json"
+    if not manifest_path.exists():
+        return []
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    if isinstance(payload, dict):
+        for key in ("clips", "items"):
+            if isinstance(payload.get(key), list):
+                return [row for row in payload[key] if isinstance(row, dict)]
+    return []
+
+
+def _resolve_compliance_path(folder: Path, row: dict[str, Any]) -> Path | None:
+    compliance_file = str(row.get("compliance_file") or row.get("compliance_json") or "").strip()
+    candidates = []
+    if compliance_file:
+        candidates.append(Path(compliance_file))
+        candidates.append(folder / compliance_file)
+    clip_id = str(row.get("clip_id") or "").strip()
+    output_file = str(row.get("output_file") or "").strip()
+    if clip_id and output_file:
+        candidates.append((folder / output_file).parent / f"{clip_id}_compliance.json")
+        candidates.append(folder / "compliance" / f"{clip_id}_compliance.json")
+    if clip_id:
+        candidates.extend(folder.glob(f"**/{clip_id}_compliance.json"))
+    for candidate in candidates:
+        try:
+            path = candidate if candidate.is_absolute() else candidate
+            if path.exists():
+                return path
+        except OSError:
+            continue
+    return None
+
+
+def _read_compliance_result(path: Path | None) -> dict[str, Any] | None:
+    if path is None or not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _build_compliance_clip_row(
+    folder: Path,
+    source_video: str,
+    run_tag: str,
+    row: dict[str, Any],
+    result: dict[str, Any] | None,
+) -> dict[str, Any]:
+    checked_at = str((result or {}).get("checked_at") or "")
+    violation_count = int((result or {}).get("violation_count", row.get("violation_count") or 0) or 0)
+    compliance_file = str(row.get("compliance_file") or "")
+    return {
+        "Source Video": source_video,
+        "Run Tag": run_tag,
+        "Clip ID": row.get("clip_id", ""),
+        "Product": row.get("product", "general") or "general",
+        "Status": row.get("status", ""),
+        "Passed": bool((result or {}).get("passed", row.get("compliance_passed", False))),
+        "Blocked": bool((result or {}).get("blocked", row.get("compliance_blocked", False))),
+        "Auto Fixed": bool((result or {}).get("auto_fixed", row.get("auto_fixed", False))),
+        "Violation Count": violation_count,
+        "Summary": (result or {}).get("compliance_summary", row.get("compliance_summary", "")),
+        "Compliance File": compliance_file,
+        "Output Dir": str(folder),
+        "Checked At": checked_at,
+        "_checked_at_sort": parse_timestamp(checked_at) or datetime.min,
+        "_raw": result or {},
+    }
+
+
+def _build_violation_row(clip_record: dict[str, Any], violation: dict[str, Any]) -> dict[str, Any]:
+    position = violation.get("position") if isinstance(violation.get("position"), dict) else {}
+    return {
+        "Source Video": clip_record.get("Source Video", ""),
+        "Run Tag": clip_record.get("Run Tag", ""),
+        "Clip ID": clip_record.get("Clip ID", ""),
+        "Product": clip_record.get("Product", "general"),
+        "Field": str(violation.get("source_field") or "transcript"),
+        "Severity": str(violation.get("severity") or ""),
+        "Violation Type": str(violation.get("violation_type") or ""),
+        "Original Text": str(violation.get("original_text") or ""),
+        "Suggested Replacement": str(violation.get("suggested_replacement") or ""),
+        "Start": position.get("start"),
+        "End": position.get("end"),
+        "Compliance File": clip_record.get("Compliance File", ""),
+        "Output Dir": clip_record.get("Output Dir", ""),
+        "Checked At": clip_record.get("Checked At", ""),
+        "_checked_at_sort": clip_record.get("_checked_at_sort", datetime.min),
+    }
+
+
 def split_output_folder_name(folder_name: str) -> tuple[str, str]:
     if "__" not in folder_name:
         return folder_name, ""
@@ -791,7 +956,6 @@ def build_group_score_rows(group: dict[str, Any], source_video: str, run_tag: st
         "Product": group.get("product", "general") or "general",
         "Total Score": score_float(group.get("total_score")),
         "Content": score_float(group.get("content_score")),
-        "Visual": score_float(group.get("visual_score")),
         "Host Focus": score_float(group.get("host_focus_score")),
         "Hook": score_float(group.get("hook_score")),
         "Quality": score_float(group.get("quality_score")),
@@ -837,7 +1001,6 @@ def build_group_score_rows(group: dict[str, Any], source_video: str, run_tag: st
                 "Product": group.get("product", "general") or "general",
                 "Total Score": score_float(group.get("total_score")),
                 "Content": score_float(group.get("content_score")),
-                "Visual": score_float(group.get("visual_score")),
                 "Host Focus": score_float(group.get("host_focus_score")),
                 "Hook": score_float(group.get("hook_score")),
                 "Quality": score_float(group.get("quality_score")),
@@ -1033,7 +1196,15 @@ def _discover_score_output_dirs_cached(
     if not root.exists():
         return tuple(output_dirs)
     for folder in root.iterdir():
-        if not folder.is_dir() or not (folder / "scores_summary.json").exists():
+        if not folder.is_dir():
+            continue
+        if not (
+            (folder / "scores_summary.json").exists()
+            or (folder / "manifest.json").exists()
+            or any(folder.glob("*_compliance.json"))
+            or any(folder.glob("v*/*_compliance.json"))
+            or any(folder.glob("compliance/*_compliance.json"))
+        ):
             continue
         normalized = str(folder)
         key = normalized.casefold()
@@ -1619,6 +1790,7 @@ def render_nav_controls(active_tab: str) -> None:
         ("videos", "Videos", "video"),
         ("analytics", "Analytics", "chart"),
         ("scores", "Scores", "check-circle"),
+        ("compliance", "Compliance", "alert-circle"),
         ("trends", "Trends", "chart"),
         ("queues", "Queues", "list"),
         ("settings", "Settings", "gear"),
@@ -2066,7 +2238,6 @@ def render_scores_tab(summary: dict[str, Any]) -> None:
                 "Total Score",
                 "Host Focus",
                 "Content",
-                "Visual",
                 "Quality",
                 "Engagement",
                 "Hook",
@@ -2148,6 +2319,156 @@ def render_scores_tab(summary: dict[str, Any]) -> None:
     render_score_methodology()
 
 
+def render_compliance_tab(summary: dict[str, Any]) -> None:
+    render_page_intro("Compliance", "Advertising claim checks before subtitle rendering.")
+    output_dirs = collect_score_output_dirs(summary)
+    payload = load_compliance_rows(output_dirs)
+    totals = payload.get("summary", {})
+    clip_rows = payload.get("clips", [])
+    violation_rows = payload.get("violations", [])
+
+    kpi_cols = st.columns(4, gap="medium")
+    kpis = [
+        ("Scanned", int(totals.get("scanned") or 0), "clips", "focus", "#3b82f6"),
+        ("Passed", int(totals.get("passed") or 0), "clips", "check-circle", "#22c55e"),
+        ("Blocked", int(totals.get("blocked") or 0), "high severity", "alert-circle", "#ef4444"),
+        ("Auto-fixed", int(totals.get("auto_fixed") or 0), "low severity", "refresh", "#fbbf24"),
+    ]
+    for col, (title, value, subtitle, icon_name, accent) in zip(kpi_cols, kpis):
+        with col:
+            render_kpi_card(title, value, subtitle, icon_name, accent)
+
+    if not clip_rows:
+        st.info("No compliance results found yet.")
+        return
+
+    st.markdown("<div style='height:0.8rem'></div>", unsafe_allow_html=True)
+    with st.container(border=True):
+        st.markdown("<div class='panel-title'>Re-scan</div>", unsafe_allow_html=True)
+        run_options = ["Select run"] + list(output_dirs)
+        selected_run = st.selectbox(
+            "Output Run",
+            run_options,
+            format_func=lambda value: "Select run" if value == "Select run" else Path(value).name,
+            key="compliance_rescan_run",
+        )
+        if st.button(
+            "Re-run Compliance Scan",
+            key="compliance_rescan_button",
+            use_container_width=True,
+            disabled=selected_run == "Select run",
+        ):
+            try:
+                import config as cfg
+                from compliance_checker import scan_output_dir
+
+                result = scan_output_dir(selected_run, cfg=cfg, force=True)
+                load_compliance_rows.clear()
+                load_score_rows.clear()
+                load_manifest_clip_count.clear()
+                st.success(
+                    "Compliance scan complete: "
+                    f"{result.get('scanned', 0)} scanned, "
+                    f"{result.get('blocked', 0)} blocked, "
+                    f"{result.get('auto_fixed', 0)} auto-fixed."
+                )
+                st.rerun(scope="fragment")
+            except Exception as exc:
+                st.error(f"Compliance re-scan failed: {exc}")
+
+    st.markdown("<div style='height:0.8rem'></div>", unsafe_allow_html=True)
+    violation_df = pd.DataFrame(violation_rows)
+    clip_df = pd.DataFrame(clip_rows)
+
+    filter_cols = st.columns([1, 1, 1, 1.4], gap="medium")
+    with filter_cols[0]:
+        severity_options = ["All"] + sorted(
+            {str(value) for value in violation_df.get("Severity", pd.Series(dtype=str)).dropna().unique()}
+        )
+        severity_filter = st.selectbox("Severity", severity_options, key="compliance_severity_filter")
+    with filter_cols[1]:
+        product_options = ["All"] + sorted(
+            {str(value) for value in clip_df.get("Product", pd.Series(dtype=str)).dropna().unique() if str(value)}
+        )
+        product_filter = st.selectbox("Product", product_options, key="compliance_product_filter")
+    with filter_cols[2]:
+        type_options = ["All"] + sorted(
+            {str(value) for value in violation_df.get("Violation Type", pd.Series(dtype=str)).dropna().unique()}
+        )
+        type_filter = st.selectbox("Type", type_options, key="compliance_type_filter")
+    with filter_cols[3]:
+        search_term = st.text_input("Search", placeholder="Clip or claim", key="compliance_search")
+
+    if violation_df.empty:
+        st.info("No violations found in scanned clips.")
+    else:
+        filtered = violation_df.copy()
+        if severity_filter != "All":
+            filtered = filtered[filtered["Severity"].astype(str) == severity_filter]
+        if product_filter != "All":
+            filtered = filtered[filtered["Product"].astype(str) == product_filter]
+        if type_filter != "All":
+            filtered = filtered[filtered["Violation Type"].astype(str) == type_filter]
+        if search_term:
+            needle = search_term.casefold()
+            haystack = (
+                filtered["Clip ID"].astype(str)
+                + " "
+                + filtered["Original Text"].astype(str)
+                + " "
+                + filtered["Suggested Replacement"].astype(str)
+            ).str.casefold()
+            filtered = filtered[haystack.str.contains(needle, na=False)]
+
+        display_cols = [
+            "Clip ID",
+            "Product",
+            "Field",
+            "Severity",
+            "Violation Type",
+            "Original Text",
+            "Suggested Replacement",
+            "Compliance File",
+        ]
+        st.dataframe(
+            filtered[display_cols].style.apply(_compliance_severity_style, axis=1),
+            hide_index=True,
+            use_container_width=True,
+            height=420,
+        )
+
+    with st.expander("Scanned Clips"):
+        st.dataframe(
+            clip_df[
+                [
+                    "Clip ID",
+                    "Product",
+                    "Status",
+                    "Passed",
+                    "Blocked",
+                    "Auto Fixed",
+                    "Violation Count",
+                    "Summary",
+                    "Compliance File",
+                ]
+            ],
+            hide_index=True,
+            use_container_width=True,
+            height=360,
+        )
+
+
+def _compliance_severity_style(row: pd.Series) -> list[str]:
+    severity = str(row.get("Severity") or "").lower()
+    colors = {
+        "high": "background-color: rgba(239, 68, 68, 0.24); color: #fee2e2;",
+        "medium": "background-color: rgba(249, 115, 22, 0.22); color: #ffedd5;",
+        "low": "background-color: rgba(234, 179, 8, 0.20); color: #fef9c3;",
+    }
+    style = colors.get(severity, "")
+    return [style for _ in row]
+
+
 def render_trends_tab(summary: dict[str, Any]) -> None:
     render_page_intro("Trends", "Score trends by product, dimension, tier, and recurring flags.")
     score_rows = load_score_rows(collect_score_output_dirs(summary))
@@ -2177,7 +2498,6 @@ def render_trends_tab(summary: dict[str, Any]) -> None:
     dimension_rows = []
     for label, column in [
         ("Content", "Content"),
-        ("Visual", "Visual"),
         ("Quality", "Quality"),
         ("Engagement", "Engagement"),
     ]:
@@ -2463,7 +2783,6 @@ def render_scores_compact_table(page_df: pd.DataFrame, all_rows: pd.DataFrame, s
             <div>Type</div>
             <div>Total</div>
             <div>Content</div>
-            <div>Visual</div>
             <div>Host Focus</div>
             <div>Hook</div>
             <div>Quality</div>
@@ -2485,7 +2804,7 @@ def render_scores_compact_table(page_df: pd.DataFrame, all_rows: pd.DataFrame, s
         if selected:
             st.markdown("<div class='score-selected-strip'></div>", unsafe_allow_html=True)
 
-        cols = st.columns([0.24, 1.12, 0.55, 1.28, 0.8, 0.42, 0.42, 0.42, 0.58, 0.42, 0.42, 0.52, 0.68, 0.4, 1.55], gap="small")
+        cols = st.columns([0.24, 1.12, 0.55, 1.28, 0.8, 0.42, 0.42, 0.58, 0.42, 0.42, 0.52, 0.68, 0.4, 1.55], gap="small")
         variant_count = row.get("Variants")
         cells = [
             str(row.get("Source Video", "")),
@@ -2493,7 +2812,6 @@ def render_scores_compact_table(page_df: pd.DataFrame, all_rows: pd.DataFrame, s
             str(row.get("Product", "")),
             score_format(row.get("Total Score")),
             score_format(row.get("Content")),
-            score_format(row.get("Visual")),
             score_format(row.get("Host Focus")),
             score_format(row.get("Hook")),
             score_format(row.get("Quality")),
@@ -2527,15 +2845,15 @@ def render_scores_compact_table(page_df: pd.DataFrame, all_rows: pd.DataFrame, s
             ):
                 selected_key = key
                 st.session_state.selected_score_key = key
-        for col, value in zip(cols[4:12], cells[2:10]):
+        for col, value in zip(cols[4:11], cells[2:9]):
             with col:
                 st.markdown(f"<div class='score-cell'>{html.escape(value)}</div>", unsafe_allow_html=True)
-        with cols[12]:
+        with cols[11]:
             st.markdown(render_similarity_bar(row.get("Similarity")), unsafe_allow_html=True)
+        with cols[12]:
+            st.markdown(f"<div class='score-cell'>{html.escape(cells[10])}</div>", unsafe_allow_html=True)
         with cols[13]:
             st.markdown(f"<div class='score-cell'>{html.escape(cells[11])}</div>", unsafe_allow_html=True)
-        with cols[14]:
-            st.markdown(f"<div class='score-cell'>{html.escape(cells[12])}</div>", unsafe_allow_html=True)
 
         if expanded:
             variants = variants_for_score_base(all_rows, base_key)
@@ -2641,11 +2959,10 @@ def render_score_detail(selected: pd.Series) -> None:
                 f"Variant of {selected.get('_base_clip_id', '')}; base scores are inherited, similarity is variant-specific."
             )
 
-        breakdown_cols = st.columns(8, gap="medium")
+        breakdown_cols = st.columns(7, gap="medium")
         items = [
             ("Total", selected.get("Total Score")),
             ("Content", selected.get("Content")),
-            ("Visual", selected.get("Visual")),
             ("Host Focus", selected.get("Host Focus")),
             ("Hook", selected.get("Hook")),
             ("Quality", selected.get("Quality")),
@@ -2687,13 +3004,11 @@ def render_score_methodology() -> None:
         st.markdown("<div class='panel-title'>How Scores Are Calculated</div>", unsafe_allow_html=True)
         st.markdown(
             """
-            **Total Score** is a weighted average of available dimensions: Content 46.7%, Quality 20%, Engagement 33.3%. Visual scoring is disabled. Host Focus receives 20% only when the vision scorer returns a score, with the other weights scaled down proportionally.
+            **Total Score** is a weighted average of available dimensions: Content 46.7%, Quality 20%, Engagement 33.3%. Host Focus receives 20% only when the vision scorer returns a score, with the other weights scaled down proportionally.
 
             Base clip scores are calculated once per original clip ID, then inherited by all rendered variants of that clip.
 
             **Content** uses Qwen text scoring on the clip transcript plus deterministic keyword checks to label actual focus: promo, demo, benefit, ingredient, or product-only. Clips that only discuss price or promotion without benefit, demo, ingredient, or product explanation are capped low on content.
-
-            **Visual** is no longer scored and does not contribute to Total Score.
 
             **Host Focus** is optional Qwen2.5-VL scoring. Every configured sample frame is classified as A engaged with livestream, B looking down at a personal device, or C not attending to the stream. Score = A frames / scored frames * 10.
 
@@ -2992,6 +3307,8 @@ def render_dashboard() -> None:
             render_analytics_tab(summary)
         elif active_tab == "scores":
             render_scores_tab(summary)
+        elif active_tab == "compliance":
+            render_compliance_tab(summary)
         elif active_tab == "trends":
             render_trends_tab(summary)
         elif active_tab == "focus_debug":

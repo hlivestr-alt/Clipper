@@ -15,11 +15,12 @@ from bisect import bisect_left, bisect_right
 from pathlib import Path
 from typing import Any
 
+from utils import _parse_json_object
+
 log = logging.getLogger("proya.clip_scorer")
 
 SCORE_SCHEMA_VERSION = 2
-_YOLO_MODEL_CACHE: dict[tuple[str, str], Any] = {}
-_COCO_MODEL_CACHE: dict[tuple[str, str], Any] = {}
+SCORE_TIER_DIRS = {"export_ready", "review_needed", "rejected"}
 
 
 def score_clip(
@@ -102,13 +103,6 @@ def score_clip(
         log.warning("Hook scoring unavailable for %s: %s", clip_path, exc)
         metrics["hook"] = {"error": str(exc), "source": "unavailable"}
 
-    visual_score = None
-    metrics["visual"] = {
-        "enabled": False,
-        "reason": "visual_scoring_removed",
-        "frame_sample_rate": sample_rate,
-    }
-
     host_focus_score = None
     metrics["host_focus"] = {
         "enabled": False,
@@ -159,7 +153,7 @@ def score_clip(
         "clip_path": str(clip_path.resolve()),
         "product": product_name or "general",
         "content_score": _round_optional_score(content_score),
-        "visual_score": _round_optional_score(visual_score),
+        "visual_score": None,
         "host_focus_score": _round_optional_score(host_focus_score),
         "hook_score": _round_optional_score(hook_score),
         "hook_summary": hook_summary,
@@ -230,7 +224,7 @@ def write_score_artifacts(
     optimization_stats: dict[str, Any] | None = None,
     cfg=None,
     finalize: bool = True,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Write per-folder scores.json files and a ranked grouped scores_summary.json."""
     if cfg is None:
         try:
@@ -247,6 +241,15 @@ def write_score_artifacts(
         if groups is not None
         else _build_score_groups_from_flat_scores(valid_scores)
     )
+    post_scoring = {}
+    report_path = ""
+    if finalize:
+        try:
+            tier_move = _move_scored_clips_by_tier(valid_scores, root, cfg)
+            _apply_tier_moves_to_groups(valid_groups, tier_move, root)
+            post_scoring["tier_move"] = tier_move
+        except Exception as exc:
+            log.warning("Could not move scored clips into tiers for %s: %s", root, exc)
 
     by_parent: dict[Path, list[dict[str, Any]]] = {}
     for score in valid_scores:
@@ -278,45 +281,36 @@ def write_score_artifacts(
         reverse=True,
     )
     summary_path = root / "scores_summary.json"
-    _write_json_atomic(
-        summary_path,
-        {
-            "schema_version": SCORE_SCHEMA_VERSION,
-            "updated_at": now,
-            "output_dir": str(root.resolve()),
-            "score_count": len(ranked),
-            "base_score_count": len(ranked_groups),
-            "variant_score_count": len(ranked),
-            "scoring_optimization": optimization_stats or _build_scoring_optimization_stats(ranked, ranked_groups),
-            "groups": ranked_groups,
-            "clips": ranked,
-        },
-    )
-    post_scoring = {}
-    report_path = ""
+    summary_payload = {
+        "schema_version": SCORE_SCHEMA_VERSION,
+        "updated_at": now,
+        "output_dir": str(root.resolve()),
+        "score_count": len(ranked),
+        "base_score_count": len(ranked_groups),
+        "variant_score_count": len(ranked),
+        "scoring_optimization": optimization_stats or _build_scoring_optimization_stats(ranked, ranked_groups),
+        "groups": ranked_groups,
+        "clips": ranked,
+    }
     if finalize:
         try:
             report_path = str(write_scores_report(ranked, root, cfg).resolve())
             post_scoring["scores_report_path"] = report_path
         except Exception as exc:
             log.warning("Could not write score trend report for %s: %s", root, exc)
-        try:
-            post_scoring["tier_copy"] = _copy_scored_clips_by_tier(ranked, root, cfg)
-        except Exception as exc:
-            log.warning("Could not sort scored clips for %s: %s", root, exc)
 
         if post_scoring:
-            summary_payload = json.loads(summary_path.read_text(encoding="utf-8"))
-            if isinstance(summary_payload, dict):
-                summary_payload["post_scoring"] = post_scoring
-                if report_path:
-                    summary_payload["scores_report_path"] = report_path
-                _write_json_atomic(summary_path, summary_payload)
+            summary_payload["post_scoring"] = post_scoring
+            if report_path:
+                summary_payload["scores_report_path"] = report_path
+
+    _write_json_atomic(summary_path, summary_payload)
 
     return {
         "summary_path": str(summary_path.resolve()),
         "local_score_files": local_files,
         "scores_report_path": report_path,
+        "tier_move": post_scoring.get("tier_move", {}),
     }
 
 
@@ -565,16 +559,9 @@ def apply_host_focus_vision_scores(
                 succeeded += 1
             except Exception as exc:
                 failed += 1
-                log.warning("Host focus vision scoring unavailable for %s: %s", representative_path, exc)
-                host_focus = {
-                    "score": None,
-                    "flags": ["host_focus_vision_unavailable"],
-                    "metrics": {
-                        "enabled": True,
-                        "error": str(exc),
-                        "frame_sample_rate": vision_sample_rate,
-                    },
-                }
+                message = f"Host focus vision scoring failed for {representative_path}: {exc}"
+                log.error(message)
+                raise RuntimeError(message) from exc
 
         base_score = copy.deepcopy(group)
         _apply_host_focus_result_to_score(base_score, host_focus, cfg)
@@ -683,7 +670,6 @@ def _apply_host_focus_result_to_score(score: dict[str, Any], host_focus: dict[st
     score["exported"] = exported
     score["scored_dimensions"] = {
         "content": score.get("content_score") is not None,
-        "visual": score.get("visual_score") is not None,
         "quality": score.get("quality_score") is not None,
         "engagement": score.get("engagement_score") is not None,
         "host_focus": host_focus_score is not None,
@@ -810,7 +796,8 @@ def score_output_folder(
             _attach_score_to_manifest_row(row, score, cfg)
 
     if scores:
-        write_score_artifacts(scores, folder, groups=groups, optimization_stats=stats, cfg=cfg)
+        artifacts = write_score_artifacts(scores, folder, groups=groups, optimization_stats=stats, cfg=cfg)
+        _apply_tier_move_stats_to_manifest(manifest, artifacts.get("tier_move", {}))
         _write_json_atomic(manifest_path, manifest)
     return scores
 
@@ -1052,6 +1039,12 @@ def _prepare_cached_variant_score(score: dict[str, Any], entry: dict[str, Any]) 
             "hook": entry.get("hook", cached.get("hook", "")),
             "clip_type": entry.get("clip_type", cached.get("clip_type", "")),
             "source_moment_score": entry.get("source_moment_score", cached.get("source_moment_score")),
+            "compliance_passed": entry.get("compliance_passed", cached.get("compliance_passed")),
+            "violation_count": entry.get("violation_count", cached.get("violation_count")),
+            "auto_fixed": entry.get("auto_fixed", cached.get("auto_fixed")),
+            "compliance_blocked": entry.get("compliance_blocked", cached.get("compliance_blocked")),
+            "compliance_summary": entry.get("compliance_summary", cached.get("compliance_summary", "")),
+            "compliance_file": entry.get("compliance_file", cached.get("compliance_file", "")),
             "cache_hit": True,
             "clip_mtime_ns": _clip_mtime_ns(clip_path),
         }
@@ -1140,6 +1133,19 @@ def _version_dir_from_output_file(output_file: Any) -> str:
     return text.split("/", 1)[0]
 
 
+def _copy_compliance_fields(target: dict[str, Any], source: dict[str, Any]) -> None:
+    for key in (
+        "compliance_passed",
+        "violation_count",
+        "auto_fixed",
+        "compliance_blocked",
+        "compliance_summary",
+        "compliance_file",
+    ):
+        if key in source:
+            target[key] = source[key]
+
+
 def _decorate_base_score(
     base_score: dict[str, Any],
     base_clip_id: str,
@@ -1161,6 +1167,7 @@ def _decorate_base_score(
     base_score["hook"] = representative.get("hook", base_score.get("hook", ""))
     base_score["clip_type"] = representative.get("clip_type", base_score.get("clip_type", ""))
     base_score["source_moment_score"] = representative.get("source_moment_score", base_score.get("source_moment_score"))
+    _copy_compliance_fields(base_score, representative)
 
 
 def _failed_base_score(base_clip_id: str, representative: dict[str, Any], exc: Exception, cfg) -> dict[str, Any]:
@@ -1183,7 +1190,6 @@ def _failed_base_score(base_clip_id: str, representative: dict[str, Any], exc: E
         "weights": weights,
         "scored_dimensions": {
             "content": False,
-            "visual": False,
             "quality": False,
             "engagement": False,
             "host_focus": False,
@@ -1379,6 +1385,12 @@ def _inherit_base_score_for_variant(
             "hook": entry.get("hook", score.get("hook", "")),
             "clip_type": entry.get("clip_type", score.get("clip_type", "")),
             "source_moment_score": entry.get("source_moment_score", score.get("source_moment_score")),
+            "compliance_passed": entry.get("compliance_passed", score.get("compliance_passed")),
+            "violation_count": entry.get("violation_count", score.get("violation_count")),
+            "auto_fixed": entry.get("auto_fixed", score.get("auto_fixed")),
+            "compliance_blocked": entry.get("compliance_blocked", score.get("compliance_blocked")),
+            "compliance_summary": entry.get("compliance_summary", score.get("compliance_summary", "")),
+            "compliance_file": entry.get("compliance_file", score.get("compliance_file", "")),
             "similarity_score": similarity_score,
             "similarity_flags": similarity_flags,
             "inherited_base_scores": True,
@@ -1468,6 +1480,12 @@ def _build_group_score_from_base(base_score: dict[str, Any], variant_scores: lis
         "hook": base_score.get("hook", ""),
         "clip_type": base_score.get("clip_type", ""),
         "source_moment_score": base_score.get("source_moment_score"),
+        "compliance_passed": base_score.get("compliance_passed"),
+        "violation_count": base_score.get("violation_count"),
+        "auto_fixed": base_score.get("auto_fixed"),
+        "compliance_blocked": base_score.get("compliance_blocked"),
+        "compliance_summary": base_score.get("compliance_summary", ""),
+        "compliance_file": base_score.get("compliance_file", ""),
         "representative_clip_id": base_score.get("representative_clip_id"),
         "representative_variant_id": base_score.get("representative_variant_id"),
         "representative_output_file": base_score.get("representative_output_file"),
@@ -1496,6 +1514,12 @@ def _variant_summary_from_score(score: dict[str, Any]) -> dict[str, Any]:
         "similarity_score": score.get("similarity_score"),
         "similarity_flags": score.get("similarity_flags", []),
         "similarity_metrics": (score.get("metrics") or {}).get("similarity", {}),
+        "compliance_passed": score.get("compliance_passed"),
+        "violation_count": score.get("violation_count"),
+        "auto_fixed": score.get("auto_fixed"),
+        "compliance_blocked": score.get("compliance_blocked"),
+        "compliance_summary": score.get("compliance_summary", ""),
+        "compliance_file": score.get("compliance_file", ""),
         "exported": bool(score.get("exported", True)),
         "scored_at": score.get("scored_at", ""),
     }
@@ -1593,10 +1617,6 @@ def _build_scoring_optimization_stats(
         "saved_text_qwen_calls": actual_calls,
         "saved_text_qwen_calls_from_merge": actual_calls,
     }
-
-
-def _score_content_with_qwen(transcript_text: str, product_name: str, cfg) -> dict[str, Any]:
-    return _score_content_and_engagement_with_qwen(transcript_text, product_name, cfg)["content"]
 
 
 def _score_content_and_engagement_with_qwen(
@@ -1906,226 +1926,6 @@ def _transcript_words_with_timestamps(transcript: Any) -> list[dict[str, Any]] |
             return None
         output.append(item)
     return output
-
-
-def _score_visual(
-    clip_path: Path,
-    product_name: str,
-    cfg,
-    frame_sample_rate: int,
-) -> tuple[float | None, list[str], dict[str, Any]]:
-    try:
-        import cv2
-    except ImportError as exc:
-        raise RuntimeError("opencv-python is not installed") from exc
-
-    product_model = _load_yolo_model(cfg)
-    coco_model, coco_error = _load_coco_model(cfg)
-    cap = cv2.VideoCapture(str(clip_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"cannot open clip: {clip_path}")
-
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-    sampled_frames = []
-    host_frames = 0
-    custom_face_frames = 0
-    person_frames = 0
-    phone_frames = 0
-    product_frames = 0
-    target_product_frames = 0
-    custom_product_frames = 0
-    generic_product_frames = 0
-    both_frames = 0
-    detections_seen = 0
-    class_counts: dict[str, int] = {}
-    coco_class_counts: dict[str, int] = {}
-    frame_idx = 0
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if frame_idx % frame_sample_rate != 0:
-            frame_idx += 1
-            continue
-
-        sampled_frames.append(frame)
-        frame_idx += 1
-
-    cap.release()
-    sampled = len(sampled_frames)
-
-    if sampled_frames:
-        product_results = product_model.predict(
-            sampled_frames,
-            conf=float(getattr(cfg, "YOLO_CONF_THRESHOLD", 0.55)),
-            verbose=False,
-            device=getattr(cfg, "YOLO_DEVICE", "cpu"),
-            imgsz=int(getattr(cfg, "YOLO_IMGSZ", 416)),
-            half=bool(getattr(cfg, "YOLO_HALF", False)),
-        )
-    else:
-        product_results = []
-
-    if sampled_frames and coco_model is not None:
-        coco_results_by_frame = coco_model.predict(
-            sampled_frames,
-            conf=0.35,
-            verbose=False,
-            device=getattr(cfg, "YOLO_DEVICE", "cpu"),
-            imgsz=640,
-            half=bool(getattr(cfg, "YOLO_HALF", False)),
-        )
-    else:
-        coco_results_by_frame = []
-
-    for sample_index, results in enumerate(product_results):
-        frame_has_host = False
-        frame_has_custom_face = False
-        frame_has_person = False
-        frame_has_phone = False
-        frame_has_product = False
-        frame_has_target_product = False
-        frame_has_custom_product = False
-        frame_has_generic_product = False
-
-        for result in [results]:
-            boxes = getattr(result, "boxes", None)
-            if boxes is None:
-                continue
-            for box in boxes:
-                class_id = int(box.cls[0])
-                labels = _labels_for_class_id(class_id, product_model, cfg)
-                label = labels[0] if labels else f"class_{class_id}"
-                class_counts[label] = class_counts.get(label, 0) + 1
-                detections_seen += 1
-                is_face = any(_is_face_label(item, cfg) for item in labels)
-                if is_face:
-                    frame_has_host = True
-                    frame_has_custom_face = True
-                elif any(_is_target_product_label(item, product_name, cfg) for item in labels):
-                    frame_has_product = True
-                    frame_has_target_product = True
-                    frame_has_custom_product = True
-                elif any(_is_custom_product_label(item, cfg) for item in labels):
-                    frame_has_product = True
-                    frame_has_custom_product = True
-
-        if coco_results_by_frame:
-            coco_results = [coco_results_by_frame[sample_index]]
-            for result in coco_results:
-                boxes = getattr(result, "boxes", None)
-                if boxes is None:
-                    continue
-                for box in boxes:
-                    class_id = int(box.cls[0])
-                    label = str(getattr(coco_model, "names", {}).get(class_id, f"class_{class_id}"))
-                    coco_class_counts[label] = coco_class_counts.get(label, 0) + 1
-                    if label == "person":
-                        frame_has_host = True
-                        frame_has_person = True
-                    if label == "cell phone":
-                        frame_has_phone = True
-                    elif _is_generic_product_label(label, cfg):
-                        frame_has_product = True
-                        frame_has_generic_product = True
-
-        if frame_has_host:
-            host_frames += 1
-        if frame_has_custom_face:
-            custom_face_frames += 1
-        if frame_has_person:
-            person_frames += 1
-        if frame_has_phone:
-            phone_frames += 1
-        if frame_has_product:
-            product_frames += 1
-        if frame_has_target_product:
-            target_product_frames += 1
-        if frame_has_custom_product:
-            custom_product_frames += 1
-        if frame_has_generic_product:
-            generic_product_frames += 1
-        if frame_has_host and frame_has_product:
-            both_frames += 1
-    if sampled == 0:
-        return None, ["visual_no_frames"], {
-            "sampled_frames": 0,
-            "frame_sample_rate": frame_sample_rate,
-        }
-
-    host_ratio = host_frames / sampled
-    custom_face_ratio = custom_face_frames / sampled
-    person_ratio = person_frames / sampled
-    phone_ratio = phone_frames / sampled
-    product_ratio = product_frames / sampled
-    target_product_ratio = target_product_frames / sampled
-    custom_product_ratio = custom_product_frames / sampled
-    generic_product_ratio = generic_product_frames / sampled
-    both_ratio = both_frames / sampled
-    score = _round_score(
-        max(0.0, min(1.0, product_ratio * 0.60 + both_ratio * 0.40)) * 10.0
-    )
-    flags = []
-    product_visible_min_ratio = float(getattr(cfg, "SCORER_PRODUCT_VISIBLE_MIN_RATIO", 0.05) or 0.05)
-    if product_ratio >= product_visible_min_ratio:
-        flags.append("product_visible")
-        if target_product_ratio >= product_visible_min_ratio:
-            flags.append("target_product_visible")
-        elif custom_product_ratio >= product_visible_min_ratio:
-            flags.append("product_visible_by_custom_model")
-        elif generic_product_ratio >= product_visible_min_ratio:
-            flags.append("product_visible_by_generic_fallback")
-    else:
-        flags.append("product_not_visible")
-    if host_ratio >= 0.20:
-        flags.append("host_visible")
-    else:
-        flags.append("host_not_detected")
-    if custom_face_ratio >= 0.20:
-        flags.append("face_present")
-    elif person_ratio >= 0.20:
-        flags.append("host_detected_by_person_fallback")
-    if both_ratio >= 0.10:
-        flags.append("host_and_product_visible")
-    if phone_ratio >= 0.10:
-        flags.append("phone_visible")
-    if coco_error:
-        flags.append("coco_yolo_unavailable")
-
-    return score, flags, {
-        "sampled_frames": sampled,
-        "total_frames": total_frames,
-        "fps": round(fps, 3) if fps > 0 else None,
-        "frame_sample_rate": frame_sample_rate,
-        "host_frames": host_frames,
-        "custom_face_frames": custom_face_frames,
-        "person_frames": person_frames,
-        "phone_frames": phone_frames,
-        "product_frames": product_frames,
-        "target_product_frames": target_product_frames,
-        "custom_product_frames": custom_product_frames,
-        "generic_product_frames": generic_product_frames,
-        "both_frames": both_frames,
-        "host_frame_ratio": round(host_ratio, 4),
-        "custom_face_frame_ratio": round(custom_face_ratio, 4),
-        "person_frame_ratio": round(person_ratio, 4),
-        "phone_frame_ratio": round(phone_ratio, 4),
-        "product_frame_ratio": round(product_ratio, 4),
-        "target_product_frame_ratio": round(target_product_ratio, 4),
-        "custom_product_frame_ratio": round(custom_product_ratio, 4),
-        "generic_product_frame_ratio": round(generic_product_ratio, 4),
-        "both_frame_ratio": round(both_ratio, 4),
-        "visual_formula": "product_ratio*0.60 + both_ratio*0.40",
-        "product_score_component": round(product_ratio * 0.60, 4),
-        "together_score_component": round(both_ratio * 0.40, 4),
-        "product_visible_min_ratio": product_visible_min_ratio,
-        "detections_seen": detections_seen,
-        "class_counts": class_counts,
-        "coco_class_counts": coco_class_counts,
-        "coco_error": coco_error,
-    }
 
 
 def _score_host_focus_with_qwen_vl(
@@ -2693,53 +2493,6 @@ def _score_engagement(transcript_text: str, product_name: str, cfg) -> tuple[flo
     }
 
 
-def _load_yolo_model(cfg):
-    try:
-        from ultralytics import YOLO
-    except ImportError as exc:
-        raise RuntimeError("ultralytics is not installed") from exc
-
-    weights = Path(getattr(cfg, "YOLO_WEIGHTS", "models/proya_best.pt"))
-    if not weights.exists():
-        raise FileNotFoundError(f"YOLO weights not found: {weights}")
-
-    cache_key = (
-        str(weights.resolve()).casefold(),
-        str(getattr(cfg, "YOLO_DEVICE", "cpu")),
-    )
-    model = _YOLO_MODEL_CACHE.get(cache_key)
-    if model is None:
-        model = YOLO(str(weights))
-        _YOLO_MODEL_CACHE.clear()
-        _YOLO_MODEL_CACHE[cache_key] = model
-    return model
-
-
-def _load_coco_model(cfg) -> tuple[Any | None, str | None]:
-    try:
-        from ultralytics import YOLO
-    except ImportError as exc:
-        return None, f"ultralytics unavailable: {exc}"
-
-    weights = Path(getattr(cfg, "YOLO_PRETRAIN", "yolov8n.pt"))
-    if not weights.exists():
-        return None, f"COCO YOLO weights not found: {weights}"
-
-    cache_key = (
-        str(weights.resolve()).casefold(),
-        str(getattr(cfg, "YOLO_DEVICE", "cpu")),
-    )
-    model = _COCO_MODEL_CACHE.get(cache_key)
-    if model is None:
-        try:
-            model = YOLO(str(weights))
-        except Exception as exc:
-            return None, str(exc)
-        _COCO_MODEL_CACHE.clear()
-        _COCO_MODEL_CACHE[cache_key] = model
-    return model, None
-
-
 def _probe_duration(clip_path: Path) -> float | None:
     result = subprocess.run(
         [
@@ -2828,75 +2581,6 @@ def _probe_audio_quality(
     return loudness_lufs, loudness_error, silence_metrics, None
 
 
-def _probe_loudness_lufs(clip_path: Path, duration: float | None) -> tuple[float | None, str | None]:
-    timeout = max(30, min(240, int((duration or 30) * 3)))
-    result = subprocess.run(
-        [
-            "ffmpeg",
-            "-hide_banner",
-            "-nostats",
-            "-i",
-            str(clip_path),
-            "-af",
-            "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
-            "-f",
-            "null",
-            "-",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    if result.returncode != 0:
-        return None, (result.stderr or result.stdout or "ffmpeg loudnorm failed")[-500:]
-    matches = re.findall(r"\{[\s\S]*?\"input_i\"[\s\S]*?\}", result.stderr or result.stdout)
-    if not matches:
-        return None, "loudnorm JSON not found"
-    try:
-        payload = json.loads(matches[-1])
-        value = float(payload.get("input_i"))
-        return value, None
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        return None, str(exc)
-
-
-def _probe_silence(clip_path: Path, duration: float | None) -> tuple[dict[str, Any] | None, str | None]:
-    timeout = max(30, min(180, int((duration or 30) * 2)))
-    result = subprocess.run(
-        [
-            "ffmpeg",
-            "-hide_banner",
-            "-nostats",
-            "-i",
-            str(clip_path),
-            "-af",
-            "silencedetect=noise=-35dB:d=1.0",
-            "-f",
-            "null",
-            "-",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    output = result.stderr or result.stdout or ""
-    if result.returncode != 0:
-        return None, output[-500:] or "ffmpeg silencedetect failed"
-
-    durations = [float(item) for item in re.findall(r"silence_duration:\s*([0-9.]+)", output)]
-    total_silence = sum(durations)
-    max_silence = max(durations) if durations else 0.0
-    silence_fraction = (total_silence / duration) if duration and duration > 0 else 0.0
-    return {
-        "events": len(durations),
-        "total_silence_seconds": round(total_silence, 3),
-        "max_silence_seconds": round(max_silence, 3),
-        "silence_fraction": round(silence_fraction, 4),
-    }, None
-
-
 def _read_transcript_path(path: Path) -> str:
     if path.suffix.lower() == ".json":
         try:
@@ -2920,72 +2604,6 @@ def _words_to_text(words: list) -> str:
         if token:
             tokens.append(token)
     return " ".join(tokens)
-
-
-def _labels_for_class_id(class_id: int, model, cfg) -> list[str]:
-    labels = []
-    model_names = getattr(model, "names", None)
-    if isinstance(model_names, dict) and class_id in model_names:
-        labels.append(str(model_names[class_id]))
-    elif isinstance(model_names, list) and 0 <= class_id < len(model_names):
-        labels.append(str(model_names[class_id]))
-
-    cfg_classes = getattr(cfg, "PRODUCT_CLASSES", {}) or {}
-    cfg_label = cfg_classes.get(class_id)
-    if cfg_label is not None and _normalize_label(cfg_label) not in {
-        _normalize_label(label) for label in labels
-    }:
-        labels.append(str(cfg_label))
-    return labels or [f"class_{class_id}"]
-
-
-def _is_face_label(label: str, cfg) -> bool:
-    normalized = _normalize_label(label)
-    configured = _normalize_label(getattr(cfg, "HOST_FACE_CLASS", "host_face"))
-    return normalized in {configured, "hostface", "face", "host"} or "hostface" in normalized
-
-
-def _is_target_product_label(label: str, product_name: str, cfg) -> bool:
-    normalized = _normalize_label(label)
-    if not normalized or _is_face_label(label, cfg):
-        return False
-    target = _normalize_label(product_name)
-    if target in {"", "general", "produk", "product"}:
-        return True
-    return target in normalized or normalized in target
-
-
-def _is_custom_product_label(label: str, cfg) -> bool:
-    normalized = _normalize_label(label)
-    if not normalized or _is_face_label(label, cfg):
-        return False
-    product_labels = {
-        _normalize_label(value)
-        for value in (getattr(cfg, "PRODUCT_CLASSES", {}) or {}).values()
-        if value
-    }
-    product_labels.discard("")
-    product_labels.discard(_normalize_label(getattr(cfg, "HOST_FACE_CLASS", "host_face")))
-    return normalized in product_labels or any(
-        normalized in product_label or product_label in normalized
-        for product_label in product_labels
-        if product_label
-    )
-
-
-def _is_generic_product_label(label: str, cfg) -> bool:
-    normalized = _normalize_label(label)
-    if not normalized:
-        return False
-    configured = getattr(cfg, "SCORER_GENERIC_PRODUCT_LABELS", None)
-    if configured is None:
-        configured = ["bottle", "cup"]
-    generic_labels = {_normalize_label(item) for item in configured if item}
-    return normalized in generic_labels
-
-
-def _normalize_label(value: Any) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
 
 def _count_pattern_matches(text: str, patterns: list[str]) -> int:
@@ -3065,7 +2683,7 @@ def _attach_score_to_manifest_row(row: dict[str, Any], score: dict[str, Any], cf
     row["scorer_variant_id"] = score.get("variant_id")
     row["scorer_total_score"] = score.get("total_score")
     row["scorer_content_score"] = score.get("content_score")
-    row["scorer_visual_score"] = score.get("visual_score")
+    row.pop("scorer_visual_score", None)
     row["scorer_host_focus_score"] = score.get("host_focus_score")
     row["scorer_quality_score"] = score.get("quality_score")
     row["scorer_engagement_score"] = score.get("engagement_score")
@@ -3091,31 +2709,15 @@ def _duration_score(duration: float, min_duration: float, max_duration: float) -
     return max(0.0, 10.0 - ((duration - max_duration) / max(max_duration, 1.0)) * 8.0)
 
 
-def _parse_json_object(raw: str) -> dict[str, Any]:
-    cleaned = re.sub(r"```(?:json)?", "", raw or "", flags=re.IGNORECASE).strip()
-    try:
-        payload = json.loads(cleaned)
-        if isinstance(payload, dict):
-            return payload
-    except json.JSONDecodeError:
-        pass
-    match = re.search(r"\{[\s\S]*\}", cleaned)
-    if match:
-        payload = json.loads(match.group(0))
-        if isinstance(payload, dict):
-            return payload
-    raise ValueError(f"Qwen response was not JSON: {cleaned[:200]}")
-
-
 def _normalized_dimension_weights(raw_weights: Any) -> dict[str, float]:
-    defaults = {"content": 0.466667, "visual": 0.0, "quality": 0.2, "engagement": 0.333333}
+    defaults = {"content": 0.466667, "quality": 0.2, "engagement": 0.333333}
     if isinstance(raw_weights, dict):
         for key in defaults:
             if key in raw_weights:
                 defaults[key] = max(0.0, float(raw_weights[key]))
     total = sum(defaults.values())
     if total <= 0:
-        return {"content": 0.466667, "visual": 0.0, "quality": 0.2, "engagement": 0.333333}
+        return {"content": 0.466667, "quality": 0.2, "engagement": 0.333333}
     return {key: round(value / total, 6) for key, value in defaults.items()}
 
 
@@ -3250,7 +2852,6 @@ def write_scores_report(scores: list[dict[str, Any]], output_dir: str | Path, cf
     product_scores: dict[str, list[float]] = {product: [] for product in products}
     dimension_scores: dict[str, list[float]] = {
         "content": [],
-        "visual": [],
         "quality": [],
         "engagement": [],
     }
@@ -3290,7 +2891,7 @@ def write_scores_report(scores: list[dict[str, Any]], output_dir: str | Path, cf
         lines.append(f"- {product}: {_format_average(values)} ({len(values)} clips)")
 
     lines.extend(["", "Average Score by Dimension"])
-    for dimension in ["content", "visual", "quality", "engagement"]:
+    for dimension in ["content", "quality", "engagement"]:
         values = dimension_scores[dimension]
         lines.append(f"- {dimension.title()}: {_format_average(values)}")
 
@@ -3325,13 +2926,17 @@ def write_scores_report(scores: list[dict[str, Any]], output_dir: str | Path, cf
     return report_path
 
 
-def _copy_scored_clips_by_tier(scores: list[dict[str, Any]], output_dir: Path, cfg) -> dict[str, Any]:
+def _move_scored_clips_by_tier(scores: list[dict[str, Any]], output_dir: Path, cfg) -> dict[str, Any]:
     enabled = bool(getattr(cfg, "SCORER_AUTO_SORT_ENABLED", False)) if cfg is not None else False
     stats = {
         "enabled": enabled,
+        "mode": "move",
         "export_ready": 0,
         "review_needed": 0,
         "rejected": 0,
+        "moved": 0,
+        "already_sorted": 0,
+        "moves": [],
         "errors": [],
     }
     if not enabled:
@@ -3343,16 +2948,44 @@ def _copy_scored_clips_by_tier(scores: list[dict[str, Any]], output_dir: Path, c
         if not isinstance(score, dict):
             continue
         source = Path(str(score.get("clip_path") or ""))
-        if not source.exists() or not source.is_file():
-            continue
         tier = _score_tier(score.get("total_score"), export_threshold, review_threshold)
         relative = _relative_clip_output_path(score, source, output_dir)
         destination = output_dir / tier / relative
+        relative_destination = _relative_to_root(destination, output_dir)
         try:
+            source_exists = source.exists() and source.is_file()
+            destination_exists = destination.exists() and destination.is_file()
+            if not source_exists and not destination_exists:
+                continue
             destination.parent.mkdir(parents=True, exist_ok=True)
-            if destination.resolve() != source.resolve():
-                shutil.copy2(source, destination)
+            same_file = False
+            if source_exists and destination_exists:
+                try:
+                    same_file = source.resolve() == destination.resolve()
+                except OSError:
+                    same_file = False
+            if not same_file and source_exists:
+                if destination_exists:
+                    destination.unlink()
+                shutil.move(str(source), str(destination))
+                stats["moved"] += 1
+            else:
+                stats["already_sorted"] += 1
+            _apply_tier_move_to_score(
+                score,
+                destination,
+                relative_destination,
+                output_dir,
+            )
             stats[tier] += 1
+            stats["moves"].append(
+                {
+                    "clip_id": score.get("clip_id"),
+                    "tier": tier,
+                    "clip_path": str(destination.resolve()),
+                    "output_file": relative_destination,
+                }
+            )
         except Exception as exc:
             stats["errors"].append(f"{source}: {exc}")
     return stats
@@ -3361,11 +2994,107 @@ def _copy_scored_clips_by_tier(scores: list[dict[str, Any]], output_dir: Path, c
 def _relative_clip_output_path(score: dict[str, Any], source: Path, output_dir: Path) -> Path:
     output_file = str(score.get("output_file") or "").replace("\\", "/").strip()
     if output_file:
-        return Path(output_file)
+        path = Path(output_file)
+        if path.is_absolute():
+            try:
+                path = path.resolve().relative_to(output_dir.resolve())
+            except ValueError:
+                path = Path(path.name)
+        return _strip_tier_prefix(path)
     try:
-        return source.resolve().relative_to(output_dir.resolve())
+        return _strip_tier_prefix(source.resolve().relative_to(output_dir.resolve()))
     except ValueError:
         return Path(source.name)
+
+
+def _strip_tier_prefix(path: Path) -> Path:
+    parts = list(path.parts)
+    while parts and parts[0].casefold() in SCORE_TIER_DIRS:
+        parts.pop(0)
+    return Path(*parts) if parts else Path(path.name)
+
+
+def _relative_to_root(path: Path, output_dir: Path) -> str:
+    try:
+        return path.resolve().relative_to(output_dir.resolve()).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _apply_tier_move_to_score(
+    score: dict[str, Any],
+    destination: Path,
+    relative_destination: str,
+    output_dir: Path,
+) -> None:
+    score["clip_path"] = str(destination.resolve())
+    score["output_file"] = relative_destination
+    score["output_dir"] = str(output_dir.resolve())
+
+
+def _apply_tier_moves_to_groups(
+    groups: list[dict[str, Any]],
+    tier_move: dict[str, Any],
+    output_dir: Path,
+) -> None:
+    moves = {
+        str(move.get("clip_id")): move
+        for move in tier_move.get("moves", [])
+        if isinstance(move, dict) and move.get("clip_id")
+    }
+    if not moves:
+        return
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        _apply_tier_move_to_group_record(group, moves, output_dir)
+
+
+def _apply_tier_move_to_group_record(
+    record: dict[str, Any],
+    moves: dict[str, dict[str, Any]],
+    output_dir: Path,
+) -> None:
+    clip_id = str(record.get("clip_id") or "")
+    move = moves.get(clip_id)
+    if move:
+        record["clip_path"] = move.get("clip_path")
+        record["output_file"] = move.get("output_file")
+        record["output_dir"] = str(output_dir.resolve())
+
+    representative_id = str(record.get("representative_clip_id") or "")
+    representative_move = moves.get(representative_id)
+    if representative_move:
+        record["clip_path"] = representative_move.get("clip_path")
+        record["output_file"] = representative_move.get("output_file")
+        record["representative_clip_path"] = representative_move.get("clip_path")
+        record["representative_output_file"] = representative_move.get("output_file")
+        record["output_dir"] = str(output_dir.resolve())
+
+    variants = record.get("variants")
+    if isinstance(variants, list):
+        for variant in variants:
+            if isinstance(variant, dict):
+                _apply_tier_move_to_group_record(variant, moves, output_dir)
+
+
+def _apply_tier_move_stats_to_manifest(
+    manifest: list[dict[str, Any]],
+    tier_move: dict[str, Any],
+) -> None:
+    moves = {
+        str(move.get("clip_id")): move
+        for move in tier_move.get("moves", [])
+        if isinstance(move, dict) and move.get("clip_id")
+    }
+    if not moves:
+        return
+    for row in manifest:
+        if not isinstance(row, dict):
+            continue
+        move = moves.get(str(row.get("clip_id") or ""))
+        if move and move.get("output_file"):
+            row["output_file"] = move["output_file"]
 
 
 def _score_tier(value: Any, export_threshold: float, review_threshold: float) -> str:
