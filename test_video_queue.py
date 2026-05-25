@@ -3,17 +3,23 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import queue_control
 from video_queue import (
     EDIT_STAGE,
     PRE_EDIT_STAGES,
     STAGES,
     StageJob,
     VideoQueueRunner,
+    _build_versioned_stem,
     _reuse_base_transcript_for_tagged_run,
 )
 
 
 class VideoQueueSchedulingTests(unittest.TestCase):
+    def test_leading_separator_tag_builds_operator_run_folder_name(self):
+        self.assertEqual(_build_versioned_stem("video", "_run_001"), "video_run_001")
+        self.assertEqual(_build_versioned_stem("video", "run_001"), "video__run_001")
+
     def test_tagged_redo_reuses_previous_tagged_transcript(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -74,6 +80,7 @@ class VideoQueueSchedulingTests(unittest.TestCase):
                 max_retries=0,
                 max_inflight_videos=1,
                 poll_interval=0.5,
+                control_path=str(temp_path / "control.json"),
             )
             runner._sync_videos([first_video, second_video])
 
@@ -115,6 +122,7 @@ class VideoQueueSchedulingTests(unittest.TestCase):
                 max_retries=0,
                 max_inflight_videos=1,
                 poll_interval=0.5,
+                control_path=str(temp_path / "control.json"),
             )
             runner._sync_videos([first_video, second_video])
 
@@ -164,6 +172,7 @@ class VideoQueueSchedulingTests(unittest.TestCase):
                 max_retries=0,
                 max_inflight_videos=1,
                 poll_interval=0.5,
+                control_path=str(temp_path / "control.json"),
             )
             runner._sync_videos([first_video, second_video])
 
@@ -245,6 +254,146 @@ class VideoQueueSchedulingTests(unittest.TestCase):
             self.assertEqual(stage_state["last_clip_id"], "clip_002")
             self.assertEqual(stage_state["last_clip_status"], "ok")
             self.assertEqual(persisted["videos"][video_key]["current_stage"], EDIT_STAGE)
+
+    def test_retry_failed_resets_failed_stage_and_downstream_only(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            input_dir = temp_path / "input"
+            input_dir.mkdir()
+            video = input_dir / "a.mp4"
+            video.write_bytes(b"")
+
+            runner = VideoQueueRunner(
+                input_dir=str(input_dir),
+                state_path=str(temp_path / "state.json"),
+                max_retries=0,
+                max_inflight_videos=1,
+                poll_interval=0.5,
+            )
+            runner._sync_videos([video])
+
+            video_key = str(video.resolve())
+            with runner.state_lock:
+                entry = runner.state["videos"][video_key]
+                entry["status"] = "failed"
+                entry["failed_at"] = "2026-05-15T17:10:21+07:00"
+                entry["stages"]["transcribe"]["status"] = "done"
+                entry["stages"]["llm"]["status"] = "done"
+                entry["stages"]["yolo"]["status"] = "failed"
+                entry["stages"]["yolo"]["attempts"] = 3
+                entry["stages"]["yolo"]["last_error"] = "AcceleratorError: CUDA error: unknown error"
+                entry["stages"][EDIT_STAGE]["status"] = "pending"
+
+                reset_count = runner._reset_failed_active_videos_locked()
+
+                self.assertEqual(reset_count, 1)
+                self.assertEqual(entry["status"], "queued")
+                self.assertIsNone(entry["failed_at"])
+                self.assertEqual(entry["stages"]["transcribe"]["status"], "done")
+                self.assertEqual(entry["stages"]["llm"]["status"], "done")
+                self.assertEqual(entry["stages"]["yolo"]["status"], "pending")
+                self.assertEqual(entry["stages"]["yolo"]["attempts"], 0)
+                self.assertIsNone(entry["stages"]["yolo"]["last_error"])
+                self.assertEqual(entry["stages"][EDIT_STAGE]["status"], "pending")
+
+    def test_rescan_adds_new_stable_video_to_current_run_tag(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            input_dir = temp_path / "input"
+            input_dir.mkdir()
+            first_video = input_dir / "a.mp4"
+            second_video = input_dir / "b.mp4"
+            first_video.write_bytes(b"")
+
+            runner = VideoQueueRunner(
+                input_dir=str(input_dir),
+                state_path=str(temp_path / "state.json"),
+                max_retries=0,
+                max_inflight_videos=1,
+                poll_interval=0.5,
+                scan_interval=0.5,
+                stable_seconds=0,
+                output_tag="_run_012",
+                working_tag="_run_012",
+            )
+            runner._sync_videos(runner._discover_videos())
+            second_video.write_bytes(b"")
+            runner._sync_videos(runner._discover_videos())
+
+            second_key = str(second_video.resolve())
+            self.assertIn(second_key, runner.state["videos"])
+            self.assertEqual(runner.state["videos"][second_key]["output_tag"], "_run_012")
+            self.assertEqual(runner.state["videos"][second_key]["working_tag"], "_run_012")
+
+    def test_rescan_does_not_duplicate_queued_ffmpeg_job(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            input_dir = temp_path / "input"
+            input_dir.mkdir()
+            video = input_dir / "a.mp4"
+            video.write_bytes(b"")
+
+            runner = VideoQueueRunner(
+                input_dir=str(input_dir),
+                state_path=str(temp_path / "state.json"),
+                max_retries=0,
+                max_inflight_videos=1,
+                poll_interval=0.5,
+                stable_seconds=0,
+                output_tag="_run_012",
+                working_tag="_run_012",
+                control_path=str(temp_path / "control.json"),
+            )
+            runner._sync_videos(runner._discover_videos())
+            video_key = str(video.resolve())
+
+            with runner.state_lock:
+                entry = runner.state["videos"][video_key]
+                entry["status"] = "queued"
+                for stage in PRE_EDIT_STAGES:
+                    entry["stages"][stage]["status"] = "done"
+                entry["stages"][EDIT_STAGE]["status"] = "pending"
+                runner._schedule_locked("bootstrap")
+                self.assertEqual(runner.queues["ffmpeg"].qsize(), 1)
+                self.assertEqual(entry["stages"][EDIT_STAGE]["status"], "queued")
+
+            runner._sync_videos(
+                runner._discover_videos(),
+                refresh_existing_from_disk=False,
+            )
+            with runner.state_lock:
+                runner._schedule_locked("rescan")
+                entry = runner.state["videos"][video_key]
+                self.assertEqual(runner.queues["ffmpeg"].qsize(), 1)
+                self.assertEqual(entry["stages"][EDIT_STAGE]["status"], "queued")
+                self.assertTrue(entry["stages"][EDIT_STAGE]["queued"])
+
+    def test_pause_request_prevents_new_stage_enqueue(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            input_dir = temp_path / "input"
+            input_dir.mkdir()
+            control_path = temp_path / "control.json"
+            video = input_dir / "a.mp4"
+            video.write_bytes(b"")
+
+            runner = VideoQueueRunner(
+                input_dir=str(input_dir),
+                state_path=str(temp_path / "state.json"),
+                max_retries=0,
+                max_inflight_videos=1,
+                poll_interval=0.5,
+                stable_seconds=0,
+                control_path=str(control_path),
+            )
+            runner._sync_videos([video])
+            queue_control.request_stop(control_path)
+
+            with runner.state_lock:
+                runner._schedule_locked("unit-test")
+                entry = runner.state["videos"][str(video.resolve())]
+                self.assertEqual(entry["stages"]["transcribe"]["status"], "pending")
+                self.assertFalse(entry["stages"]["transcribe"]["queued"])
 
 
 if __name__ == "__main__":

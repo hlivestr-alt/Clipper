@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+from utils import lm_studio_chat_request_options
 
 log = logging.getLogger("proya.model_manager")
 
@@ -76,16 +79,17 @@ def wait_until_ready(model_id: str, timeout: float = 120.0, cfg=None) -> bool:
             time.sleep(2.0)
             continue
         try:
+            payload = {
+                "model": model_id,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1,
+            }
+            payload.update(lm_studio_chat_request_options(cfg, model_id=model_id))
             _request_json(
                 "POST",
                 f"{_openai_base_url_for_model(model_id, cfg).rstrip('/')}/chat/completions",
                 cfg=cfg,
-                payload={
-                    "model": model_id,
-                    "messages": [{"role": "user", "content": "ping"}],
-                    "temperature": 0,
-                    "max_tokens": 1,
-                },
+                payload=payload,
                 timeout=15.0,
             )
             log.info("LM Studio model ready: %s", model_id)
@@ -120,14 +124,16 @@ def _post_model_action(action: str, model_id: str, cfg, timeout: float) -> bool:
         ]
     else:
         requests = [
+            (f"{root}/api/v1/models/{action}", {"model": model_id, "echo_load_config": True}),
             (f"{root}/api/v0/models/{action}", {"model": model_id}),
-            (f"{root}/api/v1/models/{action}", {"model": model_id}),
         ]
     last_error = ""
     success = False
     for index, (url, payload) in enumerate(requests):
         try:
             _request_json("POST", url, cfg=cfg, payload=payload, timeout=timeout)
+            if action == "load":
+                return True
             success = True
         except HTTPError as exc:
             body = _read_http_error(exc)
@@ -216,11 +222,16 @@ def _model_id_matches(target: str, model: dict[str, Any]) -> bool:
 
 
 def _text_id_matches(target: str, candidate: str) -> bool:
-    left = str(target or "").strip().casefold()
-    right = str(candidate or "").strip().casefold()
+    left = _normalize_model_id(target)
+    right = _normalize_model_id(candidate)
     if not left or not right:
         return False
     return left == right or left.split("/")[-1] == right.split("/")[-1]
+
+
+def _normalize_model_id(value: str) -> str:
+    text = str(value or "").strip().casefold()
+    return re.sub(r":\d+$", "", text)
 
 
 def _read_http_error(exc: HTTPError) -> str:

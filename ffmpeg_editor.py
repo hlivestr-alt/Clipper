@@ -43,16 +43,19 @@ import os
 import random
 import re
 import subprocess
+import tempfile
 import threading
+import time
 import atexit
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from hook_text import ensure_hook_payload
 from utils import _format_rupiah_compact
 
 log = logging.getLogger("proya.ffmpeg_editor")
 
+_PROJECT_ROOT = Path(__file__).resolve().parent
 _AUDIO_EXTS = {".wav", ".mp3", ".ogg", ".aac", ".flac", ".m4a"}
 _VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi"}
 
@@ -80,6 +83,41 @@ _HIGHLIGHT_CATEGORY_ALIASES = {
     "pain": "pain",
     "red": "pain",
 }
+
+
+def _project_path(path_value: str | Path | None) -> Optional[Path]:
+    if path_value is None:
+        return None
+    raw = str(path_value).strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    repo_path = _PROJECT_ROOT / path
+    if repo_path.exists():
+        return repo_path
+    if path.exists():
+        return path.resolve()
+    return repo_path
+
+
+def _existing_file(path_value: str | Path | None) -> Optional[Path]:
+    path = _project_path(path_value)
+    return path if path and path.is_file() else None
+
+
+def _existing_dir(path_value: str | Path | None) -> Optional[Path]:
+    path = _project_path(path_value)
+    return path if path and path.is_dir() else None
+
+
+def _font_file_with_fallback(primary: str | Path | None, fallbacks: list | tuple | None = None) -> Optional[Path]:
+    for candidate in [primary, *(fallbacks or [])]:
+        path = _existing_file(candidate)
+        if path and path.suffix.lower() in (".ttf", ".otf", ".ttc"):
+            return path
+    return None
 _HIGHLIGHT_CONFIG_CACHE = {
     "path": None,
     "stamp": None,
@@ -294,9 +332,9 @@ def edit_clip(
             "overlay": emoji_overlay,
         })
 
-    logo_path = getattr(cfg, "LOGO_PATH", None)
-    if logo_path and Path(logo_path).exists():
-        extra_inputs.append({"path": logo_path, "type": "logo"})
+    logo_path = _existing_file(getattr(cfg, "LOGO_PATH", None))
+    if logo_path:
+        extra_inputs.append({"path": str(logo_path), "type": "logo"})
 
     # ── SFX events ────────────────────────────────────────────────────────────
     sfx_events = []
@@ -565,6 +603,74 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return str(ass_path), subtitle_fonts_dir
 
 
+def _hook_layout_settings(cfg, W: int, H: int) -> dict[str, Any]:
+    mode = str(getattr(cfg, "_hook_layout_mode", "standard") or "standard")
+    settings = {
+        "top_y": int(H * float(getattr(cfg, "HOOK_TOP_Y_POS", 0.20))),
+        "mid_y": int(H * float(getattr(cfg, "HOOK_MID_Y_POS", 0.60))),
+        "bottom_y": int(H * float(getattr(cfg, "HOOK_BOTTOM_Y_POS", 0.65))),
+        "top_width": 0.92,
+        "mid_width": 0.60,
+        "bottom_width": 0.92,
+        "top_x": "(w-text_w)/2",
+        "mid_x": "w-text_w-w*0.07",
+        "bottom_x": "(w-text_w)/2",
+    }
+
+    if mode == "center_stack":
+        settings.update({
+            "top_y": int(H * 0.24),
+            "mid_y": int(H * 0.50),
+            "bottom_y": int(H * 0.66),
+            "mid_x": "(w-text_w)/2",
+            "mid_width": 0.78,
+        })
+    elif mode == "top_heavy":
+        settings.update({
+            "top_y": int(H * 0.16),
+            "mid_y": int(H * 0.42),
+            "bottom_y": int(H * 0.58),
+            "top_width": 0.86,
+            "mid_width": 0.68,
+        })
+    elif mode == "left_punch":
+        settings.update({
+            "top_y": int(H * 0.22),
+            "mid_y": int(H * 0.54),
+            "bottom_y": int(H * 0.68),
+            "top_x": "w*0.06",
+            "mid_x": "w*0.06",
+            "bottom_x": "w*0.06",
+            "top_width": 0.74,
+            "mid_width": 0.58,
+            "bottom_width": 0.68,
+        })
+    elif mode == "right_label":
+        settings.update({
+            "top_y": int(H * 0.18),
+            "mid_y": int(H * 0.50),
+            "bottom_y": int(H * 0.62),
+            "top_x": "w-text_w-w*0.06",
+            "mid_x": "w-text_w-w*0.06",
+            "bottom_x": "w-text_w-w*0.06",
+            "top_width": 0.74,
+            "mid_width": 0.58,
+            "bottom_width": 0.68,
+        })
+    elif mode == "clean_banner":
+        settings.update({
+            "top_y": int(H * 0.18),
+            "mid_y": int(H * 0.56),
+            "bottom_y": int(H * 0.70),
+            "top_width": 0.82,
+            "mid_width": 0.66,
+            "bottom_width": 0.82,
+            "mid_x": "(w-text_w)/2",
+        })
+
+    return settings
+
+
 # =============================================================================
 #  FILTER_COMPLEX BUILDER + FFMPEG RUNNER
 # =============================================================================
@@ -606,9 +712,9 @@ def _build_and_run(
         if ei["type"] in {"ba", "emoji"}:
             # Still images need to be looped to create a real video timeline
             # so time-based fades/overlays render visibly.
-            cmd += ["-loop", "1", "-t", f"{clip_duration:.3f}", "-i", ei["path"]]
+            cmd += ["-loop", "1", "-t", f"{clip_duration:.3f}", "-i", str(ei["path"])]
         else:
-            cmd += ["-i", ei["path"]]
+            cmd += ["-i", str(ei["path"])]
     for sfx in sfx_events:
         cmd += ["-i", str(sfx["sfx_path"])]
     bgm_input_idx = None
@@ -699,12 +805,16 @@ def _build_and_run(
 
     hook_dur_cfg = getattr(cfg, "HOOK_DURATION", 0.0)
     if hook_dur_cfg > 0:
+        hook_layout = _hook_layout_settings(cfg, W, H)
         hook_overlay = ensure_hook_payload(moment)
         hook_headline = hook_overlay.get("headline", "")
         hook_subtext = hook_overlay.get("subtext", "")
         hook_cta = hook_overlay.get("cta", "")
         hook_end_t = min(hook_dur_cfg, clip_duration * 0.4)
-        hook_font  = getattr(cfg, "FONT_HOOK", "")
+        hook_font  = _font_file_with_fallback(
+            getattr(cfg, "FONT_HOOK", ""),
+            getattr(cfg, "FONT_HOOK_FALLBACKS", []),
+        )
         hook_fs    = getattr(cfg, "HOOK_FONTSIZE", 130)
         hook_sw    = getattr(cfg, "HOOK_STROKE_W", 5)
         hook_sc    = _css_to_ffmpeg_color(getattr(cfg, "HOOK_STROKE_COLOR", "black"))
@@ -723,11 +833,12 @@ def _build_and_run(
                 stroke_width=hook_sw,
                 stroke_color=hook_sc,
                 shadow_color=hook_shadow,
-                center_y=int(H * float(getattr(cfg, "HOOK_TOP_Y_POS", 0.20))),
+                center_y=hook_layout["top_y"],
                 start_t=0.0,
                 end_t=hook_end_t,
                 block_tag="vhooktop",
-                width_ratio=0.92,
+                width_ratio=hook_layout["top_width"],
+                x_expr=hook_layout["top_x"],
             )
 
         if hook_subtext:
@@ -742,12 +853,12 @@ def _build_and_run(
                 stroke_width=max(2, int(hook_sw * 0.75)),
                 stroke_color=hook_sc,
                 shadow_color=hook_shadow,
-                center_y=int(H * float(getattr(cfg, "HOOK_MID_Y_POS", 0.60))),
+                center_y=hook_layout["mid_y"],
                 start_t=0.0,
                 end_t=hook_end_t,
                 block_tag="vhookmid",
-                width_ratio=0.60,
-                x_expr="w-text_w-w*0.07",
+                width_ratio=hook_layout["mid_width"],
+                x_expr=hook_layout["mid_x"],
             )
 
         if hook_cta:
@@ -762,11 +873,12 @@ def _build_and_run(
                 stroke_width=hook_sw,
                 stroke_color=hook_sc,
                 shadow_color=hook_shadow,
-                center_y=int(H * float(getattr(cfg, "HOOK_BOTTOM_Y_POS", 0.65))),
+                center_y=hook_layout["bottom_y"],
                 start_t=0.0,
                 end_t=hook_end_t,
                 block_tag="vhookbtm",
-                width_ratio=0.92,
+                width_ratio=hook_layout["bottom_width"],
+                x_expr=hook_layout["bottom_x"],
             )
 
     # ── 5. Product caption (drawtext above product bbox) ─────────────────────
@@ -1106,18 +1218,50 @@ def _add_before_after_overlay_filters(fc, vid, extra_inputs, clip_duration, W, H
     if ba_input_idx is None:
         return vid
 
+    mode = str(getattr(cfg, "_before_after_variant_mode", "standard") or "standard")
     ba_s = max(0.0, float(getattr(cfg, "BEFORE_AFTER_START_T", 0.0)))
     ba_dur = max(0.0, float(getattr(cfg, "BEFORE_AFTER_DURATION", 2.5)))
+    scale_ratio = 1.0
+    overlay_x = "(W-overlay_w)/2"
+    overlay_y = "(H-overlay_h)/2"
+
+    if mode == "hero":
+        ba_s = 0.15
+        ba_dur = max(ba_dur, 3.4)
+        scale_ratio = 1.0
+    elif mode == "compact":
+        ba_s = max(0.25, ba_s)
+        ba_dur = min(max(ba_dur, 1.8), 2.2)
+        scale_ratio = 0.76
+        overlay_x = "W-overlay_w-W*0.06"
+        overlay_y = "H*0.12"
+    elif mode == "clean":
+        ba_s = max(0.5, ba_s)
+        ba_dur = min(max(ba_dur, 2.0), 2.6)
+        scale_ratio = 0.86
+        overlay_x = "(W-overlay_w)/2"
+        overlay_y = "H*0.16"
+    elif mode == "minimal":
+        ba_dur = min(ba_dur, 1.4)
+        scale_ratio = 0.72
+        overlay_x = "W*0.06"
+        overlay_y = "H*0.14"
+
     ba_e = min(ba_s + ba_dur, clip_duration)
     if ba_e <= ba_s + 0.01:
         return vid
 
     ba_op = max(0.0, min(1.0, float(getattr(cfg, "BEFORE_AFTER_OPACITY", 0.96))))
+    if mode in {"compact", "clean", "minimal"}:
+        ba_op = min(ba_op, 0.92)
     ba_fi = max(0.0, min(float(getattr(cfg, "BEFORE_AFTER_FADE_IN", 0.25)), ba_e - ba_s))
     ba_fo = max(0.0, min(float(getattr(cfg, "BEFORE_AFTER_FADE_OUT", 0.25)), ba_e - ba_s))
 
+    scale_w = max(1, int(W * scale_ratio))
+    scale_h = max(1, int(H * scale_ratio))
+
     fc.append(
-        f"[{ba_input_idx}:v]scale={W}:{H}:force_original_aspect_ratio=decrease,format=rgba,"
+        f"[{ba_input_idx}:v]scale={scale_w}:{scale_h}:force_original_aspect_ratio=decrease,format=rgba,"
         f"colorchannelmixer=aa={ba_op:.3f}[bascaled]"
     )
 
@@ -1131,7 +1275,7 @@ def _add_before_after_overlay_filters(fc, vid, extra_inputs, clip_duration, W, H
         ba_chain = "[bafaded]"
 
     fc.append(
-        f"{vid}{ba_chain}overlay=x='(W-overlay_w)/2':y='(H-overlay_h)/2'"
+        f"{vid}{ba_chain}overlay=x='{overlay_x}':y='{overlay_y}'"
         f":enable='between(t,{ba_s:.2f},{ba_e:.2f})'[vba]"
     )
     return "[vba]"
@@ -1150,7 +1294,7 @@ def _add_product_caption_filters(fc, vid, prod_trigger, zoom_dur, W, H, cfg) -> 
     t_start = prod_trigger["trigger_t"]
     t_end   = t_start + zoom_dur
 
-    font_path  = getattr(cfg, "FONT_PRODUCT", "")
+    font_path  = _font_file_with_fallback(getattr(cfg, "FONT_PRODUCT", ""))
     product_fs = getattr(cfg, "ZOOM_CAPTION_FONTSIZE", 80)
     brand_fs   = getattr(cfg, "ZOOM_CAPTION_BRAND_FONTSIZE", 0)
     txt_color  = _css_to_ffmpeg_color(getattr(cfg, "ZOOM_CAPTION_TEXT_COLOR",  "white"))
@@ -1161,7 +1305,7 @@ def _add_product_caption_filters(fc, vid, prod_trigger, zoom_dur, W, H, cfg) -> 
     text_x_expr = "(w-text_w)/2"
     text_y = max(40, int(H * caption_y_frac))
 
-    font_arg = f":fontfile='{font_path.replace(chr(92), '/')}'" if font_path and Path(font_path).exists() else ""
+    font_arg = f":fontfile='{_escape_drawtext_path(font_path)}'" if font_path else ""
     safe_name = _escape_drawtext(product_name.upper())
 
     enable = f"between(t,{t_start:.2f},{t_end:.2f})"
@@ -2016,17 +2160,21 @@ def _plan_emoji_overlays(clip_words: list, clip_duration: float, W: int, H: int,
 
 
 def _pick_before_after(cfg) -> Optional[str]:
-    ba_dir = Path(getattr(cfg, "BEFORE_AFTER_DIR", "assets/before_after"))
-    if not ba_dir.exists():
+    ba_dir = _existing_dir(getattr(cfg, "BEFORE_AFTER_DIR", "assets/before_after"))
+    if not ba_dir:
+        log.warning("Before/after folder not found: %s", getattr(cfg, "BEFORE_AFTER_DIR", "assets/before_after"))
         return None
     exts = {".jpg", ".jpeg", ".png", ".webp"}
-    imgs = [p for p in ba_dir.iterdir() if p.suffix.lower() in exts]
-    return str(random.choice(imgs)) if imgs else None
+    imgs = sorted(p for p in ba_dir.iterdir() if p.is_file() and p.suffix.lower() in exts)
+    if not imgs:
+        log.warning("Before/after folder has no supported images: %s", ba_dir)
+        return None
+    return str(random.choice(imgs))
 
 
 def _pick_bgm(cfg) -> Optional[str]:
-    bgm_dir = Path(getattr(cfg, "BGM_DIR", "assets/bgm"))
-    if not bgm_dir.exists():
+    bgm_dir = _existing_dir(getattr(cfg, "BGM_DIR", "assets/bgm"))
+    if not bgm_dir:
         return None
     tracks = [p for p in bgm_dir.iterdir() if p.is_file() and p.suffix.lower() in _AUDIO_EXTS]
     if not tracks:
@@ -2045,8 +2193,8 @@ def _prepare_broll_intro(cfg, clip_duration: Optional[float] = None, hook_end: O
     if not intro_path:
         return None
 
-    path = Path(intro_path)
-    if not path.exists() or not path.is_file():
+    path = _existing_file(intro_path)
+    if not path:
         log.warning(f"B-roll intro file missing: {intro_path}")
         return None
     if path.suffix.lower() not in _VIDEO_EXTS:
@@ -2185,7 +2333,7 @@ def _add_hook_text_block(
     vid: str,
     text: str,
     frame_width: int,
-    font_path: str,
+    font_path: str | Path | None,
     font_size: int,
     font_color: str,
     stroke_width: int,
@@ -2202,9 +2350,10 @@ def _add_hook_text_block(
     if not clean_text:
         return vid
 
-    font_arg = f":fontfile='{font_path}'" if font_path and Path(font_path).exists() else ""
+    font_file = _existing_file(font_path)
+    font_arg = f":fontfile='{_escape_drawtext_path(font_file)}'" if font_file else ""
     draw_fs = max(28, int(font_size * 0.7))
-    approx_max_chars = max(10, int((frame_width * width_ratio) / max(draw_fs * 0.38, 1.0)))
+    approx_max_chars = max(8, int((frame_width * width_ratio) / max(draw_fs * 0.56, 1.0)))
     hook_lines = _split_hook_text_lines(clean_text, max_chars_per_line=approx_max_chars)
     line_gap_px = max(8, int(draw_fs * 0.9))
     first_line_y = center_y - int(((len(hook_lines) - 1) * line_gap_px) / 2)
@@ -2239,11 +2388,14 @@ def _resolve_emoji_asset_path(path_str: str) -> Optional[str]:
     if not path_str:
         return None
 
-    candidate = Path(path_str)
-    if candidate.exists():
-        return str(candidate)
+    resolved = _existing_file(path_str)
+    if resolved:
+        return str(resolved)
 
+    candidate = _project_path(path_str) or Path(path_str)
     candidate_dir = candidate.parent if str(candidate.parent) not in {"", "."} else Path("assets/emojis")
+    if not candidate_dir.is_absolute():
+        candidate_dir = _PROJECT_ROOT / candidate_dir
     if not candidate_dir.exists():
         return None
 
@@ -2266,33 +2418,98 @@ def _resolve_emoji_asset_path(path_str: str) -> Optional[str]:
     return None
 
 
+def _tail_temp_file(path: str | None, limit: int = 500) -> str:
+    if not path:
+        return ""
+    try:
+        p = Path(path)
+        if not p.exists():
+            return ""
+        with open(p, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - limit), os.SEEK_SET)
+            return f.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
 def _run_ffmpeg(cmd: list, output_path: str, timeout: int = 600) -> bool:
     """Run an FFmpeg command and check output."""
+    stdout_path = None
+    stderr_path = None
     try:
         creationflags = 0
         if os.environ.get("PROYA_QUEUE_FFMPEG_BELOW_NORMAL") == "1":
             creationflags = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
-        r = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            creationflags=creationflags,
-        )
-        if r.returncode != 0:
-            log.error(f"FFmpeg error:\n{r.stderr[-500:]}")
-            return False
+
+        poll_interval = max(1.0, float(os.environ.get("PROYA_FFMPEG_POLL_INTERVAL", "5")))
+        idle_timeout = max(0.0, float(os.environ.get("PROYA_FFMPEG_IDLE_TIMEOUT", "120")))
         p = Path(output_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+
+        with tempfile.NamedTemporaryFile(prefix="proya_ffmpeg_stdout_", suffix=".log", delete=False) as stdout_f, \
+                tempfile.NamedTemporaryFile(prefix="proya_ffmpeg_stderr_", suffix=".log", delete=False) as stderr_f:
+            stdout_path = stdout_f.name
+            stderr_path = stderr_f.name
+            proc = subprocess.Popen(
+                cmd,
+                stdout=stdout_f,
+                stderr=stderr_f,
+                creationflags=creationflags,
+            )
+
+            start_t = time.monotonic()
+            last_progress_t = start_t
+            last_size = p.stat().st_size if p.exists() else -1
+
+            while True:
+                return_code = proc.poll()
+                if return_code is not None:
+                    break
+
+                now = time.monotonic()
+                current_size = p.stat().st_size if p.exists() else -1
+                if current_size != last_size:
+                    last_size = current_size
+                    last_progress_t = now
+
+                if timeout > 0 and now - start_t > timeout:
+                    proc.kill()
+                    proc.wait(timeout=10)
+                    log.error(f"FFmpeg timed out after {timeout}s: {output_path}")
+                    return False
+
+                if idle_timeout > 0 and now - last_progress_t > idle_timeout:
+                    proc.kill()
+                    proc.wait(timeout=10)
+                    log.error(
+                        "FFmpeg idle timed out after %.0fs without output growth: %s\n%s",
+                        idle_timeout,
+                        output_path,
+                        _tail_temp_file(stderr_path)[-500:],
+                    )
+                    return False
+
+                time.sleep(poll_interval)
+
+        if return_code != 0:
+            log.error(f"FFmpeg error:\n{_tail_temp_file(stderr_path)[-500:]}")
+            return False
         if not p.exists() or p.stat().st_size < 1024:
             log.error(f"FFmpeg produced empty output: {output_path}")
             p.unlink(missing_ok=True)
             return False
         return True
-    except subprocess.TimeoutExpired:
-        log.error(f"FFmpeg timed out: {output_path}")
-        return False
     except FileNotFoundError:
         raise RuntimeError("ffmpeg not found — install from https://ffmpeg.org")
+    finally:
+        for temp_path in (stdout_path, stderr_path):
+            if temp_path:
+                try:
+                    Path(temp_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
 
 
 def _font_name_from_path(font_str: str) -> str:
@@ -2322,7 +2539,9 @@ def _resolve_subtitle_font(cfg) -> tuple[str, Optional[str]]:
         return default_name, None
 
     try:
-        font_dir = Path(font_dir_raw)
+        font_dir = _existing_dir(font_dir_raw)
+        if not font_dir:
+            return default_name, None
         candidates = [
             p for p in font_dir.iterdir()
             if p.is_file() and p.suffix.lower() in (".ttf", ".otf")
@@ -2362,7 +2581,27 @@ def _font_name_from_font_file(font_path: Path) -> Optional[str]:
 
 
 def _escape_ass_filter_path(path_value: str) -> str:
-    safe = Path(path_value).as_posix()
+    path = Path(path_value)
+    try:
+        safe = path.resolve().relative_to(_PROJECT_ROOT).as_posix()
+    except ValueError:
+        safe = path.as_posix()
+    return (
+        safe.replace("\\", "/")
+        .replace(":", r"\:")
+        .replace(",", r"\,")
+        .replace("[", r"\[")
+        .replace("]", r"\]")
+        .replace("'", r"\'")
+    )
+
+
+def _escape_drawtext_path(path_value: str | Path) -> str:
+    path = Path(path_value)
+    try:
+        safe = path.resolve().relative_to(_PROJECT_ROOT).as_posix()
+    except ValueError:
+        safe = path.as_posix()
     return (
         safe.replace("\\", "/")
         .replace(":", r"\:")

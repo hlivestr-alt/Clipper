@@ -28,44 +28,81 @@ BENEFIT_PATTERNS: list[tuple[str, str]] = [
     (r"\bbersih(?:kan)?\b|\bclean\b", "BERSIH"),
     (r"\bkalem\b|\btenang\b|\breda\b", "KALEM"),
     (r"\bsegar\b|\bfresh\b", "FRESH"),
-    (r"\bpudar\b|\bmemudar(?:kan)?\b", "LEBIH PUDAR"),
+    (r"\bpudar\b|\bmemudar(?:kan)?\b|\bsamar\b|\bmenyamar(?:kan)?\b", "LEBIH PUDAR"),
 ]
 
 PROOF_PATTERNS: list[tuple[str, str]] = [
-    (r"\b1x sehari\b", "Dipakai cuma 1x sehari"),
-    (r"\b3 hari\b", "Hasil keliatan 3 hari"),
-    (r"\b7 hari\b", "Hasil keliatan 7 hari"),
-    (r"\b10 hari\b", "Hasil keliatan 10 hari"),
-    (r"\blangsung\b|\binstan\b", "Sekali pakai langsung keliatan"),
-    (r"\btanpa klinik\b|\btanpa treatment\b", "Tanpa klinik, tanpa treatment mahal"),
+    (r"\b1x sehari\b", "Dipakai 1x sehari"),
+    (r"\b3 hari\b|\b7 hari\b|\b10 hari\b", "Pengalaman pakai beberapa hari"),
+    (r"\blangsung\b|\binstan\b", "Teksturnya nyaman dipakai"),
+    (r"\btanpa klinik\b|\btanpa treatment\b", "Rutinitas skincare di rumah"),
     (r"\blow budget\b|\bmurah\b|\bhemat\b", "Low budget"),
 ]
 
 DEFAULT_SUBTEXTS = [
-    "Pakai ini doang",
-    "Tanpa treatment mahal",
+    "Dipakai rutin di rumah",
+    "Cocok buat rutinitas harian",
     "Dipakai rutin tiap hari",
-    "Cuma 1 produk ini",
+    "Bisa masuk step harian",
 ]
 
 DEFAULT_CTAS = [
-    "Gimana caranya??",
-    "Aku pakai apa??",
-    "Serius cuma ini??",
-    "Rahasianya di sini??",
+    "Cek cara pakainya",
+    "Lihat step-nya",
+    "Mau lihat produknya?",
+    "Cek produknya di sini",
 ]
 
 TIPS_CTAS = [
-    "Pakenya gimana??",
-    "Step-nya gimana??",
-    "Gimana caranya??",
+    "Pakenya gimana?",
+    "Step-nya gimana?",
+    "Cek cara pakainya",
 ]
 
 PRODUCT_CTAS = [
-    "Produknya apa??",
-    "Aku pakai apa??",
-    "Serius cuma ini??",
+    "Produknya apa?",
+    "Cek produknya",
+    "Lihat detailnya",
 ]
+
+RISKY_HOOK_PATTERNS: list[str] = [
+    r"\b100\s*%",
+    r"\bampuh\b",
+    r"\bauto\b",
+    r"\bberubah\s+total\b",
+    r"\bbersih\s+sempurna\b",
+    r"\bcerah\s+dalam\s+\d+\s+(?:jam|hari|minggu)\b",
+    r"\bcuma\s+dalam\b",
+    r"\bdalam\s+\d+\s+(?:jam|hari|minggu)\b",
+    r"\bdijamin\b",
+    r"\bguaranteed\b",
+    r"\bgila\b",
+    r"\bhilang\b",
+    r"\bhilang\s+total\b",
+    r"\bini\s+bukan\s+filter\b",
+    r"\binstan\b",
+    r"\blangsung\b",
+    r"\bmenghilang\w*\b",
+    r"\bmengobati\b",
+    r"\bmenyembuh\w*\b",
+    r"\bnomor\s*1\b",
+    r"\bno\.?\s*1\b",
+    r"\bpaling\s+ampuh\b",
+    r"\bparah\b",
+    r"\bpasti\b",
+    r"\bputih\s+seketika\b",
+    r"\brevolusioner\b",
+    r"\bsecepat\b",
+    r"\bseketika\b",
+    r"\bstop\b",
+    r"\bterbaik\b",
+    r"\bterampuh\b",
+]
+
+_RISKY_HOOK_REGEX = re.compile(
+    "|".join(f"(?:{pattern})" for pattern in RISKY_HOOK_PATTERNS),
+    flags=re.IGNORECASE,
+)
 
 
 def _normalize(text: Any) -> str:
@@ -111,6 +148,13 @@ def _dedupe_keep_order(options: list[str]) -> list[str]:
         seen.add(key)
         ordered.append(clean)
     return ordered
+
+
+def _is_soft_claim_text(text: str) -> bool:
+    clean = _normalize(text)
+    if not clean:
+        return False
+    return _RISKY_HOOK_REGEX.search(clean) is None
 
 
 def _collect_context(moment: dict[str, Any]) -> str:
@@ -183,6 +227,38 @@ def _headline_benefit_word(benefit: str) -> str:
     return mapping.get(benefit, benefit)
 
 
+def _experience_benefit_phrase(benefit: str) -> str:
+    mapping = {
+        "GLOWING": "TAMPAK GLOWING",
+        "CERAH": "TAMPAK LEBIH CERAH",
+        "LEMBAP": "TERASA LEBIH LEMBAP",
+        "HALUS": "TERASA LEBIH HALUS",
+        "BERSIH": "TERASA LEBIH BERSIH",
+        "KALEM": "TAMPAK LEBIH TENANG",
+        "FRESH": "TERASA LEBIH SEGAR",
+        "LEBIH PUDAR": "TAMPAK LEBIH SAMAR",
+    }
+    return mapping.get(_normalize(benefit).upper(), "TAMPAK LEBIH TERAWAT")
+
+
+def _experience_problem_phrase(problem: str) -> str:
+    clean = _normalize(problem).upper()
+    mapping = {
+        "FLEK HITAM": "TAMPILAN FLEK",
+        "BEKAS JERAWAT": "TAMPILAN BEKAS JERAWAT",
+        "JERAWAT": "TAMPILAN JERAWAT",
+        "BERUNTUSAN": "TAMPILAN BERUNTUSAN",
+        "KEMERAHAN": "TAMPILAN KEMERAHAN",
+        "KULIT KERING": "KULIT TERASA KERING",
+        "KUSAM": "KULIT KUSAM",
+        "WAJAH GELAP": "WAJAH TAMPAK KUSAM",
+        "MINYAKAN": "KULIT TERASA BERMINYAK",
+        "PORI BESAR": "TAMPILAN PORI",
+        "GARIS HALUS": "TAMPILAN GARIS HALUS",
+    }
+    return mapping.get(clean, clean)
+
+
 def _infer_subtext(moment: dict[str, Any], context: str, seed: str) -> str:
     direct = _find_label(context, PROOF_PATTERNS)
     if direct:
@@ -193,11 +269,11 @@ def _infer_subtext(moment: dict[str, Any], context: str, seed: str) -> str:
 
     clip_type = _normalize(moment.get("clip_type")).lower()
     if clip_type == "demo":
-        return "Pakai ini doang"
+        return "Dipakai rutin di rumah"
     if clip_type in {"tips", "qna"}:
-        return "Tanpa treatment mahal"
+        return "Rutinitas skincare di rumah"
     if _normalize(moment.get("product")).lower() not in {"", "general"}:
-        return "Cuma 1 produk ini"
+        return "Cocok buat step harian"
     return _stable_pick(DEFAULT_SUBTEXTS, seed + "|sub")
 
 
@@ -226,65 +302,66 @@ def _build_headline(moment: dict[str, Any], problem: str, benefit: str, seed: st
     if not problem:
         problem = _fallback_problem(benefit)
 
+    problem_phrase = _experience_problem_phrase(problem)
+    benefit_phrase = _experience_benefit_phrase(benefit)
+
     headline_options = [
-        f"{problem} -> {benefit}",
-        f"DARI {problem} JADI {benefit}",
-        f"{problem} AUTO {benefit}",
-        f"{problem} PARAH JADI {benefit_word}",
-        f"AWALNYA {problem}, SEKARANG {benefit_word}",
-        f"SEBELUMNYA {problem}, SEKARANG {benefit_word}",
-        f"GILA SIH, {problem} JADI {benefit_word}",
-        f"KOK BISA {benefit_word} GINI?",
-        f"INI BUKAN FILTER, {benefit_word}",
+        f"{problem_phrase}? {benefit_phrase}",
+        f"KULIT {benefit_phrase}",
+        f"AWALNYA {problem_phrase}",
+        f"SEKARANG {benefit_phrase}",
+        f"SETELAH RUTIN, {benefit_phrase}",
+        f"PENGALAMAN KULIT {benefit_phrase}",
+        f"COBA STEP UNTUK {benefit_word}",
     ]
 
     if category == "result_proof":
         headline_options.extend([
-            f"HASILNYA JADI {benefit}",
-            f"KOK BISA SECEPAT INI?",
-            f"{benefit_word} CUMA DALAM {day_claim} HARI" if day_claim else "",
-            f"{day_claim} HARI BERUBAH TOTAL" if day_claim else "BERUBAH TOTAL",
+            f"HASIL PEMAKAIAN RUTIN",
+            f"KULIT TAMPAK LEBIH TERAWAT",
+            f"PENGALAMAN PAKAI {day_claim} HARI" if day_claim else "",
+            f"RUTIN PAKAI, {benefit_phrase}",
         ])
 
     if category == "pain_problem":
         headline_options.extend([
-            f"{problem} BISA JADI {benefit}?",
-            f"STOP {problem}, JADI {benefit_word}",
+            f"{problem_phrase}? COBA STEP INI",
+            f"BANTU RAWAT {problem_phrase}",
         ])
 
     if clip_type in {"demo", "testimoni"}:
         headline_options.extend([
-            f"CUMA PAKAI INI, JADI {benefit}",
-            f"AWALNYA GA PERCAYA, EH {benefit}",
+            f"TESTI PEMAKAIAN RUTIN",
+            f"RUTIN PAKAI, {benefit_phrase}",
         ])
 
     if clip_type in {"tips", "qna"}:
         headline_options.extend([
-            f"TERNYATA {problem} BISA {benefit}",
-            f"RAHASIA {benefit} TANPA RIBET",
+            f"STEP SKINCARE TANPA RIBET",
+            f"CARA PAKAI BIAR NYAMAN",
         ])
 
     if product and product.lower() not in {"general", ""}:
         headline_options.extend([
-            "CUMA 1 PRODUK INI...",
-            f"PAKAI {product}, JADI {benefit}",
+            "CEK PRODUK DI LIVE INI",
+            f"PAKAI {product}, KULIT TERAWAT",
         ])
 
     if benefit in {"CERAH", "GLOWING"}:
         headline_options.extend([
-            f"{problem} HILANG, {benefit_word} DATANG",
-            "MALU KARENA KUSAM? CEK INI",
+            f"{problem_phrase}? CEK STEP INI",
+            "BIAR KULIT TAMPAK FRESH",
         ])
 
     if benefit in {"LEMBAP", "HALUS", "KALEM", "FRESH"}:
         headline_options.extend([
-            f"{problem} HILANG, KULIT JADI {benefit}",
-            f"BARU PAHAM KENAPA BISA {benefit}",
+            f"KULIT {benefit_phrase}",
+            f"RUTIN PAKAI BIAR {benefit_phrase}",
         ])
 
     if benefit == "LEBIH PUDAR":
         headline_options.extend([
-            f"{problem} MULAI MEMUDAR",
+            f"{problem_phrase} LEBIH SAMAR",
             "NODANYA MAKIN SAMAR",
         ])
 
@@ -292,17 +369,24 @@ def _build_headline(moment: dict[str, Any], problem: str, benefit: str, seed: st
         cleaned = re.sub(r"[^\w\s?]", " ", base_hook, flags=re.UNICODE)
         cleaned = " ".join(cleaned.upper().split())
         strong_pattern = (
-            r"->|^DARI\b|^AWALNYA\b|^SEBELUMNYA\b|^INI BUKAN FILTER\b|"
-            r"^KOK BISA\b|^GILA\b|^CUMA\b|^GA PERCAYA\b"
+            r"^KULIT\b|^TAMPAK\b|^TERASA\b|^PENGALAMAN\b|^COBA\b|"
+            r"^CEK\b|^RUTIN\b|^STEP\b|^CARA\b|^AWALNYA\b|^SEKARANG\b"
         )
-        if 4 <= len(cleaned) <= 34 and re.search(strong_pattern, cleaned, flags=re.IGNORECASE):
+        if (
+            4 <= len(cleaned) <= 34
+            and re.search(strong_pattern, cleaned, flags=re.IGNORECASE)
+            and _is_soft_claim_text(cleaned)
+        ):
             headline_options.append(cleaned)
 
     headline_options = _dedupe_keep_order([
         option
         for option in headline_options
-        if 4 <= len(_normalize(option)) <= 38
+        if 4 <= len(_normalize(option)) <= 38 and _is_soft_claim_text(option)
     ])
+
+    if not headline_options:
+        headline_options = ["KULIT TAMPAK LEBIH TERAWAT"]
 
     return _stable_pick(headline_options, seed + "|headline")
 

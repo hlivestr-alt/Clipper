@@ -1,5 +1,5 @@
-# =============================================================================
-#  variation_engine.py — Clip variation generator for PROYA Clipper
+﻿# =============================================================================
+#  variation_engine.py â€” Clip variation generator for PROYA Clipper
 #
 #  Turns 1 raw clip moment into N styled variants using purely parameter-level
 #  mutations (no re-transcription, no re-detection).
@@ -11,7 +11,7 @@
 #    4. Zoom timing offset  (+/- seconds from original trigger)
 #    5. Zoom scale magnitude
 #    6. Color grade (brightness / contrast / saturation via FFmpeg filter)
-#    7. Speed ramp (0.9×, 1.0×, 1.1× — slight slow/fast)
+#    7. Speed ramp (0.9Ã—, 1.0Ã—, 1.1Ã— â€” slight slow/fast)
 #    8. Crop offset (re-frame slightly left/right within 9:16)
 #    9. Hook text display (show / hide, different duration)
 #   10. Karaoke active word highlight colour
@@ -19,7 +19,7 @@
 #  Usage in main.py:
 #    from variation_engine import expand_moments_with_variants
 #    moments = expand_moments_with_variants(moments, cfg)
-#    # then proceed with the normal clip-editing loop — each variant is its own job
+#    # then proceed with the normal clip-editing loop â€” each variant is its own job
 # =============================================================================
 
 from __future__ import annotations
@@ -37,11 +37,11 @@ log = logging.getLogger("proya.variation")
 _BROLL_VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi"}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #  STYLE PALETTE LIBRARY
 #  Each palette defines a complete visual identity for one variant.
 #  Add more palettes to increase variety without any code changes.
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 SUBTITLE_PALETTES = [
     # name, font, active_color, inactive_opacity, stroke_color, stroke_w
@@ -94,17 +94,146 @@ COLOR_GRADES = [
 CROP_X_OFFSETS = [-0.04, -0.02, 0.0, 0.02, 0.04]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+ARCHETYPE_SLOTS = [
+    {
+        "name": "original",
+        "variant_id": "v0_original",
+        "subtitle": "tiktok_classic",
+        "hook": "bold_white",
+        "subtitle_y": None,
+        "zoom_scale": None,
+        "zoom_offset": 0.0,
+        "speed": 1.0,
+        "grade": "",
+        "crop": 0.0,
+        "mirror": False,
+        "start_offset": 0.0,
+        "end_offset": 0.0,
+        "before_after_mode": "standard",
+        "hook_layout": "standard",
+        "subtitle_layout": "standard",
+        "broll_role": "",
+        "hook_duration_mult": 1.0,
+    },
+    {
+        "name": "product_broll_open",
+        "variant_id": "v1_product_broll_open",
+        "subtitle": "hot_pink",
+        "hook": "big_white",
+        "subtitle_y": 0.72,
+        "zoom_scale": 1.35,
+        "zoom_offset": -0.75,
+        "speed": 1.0,
+        "grade": "eq=saturation=1.25:contrast=1.08:brightness=0.02",
+        "crop": -0.03,
+        "mirror": False,
+        "start_offset": -0.40,
+        "end_offset": -0.40,
+        "before_after_mode": "minimal",
+        "hook_layout": "center_stack",
+        "subtitle_layout": "top",
+        "broll_role": "primary",
+        "hook_duration_mult": 1.0,
+    },
+    {
+        "name": "tight_product_focus",
+        "variant_id": "v2_tight_product_focus",
+        "subtitle": "neon_green",
+        "hook": "bold_yellow",
+        "subtitle_y": 0.83,
+        "zoom_scale": 1.65,
+        "zoom_offset": -1.25,
+        "speed": 1.0,
+        "grade": "eq=saturation=1.35:contrast=1.18",
+        "crop": 0.07,
+        "mirror": False,
+        "start_offset": 0.30,
+        "end_offset": 0.30,
+        "before_after_mode": "compact",
+        "hook_layout": "top_heavy",
+        "subtitle_layout": "bottom",
+        "broll_role": "",
+        "hook_duration_mult": 0.9,
+    },
+    {
+        "name": "result_overlay",
+        "variant_id": "v3_result_overlay",
+        "subtitle": "ice_blue",
+        "hook": "bold_pink",
+        "subtitle_y": 0.78,
+        "zoom_scale": 1.45,
+        "zoom_offset": 0.40,
+        "speed": 0.95,
+        "grade": "eq=saturation=1.05:contrast=1.08:brightness=0.03",
+        "crop": -0.05,
+        "mirror": True,
+        "start_offset": -0.25,
+        "end_offset": -0.25,
+        "before_after_mode": "hero",
+        "hook_layout": "left_punch",
+        "subtitle_layout": "mid",
+        "broll_role": "secondary",
+        "hook_duration_mult": 1.1,
+    },
+    {
+        "name": "host_focus_fast",
+        "variant_id": "v4_host_focus_fast",
+        "subtitle": "orange_punch",
+        "hook": "neon_cyan",
+        "subtitle_y": 0.88,
+        "zoom_scale": 1.30,
+        "zoom_offset": 0.75,
+        "speed": 1.08,
+        "grade": "colortemperature=temperature=7200,eq=saturation=1.15:contrast=1.08",
+        "crop": 0.05,
+        "mirror": False,
+        "start_offset": 0.55,
+        "end_offset": 0.55,
+        "before_after_mode": "standard",
+        "hook_layout": "right_label",
+        "subtitle_layout": "low",
+        "broll_role": "secondary",
+        "hook_duration_mult": 0.85,
+    },
+    {
+        "name": "clean_commerce",
+        "variant_id": "v5_clean_commerce",
+        "subtitle": "cream_soft",
+        "hook": "bold_white",
+        "subtitle_y": 0.86,
+        "zoom_scale": 1.55,
+        "zoom_offset": -0.20,
+        "speed": 1.0,
+        "grade": "eq=saturation=0.9:contrast=1.04:brightness=0.02",
+        "crop": 0.0,
+        "mirror": False,
+        "start_offset": -0.10,
+        "end_offset": -0.10,
+        "before_after_mode": "clean",
+        "hook_layout": "clean_banner",
+        "subtitle_layout": "low",
+        "broll_role": "optional",
+        "hook_duration_mult": 1.0,
+    },
+]
+
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #  VARIANT CONFIG DATACLASS
 #  A VariantConfig patches cfg values at render time.
 #  It's passed as a thin override layer on top of the main config.
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @dataclass
 class VariantConfig:
     """Per-variant style overrides. All fields are optional."""
     variant_id: str = ""
     variant_index: int = 0          # 0 = original, 1+ = variant
+    archetype: str = "original"
+
+    # Timeline nudges applied during moment expansion.
+    start_offset_seconds: float = 0.0
+    end_offset_seconds: float = 0.0
 
     # Mirror
     mirror: bool = False
@@ -137,6 +266,12 @@ class VariantConfig:
     # Crop X offset
     crop_x_offset: float = 0.0
 
+    # Render layout modes interpreted by ffmpeg_editor.
+    before_after_variant_mode: str = "standard"
+    hook_layout_mode: str = "standard"
+    subtitle_layout_mode: str = "standard"
+    broll_intro_role: str = ""
+
     # Optional intro B-roll used behind the opening hook text
     broll_intro_enabled: bool = False
     broll_intro_path: str = ""
@@ -150,9 +285,13 @@ def apply_variant_to_cfg(base_cfg, variant: VariantConfig):
     Does NOT mutate base_cfg. Uses __dict__ copy + override.
     """
     class PatchedCfg:
-        pass
+        def __init__(self, base):
+            object.__setattr__(self, "_base_cfg", base)
 
-    patched = PatchedCfg()
+        def __getattr__(self, name):
+            return getattr(object.__getattribute__(self, "_base_cfg"), name)
+
+    patched = PatchedCfg(base_cfg)
     # Copy all base cfg attributes
     for k, v in vars(base_cfg).items():
         setattr(patched, k, v)
@@ -185,6 +324,11 @@ def apply_variant_to_cfg(base_cfg, variant: VariantConfig):
     patched._crop_x_offset = variant.crop_x_offset
     patched._variant_id = variant.variant_id
     patched._variant_index = variant.variant_index
+    patched._variant_archetype = variant.archetype
+    patched._before_after_variant_mode = variant.before_after_variant_mode
+    patched._hook_layout_mode = variant.hook_layout_mode
+    patched._subtitle_layout_mode = variant.subtitle_layout_mode
+    patched._broll_intro_role = variant.broll_intro_role
     patched._broll_intro_enabled = variant.broll_intro_enabled
     patched._broll_intro_path = variant.broll_intro_path
     patched._broll_intro_duration = variant.broll_intro_duration
@@ -193,9 +337,9 @@ def apply_variant_to_cfg(base_cfg, variant: VariantConfig):
     return patched
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #  VARIANT GENERATION
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _draw_style_pairs(
     count: int,
@@ -265,6 +409,47 @@ def _draw_style_pairs(
             round_index += 1
 
     return pairs
+
+
+def _subtitle_palette_by_name(name: str) -> tuple[Any, ...]:
+    for palette in SUBTITLE_PALETTES:
+        if palette[0] == name:
+            return palette
+    raise ValueError(f"Unknown subtitle palette: {name}")
+
+
+def _hook_palette_by_name(name: str) -> tuple[Any, ...]:
+    for palette in HOOK_PALETTES:
+        if palette[0] == name:
+            return palette
+    raise ValueError(f"Unknown hook palette: {name}")
+
+
+def _archetype_slot(index: int, rng: random.Random) -> dict[str, Any]:
+    if index < len(ARCHETYPE_SLOTS):
+        return dict(ARCHETYPE_SLOTS[index])
+
+    subtitle_palette, hook_palette = _draw_style_pairs(1, rng)[0]
+    return {
+        "name": f"extended_{index}",
+        "variant_id": f"v{index}_{subtitle_palette[0]}_{hook_palette[0]}",
+        "subtitle": subtitle_palette[0],
+        "hook": hook_palette[0],
+        "subtitle_y": rng.choice(SUBTITLE_Y_POSITIONS),
+        "zoom_scale": rng.choice(ZOOM_SCALES),
+        "zoom_offset": rng.choice(ZOOM_OFFSETS),
+        "speed": rng.choice(SPEED_RAMPS),
+        "grade": rng.choice(COLOR_GRADES)[1],
+        "crop": rng.choice(CROP_X_OFFSETS),
+        "mirror": rng.random() < 0.30,
+        "start_offset": rng.choice([-0.45, -0.25, 0.25, 0.45]),
+        "end_offset": rng.choice([-0.45, -0.25, 0.25, 0.45]),
+        "before_after_mode": rng.choice(["standard", "compact", "clean", "hero"]),
+        "hook_layout": rng.choice(["standard", "top_heavy", "left_punch", "right_label", "clean_banner"]),
+        "subtitle_layout": rng.choice(["top", "mid", "bottom", "low"]),
+        "broll_role": rng.choice(["", "optional"]),
+        "hook_duration_mult": rng.choice([0.85, 0.95, 1.0, 1.1]),
+    }
 
 
 def _discover_broll_intro_assets(base_cfg) -> list[Path]:
@@ -346,6 +531,60 @@ def _broll_intro_rate_bounds(base_cfg) -> tuple[float, float]:
     return lo, hi
 
 
+def _clear_broll_intro_variant(variant: VariantConfig) -> None:
+    variant.broll_intro_enabled = False
+    variant.broll_intro_path = ""
+    variant.broll_intro_duration = 0.0
+    variant.broll_intro_product = ""
+    if variant.variant_id.endswith("_broll"):
+        variant.variant_id = variant.variant_id[:-6]
+
+
+def _broll_intro_candidate_indices(
+    variants: list[VariantConfig],
+    base_cfg,
+) -> list[int]:
+    candidate_indices = list(range(len(variants)))
+    if not getattr(base_cfg, "BROLL_INTRO_APPLY_TO_ORIGINAL", False):
+        candidate_indices = [idx for idx in candidate_indices if idx != 0]
+    return candidate_indices
+
+
+def _broll_intro_target_count(
+    variant_count: int,
+    candidate_count: int,
+    rng: random.Random,
+    base_cfg,
+) -> int:
+    if variant_count <= 0 or candidate_count <= 0:
+        return 0
+
+    lo, hi = _broll_intro_rate_bounds(base_cfg)
+    if hi <= 0.0:
+        return 0
+
+    target_rate = rng.uniform(lo, hi)
+    target_count = int(round(variant_count * target_rate))
+    if target_count <= 0 and variant_count >= 3:
+        target_count = 1
+    return min(max(0, target_count), candidate_count)
+
+
+def _broll_intro_duration(base_cfg) -> float:
+    try:
+        intro_duration = float(getattr(base_cfg, "BROLL_INTRO_MAX_DURATION", 2.5))
+    except (TypeError, ValueError):
+        intro_duration = 2.5
+    return max(0.0, intro_duration)
+
+
+def _enable_broll_intro_variant(variant: VariantConfig, intro_duration: float) -> None:
+    variant.broll_intro_enabled = True
+    variant.broll_intro_duration = intro_duration
+    if "_broll" not in variant.variant_id:
+        variant.variant_id = f"{variant.variant_id}_broll"
+
+
 def _assign_broll_intro_variants(
     variants: list[VariantConfig],
     rng: random.Random,
@@ -360,111 +599,88 @@ def _assign_broll_intro_variants(
         or not bool(getattr(base_cfg, "BROLL_INTRO_REQUIRE_PRODUCT_MATCH", True))
     )
 
-    candidate_indices = list(range(len(variants)))
-    if not getattr(base_cfg, "BROLL_INTRO_APPLY_TO_ORIGINAL", False):
-        candidate_indices = [idx for idx in candidate_indices if idx != 0]
+    candidate_indices = _broll_intro_candidate_indices(variants, base_cfg)
     if not candidate_indices:
         return
 
-    lo, hi = _broll_intro_rate_bounds(base_cfg)
-    if hi <= 0.0:
-        return
-
-    target_rate = rng.uniform(lo, hi)
-    target_count = int(round(len(variants) * target_rate))
-    if target_count <= 0 and len(variants) >= 3:
-        target_count = 1
-    target_count = min(target_count, len(candidate_indices))
+    target_count = _broll_intro_target_count(
+        len(variants),
+        len(candidate_indices),
+        rng,
+        base_cfg,
+    )
     if target_count <= 0:
         return
 
-    try:
-        intro_duration = float(getattr(base_cfg, "BROLL_INTRO_MAX_DURATION", 2.5))
-    except (TypeError, ValueError):
-        intro_duration = 2.5
-    intro_duration = max(0.0, intro_duration)
+    intro_duration = _broll_intro_duration(base_cfg)
 
     for idx in sorted(rng.sample(candidate_indices, target_count)):
         variant = variants[idx]
-        variant.broll_intro_enabled = True
-        variant.broll_intro_duration = intro_duration
+        _enable_broll_intro_variant(variant, intro_duration)
         if root_assets and allow_generic_root:
             variant.broll_intro_path = str(rng.choice(root_assets))
-        if "_broll" not in variant.variant_id:
-            variant.variant_id = f"{variant.variant_id}_broll"
 
 
 def generate_variants(base_cfg, n_variants: int, seed: int | None = None) -> list[VariantConfig]:
     """
     Generate `n_variants` VariantConfig objects.
 
-    Variant 0 is always the "original" (no mutations) so the base clip is
-    always produced. Variants 1..N each randomly sample from the axes above,
-    using a deterministic seed so re-runs produce the same set.
-
-    Args:
-        base_cfg:    The main config module/object.
-        n_variants:  Total variants including original (so 1 = no extra variants).
-        seed:        RNG seed for reproducibility.
-
-    Returns:
-        List of VariantConfig objects, length == n_variants.
+    Variant 0 is always the unchanged control. Variants 1..5 are deterministic
+    archetypes designed to make the common six-pack visibly distinct before
+    falling back to seeded extension slots for larger variant counts.
     """
     rng = random.Random(seed)
     variants = []
-    style_pairs = _draw_style_pairs(max(0, n_variants - 1), rng)
-
     hook_dur_base = getattr(base_cfg, "HOOK_DURATION", 0.0)
 
     for i in range(n_variants):
-        if i == 0:
-            # Original — keep everything default
-            vc = VariantConfig(
-                variant_id="v0_original",
-                variant_index=0,
-                zoom_scale=getattr(base_cfg, "ZOOM_SCALE", 1.45),
-                subtitle_y_pos=getattr(base_cfg, "SUBTITLE_Y_POS", 0.80),
-                font_subtitle=getattr(base_cfg, "FONT_SUBTITLE", ""),
-                karaoke_active_color=getattr(base_cfg, "KARAOKE_ACTIVE_COLOR", "#FFD600"),
-                karaoke_inactive_opacity=getattr(base_cfg, "KARAOKE_INACTIVE_OPACITY", 1.0),
-                hook_duration=hook_dur_base,
-            )
-        else:
-            subtitle_palette, hook_palette = style_pairs[i - 1]
-            palette_name, font, active_color, inactive_op, stroke_c, stroke_w = subtitle_palette
-            hook_name, hook_col, hook_stroke_c, hook_stroke_w, hook_fs_mult = hook_palette
+        slot = _archetype_slot(i, rng)
+        subtitle_palette = _subtitle_palette_by_name(slot["subtitle"])
+        hook_palette = _hook_palette_by_name(slot["hook"])
+        _palette_name, font, active_color, inactive_op, stroke_c, stroke_w = subtitle_palette
+        _hook_name, hook_col, hook_stroke_c, hook_stroke_w, hook_fs_mult = hook_palette
+        duration_mult = float(slot.get("hook_duration_mult") or 1.0)
+        is_original = i == 0
 
-            vc = VariantConfig(
-                variant_id=f"v{i}_{palette_name}_{hook_name}",
-                variant_index=i,
-                mirror=rng.random() < 0.30,                      # 30% chance flip
-                font_subtitle=font,
-                karaoke_active_color=active_color,
-                karaoke_inactive_opacity=inactive_op,
-                subtitle_stroke=stroke_c,
-                subtitle_stroke_w=stroke_w,
-                subtitle_y_pos=rng.choice(SUBTITLE_Y_POSITIONS),
-                hook_color=hook_col,
-                hook_stroke_color=hook_stroke_c,
-                hook_stroke_w=hook_stroke_w,
-                hook_fontsize_mult=hook_fs_mult,
-                hook_duration=hook_dur_base,
-                zoom_scale=rng.choice(ZOOM_SCALES),
-                zoom_trigger_offset=rng.choice(ZOOM_OFFSETS),
-                speed_ramp=rng.choice(SPEED_RAMPS),
-                color_grade_filter=rng.choice(COLOR_GRADES)[1],
-                crop_x_offset=rng.choice(CROP_X_OFFSETS),
-            )
-
+        vc = VariantConfig(
+            variant_id=slot["variant_id"],
+            variant_index=i,
+            archetype=slot["name"],
+            start_offset_seconds=float(slot["start_offset"]),
+            end_offset_seconds=float(slot["end_offset"]),
+            mirror=bool(slot["mirror"]),
+            font_subtitle=getattr(base_cfg, "FONT_SUBTITLE", "") if is_original else font,
+            karaoke_active_color=(
+                getattr(base_cfg, "KARAOKE_ACTIVE_COLOR", "#FFD600") if is_original else active_color
+            ),
+            karaoke_inactive_opacity=(
+                getattr(base_cfg, "KARAOKE_INACTIVE_OPACITY", 1.0) if is_original else inactive_op
+            ),
+            subtitle_stroke=stroke_c,
+            subtitle_stroke_w=stroke_w,
+            subtitle_y_pos=(
+                getattr(base_cfg, "SUBTITLE_Y_POS", 0.80)
+                if slot["subtitle_y"] is None else float(slot["subtitle_y"])
+            ),
+            hook_color=hook_col,
+            hook_stroke_color=hook_stroke_c,
+            hook_stroke_w=hook_stroke_w,
+            hook_fontsize_mult=float(hook_fs_mult),
+            hook_duration=float(hook_dur_base or 0.0) * duration_mult,
+            zoom_scale=(
+                getattr(base_cfg, "ZOOM_SCALE", 1.45)
+                if slot["zoom_scale"] is None else float(slot["zoom_scale"])
+            ),
+            zoom_trigger_offset=float(slot["zoom_offset"]),
+            speed_ramp=float(slot["speed"]),
+            color_grade_filter=str(slot["grade"] or ""),
+            crop_x_offset=float(slot["crop"]),
+            before_after_variant_mode=str(slot["before_after_mode"] or "standard"),
+            hook_layout_mode=str(slot["hook_layout"] or "standard"),
+            subtitle_layout_mode=str(slot["subtitle_layout"] or "standard"),
+            broll_intro_role=str(slot["broll_role"] or ""),
+        )
         variants.append(vc)
-
-    _assign_broll_intro_variants(variants, rng, base_cfg)
-
-    broll_count = sum(1 for variant in variants if variant.broll_intro_enabled)
-    if broll_count:
-        log.info(f"B-roll intro selected for {broll_count}/{len(variants)} variant configs")
-    elif getattr(base_cfg, "BROLL_INTRO_ENABLED", True):
-        log.debug("No B-roll intro assets found; variants render without intro pre-roll")
 
     log.info(f"Generated {len(variants)} variant configs (seed={seed})")
     return variants
@@ -598,11 +814,101 @@ def _assign_broll_intro_for_moment(
     variant.broll_intro_product = product_key
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+def _assign_broll_intro_variants_for_moment(
+    variants: list[VariantConfig],
+    moment: dict,
+    base_cfg,
+    seed: int,
+    base_clip_id: str,
+) -> None:
+    for variant in variants:
+        _clear_broll_intro_variant(variant)
+
+    if not variants or not _broll_intro_has_assets(base_cfg):
+        return
+
+    candidate_indices = _broll_intro_candidate_indices(variants, base_cfg)
+    if not candidate_indices:
+        return
+
+    rng = random.Random(f"{seed}|{base_clip_id}|broll_slots")
+    target_count = _broll_intro_target_count(
+        len(variants),
+        len(candidate_indices),
+        rng,
+        base_cfg,
+    )
+    if target_count <= 0:
+        return
+
+    intro_duration = _broll_intro_duration(base_cfg)
+    preferred = [
+        idx for idx in candidate_indices
+        if getattr(variants[idx], "broll_intro_role", "") in {"primary", "secondary"}
+    ]
+    optional = [
+        idx for idx in candidate_indices
+        if idx not in preferred and getattr(variants[idx], "broll_intro_role", "") == "optional"
+    ]
+    fallback = [idx for idx in candidate_indices if idx not in preferred and idx not in optional]
+    selected: list[int] = []
+    for pool in (preferred, optional, fallback):
+        remaining = target_count - len(selected)
+        if remaining <= 0:
+            break
+        if len(pool) <= remaining:
+            selected.extend(pool)
+        else:
+            selected.extend(rng.sample(pool, remaining))
+
+    for idx in sorted(selected[:target_count]):
+        variant = variants[idx]
+        _enable_broll_intro_variant(variant, intro_duration)
+        _assign_broll_intro_for_moment(
+            variant,
+            moment,
+            base_cfg,
+            seed,
+            base_clip_id,
+        )
+
+
+def _apply_variant_timeline_offsets(moment: dict, variant: VariantConfig) -> dict:
+    if variant.variant_index == 0:
+        return copy.deepcopy(moment)
+
+    try:
+        start = float(moment.get("start", 0.0) or 0.0)
+        end = float(moment.get("end", start) or start)
+    except (TypeError, ValueError):
+        return copy.deepcopy(moment)
+
+    duration = max(0.0, end - start)
+    if duration <= 0.5:
+        return copy.deepcopy(moment)
+
+    new_start = start + float(variant.start_offset_seconds or 0.0)
+    new_end = end + float(variant.end_offset_seconds or 0.0)
+
+    if new_start < 0.0:
+        shift = -new_start
+        new_start += shift
+        new_end += shift
+
+    if new_end <= new_start + 0.5:
+        new_end = new_start + duration
+
+    adjusted = copy.deepcopy(moment)
+    adjusted["start"] = round(max(0.0, new_start), 3)
+    adjusted["end"] = round(max(adjusted["start"] + 0.5, new_end), 3)
+    return adjusted
+
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #  MOMENT EXPANSION
 #  Takes the LLM moments list and clones each moment N times (one per variant).
 #  Each clone carries variant metadata so the editor can apply the right style.
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def expand_moments_with_variants(
     moments: list[dict],
@@ -611,7 +917,7 @@ def expand_moments_with_variants(
     seed: int = 42,
 ) -> list[dict]:
     """
-    Expand the moments list so each moment appears N times — once per variant.
+    Expand the moments list so each moment appears N times â€” once per variant.
 
     Args:
         moments:     Original moments from detect_moments().
@@ -627,44 +933,51 @@ def expand_moments_with_variants(
         n_variants = getattr(base_cfg, "VARIANTS_PER_CLIP", 4)
 
     if n_variants <= 1:
-        # No expansion — just tag every moment as v0_original
+        # No expansion â€” just tag every moment as v0_original
         for m in moments:
             m["_variant"] = VariantConfig(variant_id="v0_original", variant_index=0)
         return moments
 
     variants = generate_variants(base_cfg, n_variants, seed=seed)
     expanded = []
+    broll_jobs = 0
 
     for moment in moments:
-        base_clip_id = moment.get("clip_id", "clip_unknown")
-        for vc in variants:
-            variant_for_moment = copy.deepcopy(vc)
-            _assign_broll_intro_for_moment(
-                variant_for_moment,
-                moment,
-                base_cfg,
-                seed,
-                str(base_clip_id),
-            )
-            m = copy.deepcopy(moment)
+        base_clip_id = str(moment.get("clip_id", "clip_unknown"))
+        moment_variants = [copy.deepcopy(vc) for vc in variants]
+        _assign_broll_intro_variants_for_moment(
+            moment_variants,
+            moment,
+            base_cfg,
+            seed,
+            base_clip_id,
+        )
+        broll_jobs += sum(1 for vc in moment_variants if vc.broll_intro_enabled)
+
+        for variant_for_moment in moment_variants:
+            m = _apply_variant_timeline_offsets(moment, variant_for_moment)
             m["_variant"] = variant_for_moment
             # Give variant its own clip_id so files don't collide
             m["clip_id"] = f"{base_clip_id}_{variant_for_moment.variant_id}"
             expanded.append(m)
 
     log.info(
-        f"Expanded {len(moments)} moments × {n_variants} variants "
+        f"Expanded {len(moments)} moments Ã— {n_variants} variants "
         f"= {len(expanded)} total clip jobs"
     )
+    if broll_jobs:
+        log.info(f"B-roll intro selected for {broll_jobs}/{len(expanded)} expanded clip jobs")
+    elif getattr(base_cfg, "BROLL_INTRO_ENABLED", True):
+        log.debug("No matching B-roll intro assets found; variants render without intro pre-roll")
     return expanded
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #  FFmpeg VARIANT HELPERS
 #  Called inside cut_raw_clip (or a wrapper) to bake mirror, speed, grade, crop
 #  into the raw cut stage (before MoviePy editing) for maximum throughput.
 #  Python-level image ops (mirror) on MoviePy clips are slow; FFmpeg is fast.
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def build_ffmpeg_vf_chain(variant: VariantConfig | None, frame_w: int = 1080, frame_h: int = 1920) -> str:
     """
@@ -683,7 +996,7 @@ def build_ffmpeg_vf_chain(variant: VariantConfig | None, frame_w: int = 1080, fr
 
     filters = []
 
-    # 1. Crop X offset — shift horizontal slice before other transforms
+    # 1. Crop X offset â€” shift horizontal slice before other transforms
     ox = getattr(variant, "crop_x_offset", 0.0)
     if abs(ox) > 0.005:
         # Crop a slightly narrower strip then scale back up
@@ -696,7 +1009,7 @@ def build_ffmpeg_vf_chain(variant: VariantConfig | None, frame_w: int = 1080, fr
     if getattr(variant, "mirror", False):
         filters.append("hflip")
 
-    # 3. Speed ramp — setpts changes presentation timestamps
+    # 3. Speed ramp â€” setpts changes presentation timestamps
     speed = getattr(variant, "speed_ramp", 1.0)
     if abs(speed - 1.0) > 0.02:
         pts = round(1.0 / speed, 4)
@@ -713,7 +1026,7 @@ def build_ffmpeg_vf_chain(variant: VariantConfig | None, frame_w: int = 1080, fr
 def build_ffmpeg_atempo(speed: float) -> list[str]:
     """
     Build FFmpeg -af atempo arguments for audio speed matching.
-    atempo only supports 0.5–2.0 per filter; chain filters for extremes.
+    atempo only supports 0.5â€“2.0 per filter; chain filters for extremes.
     """
     if abs(speed - 1.0) <= 0.02:
         return []
@@ -774,11 +1087,11 @@ def cut_raw_clip_with_variant(
     raw_codec  = getattr(cfg, "RAW_CUT_CODEC", "h264_nvenc")
     raw_preset = getattr(cfg, "RAW_CUT_PRESET", "p1")
 
-    # Use -ss AFTER -i (output seek) — slower but accurate, avoids empty output
+    # Use -ss AFTER -i (output seek) â€” slower but accurate, avoids empty output
     # Also add -avoid_negative_ts make_zero to handle edge cases
     cmd = [
         "ffmpeg", "-y",
-        "-ss", f"{max(0.0, start):.3f}",   # input seek — BEFORE -i
+        "-ss", f"{max(0.0, start):.3f}",   # input seek â€” BEFORE -i
         "-i", input_video,
         "-t", f"{duration:.3f}",
         "-c:v", raw_codec, "-preset", raw_preset,
@@ -819,20 +1132,20 @@ def cut_raw_clip_with_variant(
     except FileNotFoundError:
         raise RuntimeError("FFmpeg not found")
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #  THROUGHPUT MATH HELPER
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #  CONFIG ADDITIONS (paste these into config.py)
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 SUGGESTED_CONFIG_ADDITIONS = """
-# ── Variation Engine ──────────────────────────────────────────────────────────
+# â”€â”€ Variation Engine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # How many style variants to render per detected moment.
 # 1 = no variation (just the original). 6 = 6x clip output.
-# With a ~1h livestream → ~60 moments → 6 variants = ~360 clips.
-# For 8–18k clips target across multiple VODs, set to 8–12.
+# With a ~1h livestream â†’ ~60 moments â†’ 6 variants = ~360 clips.
+# For 8â€“18k clips target across multiple VODs, set to 8â€“12.
 VARIANTS_PER_CLIP = 6
 
 # Seed for variant randomisation. Change to get a different style mix.
@@ -842,3 +1155,4 @@ VARIANT_SEED = 42
 # False = these transforms are done in MoviePy (slower).
 VARIANT_FFMPEG_BAKE = True
 """
+

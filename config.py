@@ -10,6 +10,25 @@ YOLO_WEIGHTS       = "models/proya_best.pt"    # your trained YOLO weights
 YOLO_PRETRAIN      = "yolov8n.pt"              # base model for training
 DATASET_YAML       = "dataset/proya.yaml"      # YOLO dataset config
 LOGO_PATH          = None                      # disable watermark for max throughput
+RENDER_STYLE_VERSION = 5                       # bump when opening-hook/render styling changes
+
+# Queue runner defaults. The PowerShell launchers and video_queue.py read these
+# so routine queue tuning can live here instead of in long terminal commands.
+QUEUE_INPUT_DIR = r"D:\VOD"
+QUEUE_STATE_FILE = WORKING_DIR + r"\video_queue_state.json"
+QUEUE_FOREVER_STATE_FILE = WORKING_DIR + r"\queue_forever_state.json"
+QUEUE_CONTROL_FILE = WORKING_DIR + r"\queue_control.json"
+QUEUE_START_RUN_NUMBER = 12
+QUEUE_MAX_RETRIES = 2
+QUEUE_MAX_INFLIGHT_VIDEOS = 1
+QUEUE_FFMPEG_MAX_PARALLEL_CLIPS = 4
+QUEUE_YOLO_IN_SUBPROCESS = True
+QUEUE_POLL_INTERVAL = 2.0
+QUEUE_RESCAN_INTERVAL_SECONDS = 300.0
+QUEUE_SCAN_INTERVAL_SECONDS = QUEUE_RESCAN_INTERVAL_SECONDS
+QUEUE_STABLE_SECONDS = 60.0
+QUEUE_RESTART_DELAY_SECONDS = 30
+QUEUE_BETWEEN_RUNS_DELAY_SECONDS = 10
 
 # ── Before/After Image Overlay ────────────────────────────────────────────────
 # Drop your before/after result photos into this folder.
@@ -72,7 +91,9 @@ WORD_CORRECTIONS = {
     "bestibestiku"   : "bestie bestieku",
     "bakas"          : "bekas",
     "kelencernya"    : "cleanser", 
-
+    "tritamic"       : "tranexamic",
+    "karnoset"       : "carnosine",
+    "antiglationnya" : "Anti-glycation",
 
     # Common Indonesian skincare terms Whisper mishears
     "skinker"        : "skincare",
@@ -212,6 +233,8 @@ LM_STUDIO_API_KEY  = "lm-studio"               # LM Studio accepts any non-empty
 LM_STUDIO_MOMENT_MODEL_ID = "qwen/qwen3.6-27b"
 LM_STUDIO_MODEL    = LM_STUDIO_MOMENT_MODEL_ID          # match the model name shown in LM Studio
 LM_STUDIO_TIMEOUT  = 360                       # seconds per request
+LM_STUDIO_TEMPERATURE = 0.2                    # keep Qwen text calls stable without reverting to UI defaults
+LM_STUDIO_QWEN_THINKING_ENABLED = False        # passed as enable_thinking=false for Qwen3.x chat templates
 LM_STUDIO_MODEL_MANAGEMENT_ENABLED = True
 LM_STUDIO_MODEL_UNLOAD_TIMEOUT = 600           # Qwen 3.6 can take minutes to fully free VRAM
 LM_STUDIO_MODEL_UNLOAD_LOG_INTERVAL = 30       # log wait progress so unloads do not look frozen
@@ -281,7 +304,8 @@ PAD_END            = 2.0          # seconds to add after moment end
 # If a font isn't found, MoviePy falls back to the system default.
 # Safe cross-platform fallback names are shown in comments.
 
-FONT_HOOK       = "assets/fonts/Anton-Regular.ttf"              # or "Bebas-Neue", "Impact"
+FONT_HOOK       = "assets/fonts/Poppins-Bold.ttf"               # bold readable hook title
+FONT_HOOK_FALLBACKS = ["assets/fonts/Montserrat-ExtraBold.ttf", "assets/fonts/Anton-Regular.ttf"]
 FONT_LABEL      = "assets/fonts/Montserrat-SemiBold.ttf"  # or "Poppins-Medium", "Arial-Bold"
 FONT_SUBTITLE   = "assets/fonts/Montserrat-ExtraBold.ttf"    # or "Arial-Bold"
 FONT_PRODUCT    = "assets/fonts/PlayfairDisplay-Italic-VariableFont_wght.ttf"  # for zoom caption
@@ -476,6 +500,14 @@ LOG_FFMPEG_FILTER_COMPLEX = False
 RAW_CUT_CODEC   = "libx264"   # CPU — fast enough, no NVENC slot used
 RAW_CUT_PRESET  = "ultrafast"
 
+# Moderate dead-air compaction during Stage 4 rendering.
+SILENCE_TRIM_ENABLED = True
+SILENCE_TRIM_MIN_GAP = 1.2
+SILENCE_TRIM_KEEP_GAP = 0.35
+SILENCE_TRIM_EDGE_KEEP = 0.25
+SILENCE_TRIM_MAX_REMOVAL_FRACTION = 0.45
+SILENCE_TRIM_MIN_WORDS = 6
+
 # Automated post-render clip scoring.
 SCORER_ENABLED = True
 SCORER_FRAME_SAMPLE_RATE = 10
@@ -490,7 +522,7 @@ SCORER_EXPORT_READY_THRESHOLD = 7.0
 SCORER_REVIEW_THRESHOLD = 5.0
 SCORER_AUTO_SORT_ENABLED = True
 SCORER_TOP_VARIANTS_PER_CLIP = 0
-SCORER_VISION_ENABLED = True
+SCORER_VISION_ENABLED = False
 SCORER_VISION_FRAME_SAMPLE_RATE = 150
 SCORER_VISION_BASE_URL = "http://localhost:1234/v1"
 SCORER_VISION_API_KEY = "lm-studio"
@@ -498,17 +530,81 @@ SCORER_VISION_MODEL_ID = "qwen2.5-vl-32b-instruct"
 SCORER_VISION_MODEL = SCORER_VISION_MODEL_ID
 SCORER_VISION_TIMEOUT = 600
 SCORER_VISION_DEBUG = False
+SCORER_VISION_CONTACT_SHEET = True
+SCORER_VISION_CONTACT_SHEET_MAX_FRAMES = 6
+SCORER_VISION_CONTACT_SHEET_CELL_SIZE = 384
 SCORER_FOCUS_DROP_OUTLIERS = True
 SCORER_FOCUS_SKIP_FIRST_FRAME = True
 SCORER_BATCH_FLUSH_EVERY = 5
 SCORER_SIMILARITY_FRAME_SAMPLE_RATE = 30
 SCORER_SIMILARITY_MAX_FRAMES = 24
 
+# Affiliate handoff packaging. Export-ready clips from all VOD output folders
+# are moved into numbered batch folders with at most 30 videos each.
+EXPORT_BATCHES_ENABLED = True
+EXPORT_BATCH_DIR_NAME = "export_batches"
+EXPORT_BATCH_SIZE = 30
+EXPORT_BATCH_ORDER = "score_round_robin"
+EXPORT_BATCH_APPEND_ONLY = True
+EXPORT_PACK_ONE_VARIANT_PER_CLIP = True
+
 # Pre-subtitle advertising compliance checks for Indonesian skincare claims.
 COMPLIANCE_ENABLED = True
 COMPLIANCE_AUTO_FIX = True
 COMPLIANCE_BLOCK_HIGH = True
 COMPLIANCE_LM_TIMEOUT = 60
+
+# Modular raw clip library.
+# Extraction is transcript-only in v1; product zoom remains a documented
+# placeholder for future YOLO-backed modular rendering.
+MODULE_LIBRARY_DIR = r"D:\proya_modules"
+MODULE_EXTRACTION_ENABLED = True
+MODULE_DURATION_STRICT = False
+MODULE_HOOK_MIN_DURATION = 4.0
+MODULE_HOOK_MAX_DURATION = 8.0
+MODULE_MAIN_MIN_DURATION = 15.0
+MODULE_MAIN_MAX_DURATION = 45.0
+MODULE_CTA_MIN_DURATION = 4.0
+MODULE_CTA_MAX_DURATION = 12.0
+MODULE_SENTENCE_BOUNDARY_TOLERANCE = 2.0
+MODULE_ASSEMBLY_ENABLED = False
+MODULE_ASSEMBLY_RENDER_LIMIT = 3
+MODULE_ASSEMBLY_CANDIDATE_POOL = 30
+MODULE_ASSEMBLY_MAX_PER_PRODUCT = 1
+MODULE_ASSEMBLY_COMPLIANCE_PREFILTER = True
+MODULE_ASSEMBLY_SAFE_HOOKS_ENABLED = True
+MODULE_ASSEMBLY_SAME_DATE_ONLY = True
+MODULE_ASSEMBLY_VISUAL_EVENT_BONUS = 0.75
+MODULE_ASSEMBLY_ZOOM_READY_MIN_EVENTS = 1
+MODULE_ASSEMBLY_REQUIRE_ZOOM_READY = False
+MODULE_REBUILD_INDEX_BEFORE_ASSEMBLY = True
+MODULE_OUTPUT_LOCK_TIMEOUT = 30.0
+MODULE_EXTRACT_FFMPEG_TIMEOUT = 300
+MODULE_DEDUPE_IOU_THRESHOLD = 0.5
+MODULE_PRODUCT_ZOOM_ENABLED = False
+MODULE_VISUAL_VALIDATION_ENABLED = False
+# Runs YOLO during module extraction; keep opt-in so routine extraction does not contend for CUDA.
+MODULE_VALIDATE_ON_EXTRACT = False
+MODULE_VISUAL_VALIDATION_MIN_CONFIDENCE = 0.55
+MODULE_VISUAL_VALIDATION_SAMPLE_FPS = 1.0
+MODULE_VISUAL_VALIDATION_MIN_HITS = 1
+MODULE_WORD_FALLBACK_REVIEW_REQUIRED = True
+MODULE_ASSEMBLY_REQUIRE_APPROVED = True
+MODULE_ASSEMBLY_MIN_SOURCE_VIDEOS = 2
+MODULAR_ASSEMBLY_READY_MIN_HOOK = 5
+MODULAR_ASSEMBLY_READY_MIN_MAIN = 3
+MODULAR_ASSEMBLY_READY_MIN_CTA = 3
+MODULE_PRODUCT_EVIDENCE_REQUIRED = True
+MODULE_PRODUCT_EVIDENCE_CONTEXT_SECONDS = 12.0
+MODULE_CLASSIFICATION_MIN_CONFIDENCE = 0.6
+MODULE_CLASSIFIER_WORKERS = 1
+MODULE_CANDIDATE_CACHE_ENABLED = True
+MODULE_MAX_CANDIDATES_PER_ROLE = 0
+MODULE_INDEX_LOCK_TIMEOUT = 30.0
+MODULE_FILE_LOCK_TIMEOUT = 30.0
+MODULE_INDEX_VALIDATE_MEDIA = True
+MODULE_INDEX_REPROBE_MEDIA = False
+MODULE_REPORT_LOAD_SIDECARS = False
 
 # ── Variation Engine ──────────────────────────────────────────────────────────
 # How many style variants to render per detected moment.
@@ -530,8 +626,8 @@ VARIANT_FFMPEG_BAKE = True
 # behind the hook text instead of the before/after image.
 BROLL_INTRO_ENABLED = True
 BROLL_INTRO_DIR = "assets/broll_intro"
-BROLL_INTRO_MIN_VARIANT_RATE = 0.20
-BROLL_INTRO_MAX_VARIANT_RATE = 0.40
+BROLL_INTRO_MIN_VARIANT_RATE = 0.50
+BROLL_INTRO_MAX_VARIANT_RATE = 0.50
 BROLL_INTRO_APPLY_TO_ORIGINAL = False
 BROLL_INTRO_MAX_DURATION = 2.5
 BROLL_INTRO_FADE_IN = 0.0

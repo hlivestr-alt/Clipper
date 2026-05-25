@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from hook_text import build_hook_payload
+from utils import lm_studio_openai_chat_kwargs
 
 log = logging.getLogger("proya.moment_detector")
 
@@ -90,12 +91,13 @@ Hanya return [] jika chunk ini benar-benar tidak ada konten produk/benefit/promo
 
 def _call_lm_studio(client, messages: list, cfg) -> str:
     """Make a single call to LM Studio and return the text response."""
+    model_id = cfg.LM_STUDIO_MODEL
     response = client.chat.completions.create(
-        model=cfg.LM_STUDIO_MODEL,
+        model=model_id,
         messages=messages,
-        temperature=0.2,       # low temperature = more consistent JSON output
         max_tokens=8192,
         timeout=cfg.LM_STUDIO_TIMEOUT,
+        **lm_studio_openai_chat_kwargs(cfg, model_id=model_id),
     )
     return response.choices[0].message.content.strip()
 

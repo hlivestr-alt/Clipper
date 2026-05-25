@@ -9,13 +9,14 @@ import math
 import re
 import shutil
 import subprocess
+import time
 from collections import Counter
 from datetime import datetime, timezone
 from bisect import bisect_left, bisect_right
 from pathlib import Path
 from typing import Any
 
-from utils import _parse_json_object
+from utils import _parse_json_object, lm_studio_openai_chat_kwargs
 
 log = logging.getLogger("proya.clip_scorer")
 
@@ -60,12 +61,21 @@ def score_clip(
     transcript_text = transcript_to_text(transcript)
     flags: list[str] = []
     metrics: dict[str, Any] = {}
+    text_accounting = {"actual_text_qwen_calls": 0}
 
     content_score = None
     content_summary = ""
     engagement_score = 0.0
+    hook_score = None
+    hook_summary = ""
     try:
-        combined = _score_content_and_engagement_with_qwen(transcript_text, product_name, cfg)
+        combined = _score_content_and_engagement_with_qwen(
+            transcript_text,
+            product_name,
+            cfg,
+            transcript=transcript,
+            accounting=text_accounting,
+        )
         content = combined["content"]
         content_score = content["score"]
         flags.extend(content["flags"])
@@ -75,8 +85,12 @@ def score_clip(
         engagement_score = engagement["score"]
         flags.extend(engagement["flags"])
         metrics["engagement"] = engagement.get("metrics", {})
+        hook = combined.get("hook", {})
+        hook_score = hook.get("score")
+        hook_summary = str(hook.get("summary") or "")
+        metrics["hook"] = hook.get("metrics", {})
     except Exception as exc:
-        log.warning("Content/engagement Qwen scoring unavailable for %s: %s", clip_path, exc)
+        log.warning("Content/engagement/hook Qwen scoring unavailable for %s: %s", clip_path, exc)
         flags.append("content_qwen_unavailable")
         content_summary = ""
         metrics["content"] = {"error": str(exc)}
@@ -91,16 +105,6 @@ def score_clip(
             "source": "keyword_fallback",
             "fallback_reason": str(exc),
         }
-
-    hook_score = None
-    hook_summary = ""
-    try:
-        hook = _score_hook_with_qwen(transcript, product_name, cfg)
-        hook_score = hook.get("score")
-        hook_summary = str(hook.get("summary") or "")
-        metrics["hook"] = hook.get("metrics", {})
-    except Exception as exc:
-        log.warning("Hook scoring unavailable for %s: %s", clip_path, exc)
         metrics["hook"] = {"error": str(exc), "source": "unavailable"}
 
     host_focus_score = None
@@ -119,6 +123,10 @@ def score_clip(
         quality_score = None
         flags.append("quality_probe_unavailable")
         metrics["quality"] = {"error": str(exc)}
+    metrics["accounting"] = {
+        "actual_text_qwen_calls": int(text_accounting.get("actual_text_qwen_calls") or 0),
+        "actual_vision_qwen_calls": 0,
+    }
 
     dimension_scores = {
         "content": content_score,
@@ -176,6 +184,10 @@ def score_clip(
         "exported": exported,
         "clip_mtime_ns": _clip_mtime_ns(clip_path),
         "scored_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        "_scorer_accounting": {
+            "actual_text_qwen_calls": int(text_accounting.get("actual_text_qwen_calls") or 0),
+            "actual_vision_qwen_calls": 0,
+        },
     }
 
 
@@ -335,6 +347,7 @@ def score_clip_variants(
     grouped_entries = _group_score_entries_by_base_clip(normalized_entries)
     previous_calls = len(normalized_entries)
     actual_calls = 0
+    actual_text_qwen_calls = 0
     cache_hits = 0
     cache_misses = 0
     fresh_scores = 0
@@ -375,6 +388,7 @@ def score_clip_variants(
                     clip_id=base_clip_id,
                     output_file=representative.get("output_file"),
                 )
+                actual_text_qwen_calls += _actual_qwen_calls_from_score(base_score, "actual_text_qwen_calls")
             except Exception as exc:
                 log.warning("Base scoring failed for %s: %s", base_clip_id, exc)
                 base_score = _failed_base_score(base_clip_id, representative, exc, cfg)
@@ -414,9 +428,10 @@ def score_clip_variants(
             "score_cache_enabled": bool(getattr(cfg, "SCORER_CACHE_ENABLED", True)),
             "force_rescore": bool(getattr(cfg, "SCORER_FORCE_RESCORE", False)),
             "previous_text_qwen_calls": group_index * 2,
-            "actual_text_qwen_calls": actual_calls,
-            "saved_text_qwen_calls": max(0, group_index * 2 - actual_calls),
-            "saved_text_qwen_calls_from_merge": actual_calls,
+            "actual_text_qwen_calls": actual_text_qwen_calls,
+            "saved_text_qwen_calls": max(0, group_index * 2 - actual_text_qwen_calls),
+            "saved_text_qwen_calls_from_merge": actual_text_qwen_calls,
+            "actual_vision_qwen_calls": 0,
         }
 
         if print_progress:
@@ -449,9 +464,10 @@ def score_clip_variants(
         "score_cache_enabled": bool(getattr(cfg, "SCORER_CACHE_ENABLED", True)),
         "force_rescore": bool(getattr(cfg, "SCORER_FORCE_RESCORE", False)),
         "previous_text_qwen_calls": len(grouped_entries) * 2,
-        "actual_text_qwen_calls": actual_calls,
-        "saved_text_qwen_calls": max(0, len(grouped_entries) * 2 - actual_calls),
-        "saved_text_qwen_calls_from_merge": actual_calls,
+        "actual_text_qwen_calls": actual_text_qwen_calls,
+        "saved_text_qwen_calls": max(0, len(grouped_entries) * 2 - actual_text_qwen_calls),
+        "saved_text_qwen_calls_from_merge": actual_text_qwen_calls,
+        "actual_vision_qwen_calls": 0,
     }
     message = (
         "Grouped clip scoring saved %s full scoring call(s): previous=%s actual=%s "
@@ -474,7 +490,7 @@ def score_clip_variants(
         cache_misses,
     )
     log.info(
-        "Merged content+engagement Qwen calls saved %s text call(s): previous=%s actual=%s",
+        "Merged content+engagement+hook Qwen calls saved %s text call(s): previous=%s actual_http=%s",
         stats["saved_text_qwen_calls"],
         stats["previous_text_qwen_calls"],
         stats["actual_text_qwen_calls"],
@@ -493,7 +509,7 @@ def score_clip_variants(
         print(
             "Qwen text calls saved: "
             f"{stats['saved_text_qwen_calls']} "
-            f"(previous {stats['previous_text_qwen_calls']}, actual {stats['actual_text_qwen_calls']})."
+            f"(previous {stats['previous_text_qwen_calls']}, actual HTTP {stats['actual_text_qwen_calls']})."
         )
     return flat_scores, groups, stats
 
@@ -531,6 +547,9 @@ def apply_host_focus_vision_scores(
     succeeded = 0
     failed = 0
     skipped = 0
+    actual_vision_qwen_calls = 0
+    contact_sheet_groups = 0
+    contact_sheet_fallbacks = 0
 
     for group_index, group in enumerate(score_groups, start=1):
         base_clip_id = str(group.get("base_clip_id") or group.get("clip_id") or "")
@@ -562,6 +581,15 @@ def apply_host_focus_vision_scores(
                 message = f"Host focus vision scoring failed for {representative_path}: {exc}"
                 log.error(message)
                 raise RuntimeError(message) from exc
+            host_metrics = host_focus.get("metrics", {}) if isinstance(host_focus, dict) else {}
+            if isinstance(host_metrics, dict):
+                actual_vision_qwen_calls += _safe_int_count(
+                    host_metrics.get("actual_vision_qwen_calls")
+                )
+                if bool(host_metrics.get("contact_sheet_used")):
+                    contact_sheet_groups += 1
+                if bool(host_metrics.get("contact_sheet_fallback")):
+                    contact_sheet_fallbacks += 1
 
         base_score = copy.deepcopy(group)
         _apply_host_focus_result_to_score(base_score, host_focus, cfg)
@@ -590,13 +618,18 @@ def apply_host_focus_vision_scores(
         "vision_skipped_groups": skipped,
         "vision_model": getattr(cfg, "SCORER_VISION_MODEL", getattr(cfg, "SCORER_VISION_MODEL_ID", "")),
         "vision_frame_sample_rate": vision_sample_rate,
+        "actual_vision_qwen_calls": actual_vision_qwen_calls,
+        "vision_contact_sheet_enabled": bool(getattr(cfg, "SCORER_VISION_CONTACT_SHEET", False)),
+        "vision_contact_sheet_groups": contact_sheet_groups,
+        "vision_contact_sheet_fallbacks": contact_sheet_fallbacks,
     }
     log.info(
-        "Host-focus vision scoring complete: attempted=%s scored=%s failed=%s skipped=%s",
+        "Host-focus vision scoring complete: attempted=%s scored=%s failed=%s skipped=%s actual_vision_qwen_calls=%s",
         attempted,
         succeeded,
         failed,
         skipped,
+        actual_vision_qwen_calls,
     )
     return updated_scores, updated_groups, stats
 
@@ -638,7 +671,19 @@ def _apply_host_focus_result_to_score(score: dict[str, Any], host_focus: dict[st
     if not isinstance(metrics, dict):
         metrics = {}
     metrics["host_focus"] = host_focus.get("metrics", {})
+    accounting = metrics.get("accounting", {})
+    if not isinstance(accounting, dict):
+        accounting = {}
+    accounting["actual_text_qwen_calls"] = _safe_int_count(accounting.get("actual_text_qwen_calls"))
+    accounting["actual_vision_qwen_calls"] = _safe_int_count(
+        (host_focus.get("metrics") or {}).get("actual_vision_qwen_calls")
+    )
+    metrics["accounting"] = accounting
     score["metrics"] = metrics
+    score["_scorer_accounting"] = {
+        "actual_text_qwen_calls": accounting["actual_text_qwen_calls"],
+        "actual_vision_qwen_calls": accounting["actual_vision_qwen_calls"],
+    }
     score["host_focus_score"] = host_focus_score
 
     dimension_scores = {
@@ -1193,11 +1238,16 @@ def _failed_base_score(base_clip_id: str, representative: dict[str, Any], exc: E
             "quality": False,
             "engagement": False,
             "host_focus": False,
+            "hook": False,
         },
         "flags": ["base_scoring_failed"],
         "score_caps_applied": [],
         "summary": f"Skor dasar gagal dihitung: {str(exc)[:120]}",
-        "metrics": {"base_error": str(exc)},
+        "metrics": {
+            "base_error": str(exc),
+            "accounting": {"actual_text_qwen_calls": 0, "actual_vision_qwen_calls": 0},
+        },
+        "_scorer_accounting": {"actual_text_qwen_calls": 0, "actual_vision_qwen_calls": 0},
         "export_threshold": float(getattr(cfg, "SCORER_MIN_SCORE_TO_EXPORT", 0.0) or 0.0),
         "exported": False,
         "scored_at": now,
@@ -1603,6 +1653,30 @@ def _build_scoring_optimization_stats(
 ) -> dict[str, Any]:
     previous_calls = len(scores)
     actual_calls = len(groups)
+    accounting_sources = groups if groups else scores
+    has_text_accounting = any(
+        _score_has_accounting(item, "actual_text_qwen_calls")
+        for item in accounting_sources
+        if isinstance(item, dict)
+    )
+    actual_text_qwen_calls = sum(
+        _actual_qwen_calls_from_score(group, "actual_text_qwen_calls")
+        for group in groups
+        if isinstance(group, dict)
+    )
+    if not groups and scores:
+        actual_text_qwen_calls = sum(
+            _actual_qwen_calls_from_score(score, "actual_text_qwen_calls")
+            for score in scores
+            if isinstance(score, dict)
+        )
+    if not has_text_accounting and actual_text_qwen_calls <= 0 and actual_calls > 0:
+        actual_text_qwen_calls = actual_calls
+    actual_vision_qwen_calls = sum(
+        _actual_qwen_calls_from_score(group, "actual_vision_qwen_calls")
+        for group in groups
+        if isinstance(group, dict)
+    )
     return {
         "previous_scoring_calls": previous_calls,
         "actual_scoring_calls": actual_calls,
@@ -1613,16 +1687,55 @@ def _build_scoring_optimization_stats(
         "fresh_score_count": previous_calls,
         "cache_miss_count": previous_calls,
         "previous_text_qwen_calls": actual_calls * 2,
-        "actual_text_qwen_calls": actual_calls,
-        "saved_text_qwen_calls": actual_calls,
-        "saved_text_qwen_calls_from_merge": actual_calls,
+        "actual_text_qwen_calls": actual_text_qwen_calls,
+        "saved_text_qwen_calls": max(0, actual_calls * 2 - actual_text_qwen_calls),
+        "saved_text_qwen_calls_from_merge": actual_text_qwen_calls,
+        "actual_vision_qwen_calls": actual_vision_qwen_calls,
     }
+
+
+def _actual_qwen_calls_from_score(score: dict[str, Any], key: str) -> int:
+    accounting = score.get("_scorer_accounting")
+    if isinstance(accounting, dict):
+        return _safe_int_count(accounting.get(key))
+    metrics = score.get("metrics", {})
+    if isinstance(metrics, dict):
+        metric_accounting = metrics.get("accounting", {})
+        if isinstance(metric_accounting, dict):
+            return _safe_int_count(metric_accounting.get(key))
+        host_focus = metrics.get("host_focus", {})
+        if key == "actual_vision_qwen_calls" and isinstance(host_focus, dict):
+            return _safe_int_count(host_focus.get(key))
+    return 0
+
+
+def _score_has_accounting(score: dict[str, Any], key: str) -> bool:
+    accounting = score.get("_scorer_accounting")
+    if isinstance(accounting, dict) and key in accounting:
+        return True
+    metrics = score.get("metrics", {})
+    if not isinstance(metrics, dict):
+        return False
+    metric_accounting = metrics.get("accounting", {})
+    if isinstance(metric_accounting, dict) and key in metric_accounting:
+        return True
+    host_focus = metrics.get("host_focus", {})
+    return key == "actual_vision_qwen_calls" and isinstance(host_focus, dict) and key in host_focus
+
+
+def _safe_int_count(value: Any) -> int:
+    numeric = _safe_float(value, default=0.0)
+    if not math.isfinite(numeric):
+        return 0
+    return max(0, int(numeric))
 
 
 def _score_content_and_engagement_with_qwen(
     transcript_text: str,
     product_name: str,
     cfg,
+    transcript: Any | None = None,
+    accounting: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     if not transcript_text.strip():
         engagement_score, engagement_flags, engagement_metrics = _score_engagement(
@@ -1646,6 +1759,15 @@ def _score_content_and_engagement_with_qwen(
                     "fallback_reason": "empty_transcript",
                 },
             },
+            "hook": {
+                "score": 0.0,
+                "summary": "Pembukaan kosong sehingga kekuatan hook tidak bisa dinilai.",
+                "metrics": {
+                    "source": "empty_transcript",
+                    "window_seconds": 8.0,
+                    "text": "",
+                },
+            },
         }
 
     try:
@@ -1658,6 +1780,7 @@ def _score_content_and_engagement_with_qwen(
         api_key=getattr(cfg, "LM_STUDIO_API_KEY", "lm-studio"),
     )
     prompt_text = transcript_text[:8000]
+    hook_text, hook_source = _hook_text_for_combined_prompt(transcript, transcript_text)
     messages = [
         {
             "role": "system",
@@ -1690,7 +1813,11 @@ def _score_content_and_engagement_with_qwen(
                 "7. engagement_flags harus menjelaskan sinyal engagement yang muncul, misalnya "
                 "promo_focus, product_focus, demo_focus, benefit_focus, ingredient_focus, atau off_topic.\n"
                 "8. engagement_metrics wajib berisi boolean untuk price_mentioned, product_name_mentioned, "
-                "demo_signal, dan benefit_claim.\n\n"
+                "demo_signal, dan benefit_claim.\n"
+                "9. Beri hook_score 0 sampai 10 untuk kekuatan pembukaan clip. Skor tinggi jika pembukaan "
+                "langsung menyebut produk, benefit, harga/promo, masalah kulit, atau pertanyaan yang kuat untuk "
+                "membuat penonton berhenti scroll.\n"
+                "10. Beri hook_summary satu kalimat Bahasa Indonesia yang menjelaskan alasan hook_score.\n\n"
                 "Format JSON wajib:\n"
                 "{"
                 "\"content_score\": 0.0, "
@@ -1703,19 +1830,26 @@ def _score_content_and_engagement_with_qwen(
                 "\"product_name_mentioned\": false, "
                 "\"demo_signal\": false, "
                 "\"benefit_claim\": false"
-                "}"
+                "}, "
+                "\"hook_score\": 0.0, "
+                "\"hook_summary\": \"satu kalimat Bahasa Indonesia\""
                 "}\n\n"
+                "Transkrip pembuka untuk hook_score:\n"
+                f"{hook_text[:2000] or '(kosong)'}\n\n"
                 "Transkrip clip:\n"
                 f"{prompt_text}"
             ),
         },
     ]
+    if accounting is not None:
+        accounting["actual_text_qwen_calls"] = int(accounting.get("actual_text_qwen_calls") or 0) + 1
+    model_id = getattr(cfg, "LM_STUDIO_MODEL", "qwen/qwen3.6-27b")
     response = client.chat.completions.create(
-        model=getattr(cfg, "LM_STUDIO_MODEL", "qwen/qwen3.6-27b"),
+        model=model_id,
         messages=messages,
-        temperature=0.0,
-        max_tokens=512,
+        max_tokens=700,
         timeout=min(float(getattr(cfg, "LM_STUDIO_TIMEOUT", 120)), 120.0),
+        **lm_studio_openai_chat_kwargs(cfg, model_id=model_id),
     )
     raw = (response.choices[0].message.content or "").strip()
     payload = _parse_json_object(raw)
@@ -1778,6 +1912,10 @@ def _score_content_and_engagement_with_qwen(
             bool(fallback_engagement_metrics.get("benefit_matches")),
         ),
     }
+    hook_score = _round_score(_safe_float(payload.get("hook_score"), default=0.0))
+    hook_summary = str(payload.get("hook_summary") or "").strip()
+    if not hook_summary:
+        hook_summary = "Kekuatan pembukaan dinilai dari sinyal produk, benefit, promo, atau masalah kulit."
 
     return {
         "content": {
@@ -1803,87 +1941,29 @@ def _score_content_and_engagement_with_qwen(
                 "raw_response": raw[:1000],
             },
         },
+        "hook": {
+            "score": hook_score,
+            "summary": hook_summary,
+            "metrics": {
+                "source": "qwen_combined",
+                "window_seconds": 8.0,
+                "text_source": hook_source,
+                "text": hook_text,
+                "raw_response": raw[:500],
+            },
+        },
     }
 
 
-def _score_hook_with_qwen(transcript: Any, product_name: str, cfg) -> dict[str, Any]:
-    hook_text = _first_seconds_transcript_text(transcript, seconds=8.0)
-    if hook_text is None:
-        return {
-            "score": None,
-            "summary": "",
-            "metrics": {
-                "source": "skipped_no_word_timestamps",
-                "window_seconds": 8.0,
-            },
-        }
-    if not hook_text.strip():
-        return {
-            "score": 0.0,
-            "summary": "Pembukaan kosong sehingga kekuatan hook tidak bisa dinilai.",
-            "metrics": {
-                "source": "empty_hook_window",
-                "window_seconds": 8.0,
-                "text": "",
-            },
-        }
-
-    try:
-        from openai import OpenAI
-    except ImportError as exc:
-        raise RuntimeError("openai package is not installed") from exc
-
-    client = OpenAI(
-        base_url=getattr(cfg, "LM_STUDIO_BASE_URL", "http://localhost:1234/v1"),
-        api_key=getattr(cfg, "LM_STUDIO_API_KEY", "lm-studio"),
-    )
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "Kamu adalah evaluator hook pembuka clip livestream skincare PROYA. "
-                "Nilai hanya dari transkrip 8 detik pertama. "
-                "Kembalikan hanya JSON valid tanpa markdown dan gunakan Bahasa Indonesia."
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                "Produk target: "
-                f"{product_name or 'general'}\n\n"
-                "Tugas:\n"
-                "Beri hook_score 0 sampai 10 untuk kekuatan pembukaan. Skor tinggi jika pembukaan "
-                "langsung menyebut produk, benefit, harga/promo, atau pertanyaan hook yang membuat penonton berhenti scroll. "
-                "Beri hook_summary satu kalimat Bahasa Indonesia.\n\n"
-                "Format JSON wajib:\n"
-                "{\"hook_score\": 0.0, \"hook_summary\": \"satu kalimat Bahasa Indonesia\"}\n\n"
-                "Transkrip 8 detik pertama:\n"
-                f"{hook_text[:2000]}"
-            ),
-        },
-    ]
-    response = client.chat.completions.create(
-        model=getattr(cfg, "LM_STUDIO_MODEL", "qwen/qwen3.6-27b"),
-        messages=messages,
-        temperature=0.0,
-        max_tokens=160,
-        timeout=min(float(getattr(cfg, "LM_STUDIO_TIMEOUT", 120)), 120.0),
-    )
-    raw = (response.choices[0].message.content or "").strip()
-    payload = _parse_json_object(raw)
-    summary = str(payload.get("hook_summary") or "").strip()
-    if not summary:
-        summary = "Kekuatan pembukaan dinilai dari sinyal produk, benefit, harga, atau pertanyaan hook."
-    return {
-        "score": _round_score(_safe_float(payload.get("hook_score"), default=0.0)),
-        "summary": summary,
-        "metrics": {
-            "source": "qwen",
-            "window_seconds": 8.0,
-            "text": hook_text,
-            "raw_response": raw[:500],
-        },
-    }
+def _hook_text_for_combined_prompt(transcript: Any, transcript_text: str, seconds: float = 8.0) -> tuple[str, str]:
+    hook_text = _first_seconds_transcript_text(transcript, seconds=seconds)
+    if hook_text is not None:
+        return hook_text.strip(), "word_timestamps"
+    words = str(transcript_text or "").split()
+    if not words:
+        return "", "text_excerpt"
+    # Without word timestamps, use a compact early-text proxy so hook scoring stays in the merged call.
+    return " ".join(words[:40]).strip(), "text_excerpt"
 
 
 def _first_seconds_transcript_text(transcript: Any, seconds: float) -> str | None:
@@ -1928,11 +2008,19 @@ def _transcript_words_with_timestamps(transcript: Any) -> list[dict[str, Any]] |
     return output
 
 
+class _ContactSheetVisionError(RuntimeError):
+    def __init__(self, message: str, actual_calls: int = 0):
+        super().__init__(message)
+        self.actual_calls = max(0, int(actual_calls or 0))
+
+
 def _score_host_focus_with_qwen_vl(
     clip_path: Path,
     cfg,
     frame_sample_rate: int,
     clip_id: str | None = None,
+    contact_sheet_override: bool | None = None,
+    contact_sheet_frame_strategy: bool | None = None,
 ) -> dict[str, Any]:
     try:
         import cv2
@@ -1957,50 +2045,39 @@ def _score_host_focus_with_qwen_vl(
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-    frame_idx = 0
-    sampled = 0
-    skipped_initial_frame = False
     skip_first_frame = bool(getattr(cfg, "SCORER_FOCUS_SKIP_FIRST_FRAME", True))
-    counts = {"A": 0, "B": 0, "C": 0, "unknown": 0}
-    samples: list[dict[str, Any]] = []
-    debug_frames: list[dict[str, Any]] = []
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if frame_idx % frame_sample_rate != 0:
-            frame_idx += 1
-            continue
-        if skip_first_frame and frame_idx == 0:
-            skipped_initial_frame = True
-            frame_idx += 1
-            continue
-
-        encoded = _encode_frame_as_jpeg_base64(cv2, frame)
-        timestamp = (frame_idx / fps) if fps > 0 else None
-        label, raw = _classify_host_focus_frame(
-            client,
-            model_name,
-            encoded,
-            timeout,
+    contact_sheet_enabled = (
+        bool(getattr(cfg, "SCORER_VISION_CONTACT_SHEET", False))
+        if contact_sheet_override is None
+        else bool(contact_sheet_override)
+    )
+    use_contact_sheet_strategy = (
+        bool(contact_sheet_frame_strategy)
+        if contact_sheet_frame_strategy is not None
+        else contact_sheet_enabled
+    )
+    selection_metrics: dict[str, Any] = {}
+    if use_contact_sheet_strategy:
+        sampled_frames, skipped_initial_frame, selection_metrics = _sample_host_focus_contact_sheet_frames(
+            cv2,
+            cap,
+            total_frames,
+            fps,
+            cfg,
+            skip_first_frame,
         )
-        normalized_label = label if label in counts else "unknown"
-        confidence = _host_focus_label_confidence(normalized_label, raw)
-        sample = {
-            "frame": frame_idx,
-            "time": round(timestamp, 3) if timestamp is not None else None,
-            "label": normalized_label,
-            "raw": raw[:120],
-            "confidence": confidence,
-        }
-        samples.append(sample)
-        debug_frames.append({"frame": frame.copy(), "sample": sample})
-        sampled += 1
-        frame_idx += 1
+    else:
+        sampled_frames, skipped_initial_frame = _sample_host_focus_uniform_frames(
+            cv2,
+            cap,
+            frame_sample_rate,
+            fps,
+            skip_first_frame,
+        )
 
     cap.release()
 
+    sampled = len(sampled_frames)
     if sampled == 0:
         return {
             "score": None,
@@ -2011,8 +2088,75 @@ def _score_host_focus_with_qwen_vl(
                 "frame_sample_rate": frame_sample_rate,
                 "skip_first_frame": skip_first_frame,
                 "skipped_initial_frame": skipped_initial_frame,
+                "actual_vision_qwen_calls": 0,
             },
         }
+
+    samples: list[dict[str, Any]] = []
+    debug_frames: list[dict[str, Any]] = []
+    actual_vision_qwen_calls = 0
+    contact_sheet_used = False
+    contact_sheet_fallback = False
+    contact_sheet_error = ""
+    contact_sheet_metrics: dict[str, Any] = {}
+
+    if contact_sheet_enabled:
+        try:
+            labels, raw, calls, contact_sheet_metrics = _classify_host_focus_contact_sheet(
+                client,
+                model_name,
+                cv2,
+                sampled_frames,
+                timeout,
+                max(256, int(getattr(cfg, "SCORER_VISION_CONTACT_SHEET_CELL_SIZE", 384) or 384)),
+            )
+            actual_vision_qwen_calls += calls
+            fallback_reason = _contact_sheet_fallback_reason(labels)
+            if fallback_reason:
+                raise _ContactSheetVisionError(fallback_reason, 0)
+            contact_sheet_used = True
+            for item, label in zip(sampled_frames, labels):
+                normalized_label = label if label in {"A", "B", "C"} else "unknown"
+                sample = {
+                    "frame": item["frame"],
+                    "time": item["time"],
+                    "label": normalized_label,
+                    "raw": raw[:120],
+                    "confidence": 1.0 if normalized_label != "unknown" else 0.0,
+                }
+                samples.append(sample)
+                debug_frames.append({"frame": item["image"].copy(), "sample": sample})
+        except _ContactSheetVisionError as exc:
+            actual_vision_qwen_calls += exc.actual_calls
+            contact_sheet_fallback = True
+            contact_sheet_error = str(exc)
+            log.info(
+                "Contact-sheet host focus scoring fell back to per-frame mode for %s: %s",
+                clip_path,
+                exc,
+            )
+
+    if not samples:
+        for item in sampled_frames:
+            encoded = _encode_frame_as_jpeg_base64(cv2, item["image"])
+            actual_vision_qwen_calls += 1
+            label, raw = _classify_host_focus_frame(
+                client,
+                model_name,
+                encoded,
+                timeout,
+            )
+            normalized_label = label if label in {"A", "B", "C"} else "unknown"
+            confidence = _host_focus_label_confidence(normalized_label, raw)
+            sample = {
+                "frame": item["frame"],
+                "time": item["time"],
+                "label": normalized_label,
+                "raw": raw[:120],
+                "confidence": confidence,
+            }
+            samples.append(sample)
+            debug_frames.append({"frame": item["image"].copy(), "sample": sample})
 
     scoring_samples = samples
     outlier_dropped = None
@@ -2024,6 +2168,7 @@ def _score_host_focus_with_qwen_vl(
                 sample for idx, sample in enumerate(samples) if idx != outlier_dropped
             ]
 
+    counts = {"A": 0, "B": 0, "C": 0, "unknown": 0}
     scoring_counts = {"A": 0, "B": 0, "C": 0, "unknown": 0}
     for sample in scoring_samples:
         label = str(sample.get("label") or "unknown")
@@ -2039,6 +2184,8 @@ def _score_host_focus_with_qwen_vl(
     unknown_ratio = scoring_counts["unknown"] / total_scored
     score = _round_score(focus_ratio * 10.0)
     flags = []
+    if contact_sheet_fallback:
+        flags.append("contact_sheet_fallback")
     if focus_ratio >= 0.60:
         flags.append("host_focused")
     if phone_ratio >= 0.20:
@@ -2074,9 +2221,23 @@ def _score_host_focus_with_qwen_vl(
             "total_frames": total_frames,
             "fps": round(fps, 3) if fps > 0 else None,
             "frame_sample_rate": frame_sample_rate,
+            "frame_selection": selection_metrics or {"strategy": "uniform"},
+            "actual_vision_qwen_calls": actual_vision_qwen_calls,
+            "request_mode": (
+                "contact_sheet"
+                if contact_sheet_used
+                else "contact_sheet_fallback"
+                if contact_sheet_fallback
+                else "per_frame"
+            ),
+            "contact_sheet_enabled": contact_sheet_enabled,
+            "contact_sheet_used": contact_sheet_used,
+            "contact_sheet_fallback": contact_sheet_fallback,
+            "contact_sheet_error": contact_sheet_error,
+            "contact_sheet": contact_sheet_metrics,
             "skip_first_frame": skip_first_frame,
             "skipped_initial_frame": skipped_initial_frame,
-            "encoded_frame_size": "512x512",
+            "encoded_frame_size": "contact_sheet" if contact_sheet_used else "512x512",
             "counts": counts,
             "scoring_counts": scoring_counts,
             "ratios": {
@@ -2090,6 +2251,185 @@ def _score_host_focus_with_qwen_vl(
             "debug": debug_paths,
         },
     }
+
+
+def _sample_host_focus_uniform_frames(
+    cv2_module,
+    cap,
+    frame_sample_rate: int,
+    fps: float,
+    skip_first_frame: bool,
+) -> tuple[list[dict[str, Any]], bool]:
+    frame_idx = 0
+    skipped_initial_frame = False
+    sampled_frames: list[dict[str, Any]] = []
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if frame_idx % frame_sample_rate != 0:
+            frame_idx += 1
+            continue
+        if skip_first_frame and frame_idx == 0:
+            skipped_initial_frame = True
+            frame_idx += 1
+            continue
+
+        timestamp = (frame_idx / fps) if fps > 0 else None
+        sampled_frames.append(
+            {
+                "frame": frame_idx,
+                "time": round(timestamp, 3) if timestamp is not None else None,
+                "image": frame.copy(),
+                "selection_reasons": ["uniform"],
+            }
+        )
+        frame_idx += 1
+    return sampled_frames, skipped_initial_frame
+
+
+def _sample_host_focus_contact_sheet_frames(
+    cv2_module,
+    cap,
+    total_frames: int,
+    fps: float,
+    cfg,
+    skip_first_frame: bool,
+) -> tuple[list[dict[str, Any]], bool, dict[str, Any]]:
+    max_frames = max(1, int(getattr(cfg, "SCORER_VISION_CONTACT_SHEET_MAX_FRAMES", 6) or 6))
+    if total_frames <= 0:
+        sampled, skipped = _sample_host_focus_uniform_frames(
+            cv2_module,
+            cap,
+            max(1, int(getattr(cfg, "SCORER_VISION_FRAME_SAMPLE_RATE", 150) or 150)),
+            fps,
+            skip_first_frame,
+        )
+        return sampled[:max_frames], skipped, {
+            "strategy": "uniform_fallback_unknown_frame_count",
+            "max_frames": max_frames,
+        }
+
+    min_frame = 1 if skip_first_frame and total_frames > 1 else 0
+    max_frame = max(min_frame, total_frames - 1)
+    skipped_initial_frame = bool(skip_first_frame and min_frame > 0)
+    candidates: dict[int, dict[str, Any]] = {}
+    anchors = [
+        (0.0, "beginning"),
+        (0.25, "quarter_25"),
+        (0.50, "midpoint_50"),
+        (0.75, "quarter_75"),
+        (1.0, "end"),
+    ]
+    span = max(0, max_frame - min_frame)
+    for ratio, reason in anchors:
+        frame_idx = int(round(min_frame + span * ratio))
+        frame_idx = max(min_frame, min(max_frame, frame_idx))
+        candidates.setdefault(frame_idx, {"selection_reasons": []})["selection_reasons"].append(reason)
+
+    motion_blur_pick = _lowest_motion_blur_candidate(cv2_module, cap, min_frame, max_frame, fps)
+    if motion_blur_pick is not None:
+        frame_idx, motion_blur_score, sharpness_score = motion_blur_pick
+        item = candidates.setdefault(frame_idx, {"selection_reasons": []})
+        item["selection_reasons"].append("lowest_motion_blur")
+        item["motion_blur_score"] = motion_blur_score
+        item["sharpness_score"] = sharpness_score
+
+    selected_frames = sorted(candidates)
+    if len(selected_frames) > max_frames:
+        priority = {
+            "beginning": 0,
+            "quarter_25": 1,
+            "midpoint_50": 2,
+            "quarter_75": 3,
+            "end": 4,
+            "lowest_motion_blur": 5,
+        }
+        selected_frames = sorted(
+            selected_frames,
+            key=lambda idx: min(priority.get(reason, 99) for reason in candidates[idx].get("selection_reasons", [])),
+        )[:max_frames]
+        selected_frames.sort()
+
+    sampled_frames: list[dict[str, Any]] = []
+    failed_reads = []
+    for frame_idx in selected_frames:
+        frame = _read_video_frame_at(cv2_module, cap, frame_idx)
+        if frame is None:
+            failed_reads.append(frame_idx)
+            continue
+        timestamp = (frame_idx / fps) if fps > 0 else None
+        meta = candidates.get(frame_idx, {})
+        sampled_frames.append(
+            {
+                "frame": frame_idx,
+                "time": round(timestamp, 3) if timestamp is not None else None,
+                "image": frame.copy(),
+                "selection_reasons": _dedupe_flags(meta.get("selection_reasons", [])),
+                "motion_blur_score": meta.get("motion_blur_score"),
+                "sharpness_score": meta.get("sharpness_score"),
+            }
+        )
+
+    return sampled_frames, skipped_initial_frame, {
+        "strategy": "contact_sheet_change_points",
+        "max_frames": max_frames,
+        "selected_frames": [item["frame"] for item in sampled_frames],
+        "selected_reasons": [
+            {"frame": item["frame"], "reasons": item.get("selection_reasons", [])}
+            for item in sampled_frames
+        ],
+        "failed_reads": failed_reads,
+        "motion_blur_candidate": (
+            {
+                "frame": motion_blur_pick[0],
+                "motion_blur_score": round(motion_blur_pick[1], 6),
+                "sharpness_score": round(motion_blur_pick[2], 3),
+            }
+            if motion_blur_pick is not None
+            else None
+        ),
+    }
+
+
+def _lowest_motion_blur_candidate(
+    cv2_module,
+    cap,
+    min_frame: int,
+    max_frame: int,
+    fps: float,
+) -> tuple[int, float, float] | None:
+    if max_frame < min_frame:
+        return None
+    probe_count = min(24, max_frame - min_frame + 1)
+    if probe_count <= 0:
+        return None
+    indexes = []
+    if probe_count == 1:
+        indexes = [min_frame]
+    else:
+        span = max_frame - min_frame
+        indexes = [
+            int(round(min_frame + span * (idx / (probe_count - 1))))
+            for idx in range(probe_count)
+        ]
+    best: tuple[int, float, float] | None = None
+    for frame_idx in sorted(set(indexes)):
+        frame = _read_video_frame_at(cv2_module, cap, frame_idx)
+        if frame is None:
+            continue
+        gray = cv2_module.cvtColor(frame, cv2_module.COLOR_BGR2GRAY)
+        sharpness_score = float(cv2_module.Laplacian(gray, cv2_module.CV_64F).var())
+        motion_blur_score = 1.0 / max(sharpness_score, 0.000001)
+        if best is None or motion_blur_score < best[1]:
+            best = (frame_idx, motion_blur_score, sharpness_score)
+    return best
+
+
+def _read_video_frame_at(cv2_module, cap, frame_idx: int):
+    cap.set(cv2_module.CAP_PROP_POS_FRAMES, int(max(0, frame_idx)))
+    ret, frame = cap.read()
+    return frame if ret else None
 
 
 def _host_focus_label_confidence(label: str, raw: str) -> float:
@@ -2202,6 +2542,142 @@ def _write_host_focus_debug_artifacts(
         "contact_sheet_path": str(image_path.resolve()),
         "breakdown_path": str(json_path.resolve()),
     }
+
+
+def _classify_host_focus_contact_sheet(
+    client,
+    model_name: str,
+    cv2_module,
+    sampled_frames: list[dict[str, Any]],
+    timeout: float,
+    cell_size: int = 384,
+) -> tuple[list[str], str, int, dict[str, Any]]:
+    if not sampled_frames:
+        return [], "", 0, {}
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise _ContactSheetVisionError("numpy is required to build the contact sheet", 0) from exc
+
+    cell_size = max(256, int(cell_size or 384))
+    columns = 2
+    rows = math.ceil(len(sampled_frames) / columns)
+    blank = np.full((cell_size, cell_size, 3), 245, dtype=sampled_frames[0]["image"].dtype)
+    cells = []
+    for idx, item in enumerate(sampled_frames, start=1):
+        thumb = cv2_module.resize(item["image"], (cell_size, cell_size), interpolation=cv2_module.INTER_AREA)
+        cv2_module.rectangle(thumb, (0, 0), (54, 36), (0, 0, 0), -1)
+        cv2_module.putText(
+            thumb,
+            str(idx),
+            (10, 26),
+            cv2_module.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2,
+            cv2_module.LINE_AA,
+        )
+        cells.append(thumb)
+    while len(cells) < rows * columns:
+        cells.append(blank.copy())
+
+    grid_rows = []
+    for row_idx in range(rows):
+        grid_rows.append(np.hstack(cells[row_idx * columns : (row_idx + 1) * columns]))
+    sheet = np.vstack(grid_rows)
+    ok, buffer = cv2_module.imencode(".jpg", sheet, [int(cv2_module.IMWRITE_JPEG_QUALITY), 88])
+    if not ok:
+        raise _ContactSheetVisionError("could not encode contact sheet as JPEG", 0)
+    image_base64 = base64.b64encode(buffer.tobytes()).decode("ascii")
+    expected_count = len(sampled_frames)
+    prompt = (
+        f"Ini adalah grid 2 kolom berisi {expected_count} frame dari video yang sama. "
+        "Frame dinomori dari kiri ke kanan, atas ke bawah mulai dari 1. "
+        "Untuk setiap frame, kategorikan aktivitas host dengan huruf A, B, atau C. "
+        "Kembalikan JSON: {\"labels\": [\"A\", \"B\", ...]}\n\n"
+        "Untuk setiap nomor, klasifikasikan aktivitas host:\n"
+        "(A) Host berbicara dan terlibat dengan siaran, termasuk melihat layar chat, menghadap kamera, "
+        "atau berbicara sambil melihat ke arah manapun yang wajar untuk livestream.\n"
+        "(B) Host melihat ke bawah ke ponsel atau perangkat pribadi yang dipegang di tangan.\n"
+        "(C) Host tidak memperhatikan siaran, sedang dandan, merapikan rambut, berbicara dengan orang "
+        "lain di luar kamera, atau membelakangi kamera.\n\n"
+        f"Kembalikan hanya JSON valid dengan tepat {expected_count} label sesuai urutan nomor 1 sampai "
+        f"{expected_count}."
+    )
+    actual_calls = 0
+    try:
+        actual_calls += 1
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_base64}",
+                            },
+                        },
+                    ],
+                }
+            ],
+            temperature=0.0,
+            max_tokens=max(64, expected_count * 8),
+            timeout=timeout,
+        )
+    except Exception as exc:
+        raise _ContactSheetVisionError(str(exc), actual_calls) from exc
+
+    raw = (response.choices[0].message.content or "").strip()
+    labels = _parse_contact_sheet_labels(raw)
+    if len(labels) != expected_count:
+        raise _ContactSheetVisionError(
+            f"expected {expected_count} labels, got {len(labels)}",
+            actual_calls,
+        )
+    normalized_labels = [str(label or "").strip().upper() for label in labels]
+    invalid = [label for label in normalized_labels if label not in {"A", "B", "C"}]
+    if invalid:
+        raise _ContactSheetVisionError(
+            f"invalid labels returned: {invalid[:5]}",
+            actual_calls,
+        )
+    return normalized_labels, raw, actual_calls, {
+        "columns": columns,
+        "rows": rows,
+        "cell_size": cell_size,
+        "image_size": f"{columns * cell_size}x{rows * cell_size}",
+        "raw_response": raw[:1000],
+    }
+
+
+def _parse_contact_sheet_labels(raw: str) -> list[str]:
+    try:
+        payload = _parse_json_object(raw)
+        labels = payload.get("labels", []) if isinstance(payload, dict) else []
+    except Exception:
+        labels = []
+    if not labels:
+        match = re.search(r"\[[\s\S]*\]", str(raw or ""))
+        if match:
+            try:
+                payload = json.loads(match.group(0))
+                labels = payload if isinstance(payload, list) else []
+            except Exception:
+                labels = []
+    if not isinstance(labels, list):
+        return []
+    return [str(label).strip().upper() for label in labels]
+
+
+def _contact_sheet_fallback_reason(labels: list[str]) -> str:
+    normalized = [str(label or "").strip().upper() for label in labels]
+    non_a = {label for label in normalized if label in {"B", "C"}}
+    if len(non_a) >= 2:
+        return "contact_sheet_ambiguous_mixed_non_a_labels"
+    return ""
 
 
 def _classify_host_focus_frame(client, model_name: str, image_base64: str, timeout: float) -> tuple[str, str]:
@@ -3156,6 +3632,185 @@ def _write_json_atomic(path: Path, payload: Any) -> None:
     temp_path.replace(path)
 
 
+def validate_contact_sheet_scoring(
+    output_dir: str | Path,
+    cfg=None,
+    limit: int = 10,
+) -> dict[str, Any]:
+    """Compare strategic per-frame host-focus labels against contact-sheet labels."""
+    if cfg is None:
+        import config as cfg  # type: ignore
+
+    folder = Path(output_dir)
+    if not folder.exists():
+        raise FileNotFoundError(f"Output directory not found: {folder}")
+
+    clip_paths = _contact_sheet_validation_clip_paths(folder, limit)
+    if not clip_paths:
+        raise FileNotFoundError(f"No rendered .mp4 clips found for validation in {folder}")
+
+    frame_sample_rate = max(1, int(getattr(cfg, "SCORER_VISION_FRAME_SAMPLE_RATE", 150) or 150))
+    rows = []
+    started = time.time()
+    for index, clip_path in enumerate(clip_paths, start=1):
+        print(f"[{index}/{len(clip_paths)}] per-frame strategic: {clip_path}", flush=True)
+        per_frame = _score_host_focus_with_qwen_vl(
+            clip_path,
+            cfg,
+            frame_sample_rate,
+            clip_id=f"validation_{index:02d}_per_frame",
+            contact_sheet_override=False,
+            contact_sheet_frame_strategy=True,
+        )
+        print(f"[{index}/{len(clip_paths)}] contact sheet:       {clip_path}", flush=True)
+        contact_sheet = _score_host_focus_with_qwen_vl(
+            clip_path,
+            cfg,
+            frame_sample_rate,
+            clip_id=f"validation_{index:02d}_contact_sheet",
+            contact_sheet_override=True,
+            contact_sheet_frame_strategy=True,
+        )
+        per_score = per_frame.get("score")
+        contact_score = contact_sheet.get("score")
+        delta = None
+        if per_score is not None and contact_score is not None:
+            delta = abs(float(per_score) - float(contact_score))
+        per_metrics = per_frame.get("metrics", {}) if isinstance(per_frame, dict) else {}
+        contact_metrics = contact_sheet.get("metrics", {}) if isinstance(contact_sheet, dict) else {}
+        row = {
+            "clip_path": str(clip_path.resolve()),
+            "per_frame_score": per_score,
+            "contact_sheet_score": contact_score,
+            "delta": round(delta, 4) if delta is not None else None,
+            "per_frame_calls": per_metrics.get("actual_vision_qwen_calls"),
+            "contact_sheet_calls": contact_metrics.get("actual_vision_qwen_calls"),
+            "contact_sheet_fallback": bool(contact_metrics.get("contact_sheet_fallback")),
+            "contact_sheet_error": contact_metrics.get("contact_sheet_error", ""),
+            "sampled_frames": contact_metrics.get("sampled_frames"),
+            "frame_selection": contact_metrics.get("frame_selection", {}),
+            "per_frame_flags": per_frame.get("flags", []),
+            "contact_sheet_flags": contact_sheet.get("flags", []),
+        }
+        rows.append(row)
+        print(
+            f"[{index}/{len(clip_paths)}] scores per={per_score} "
+            f"contact={contact_score} delta={row['delta']}",
+            flush=True,
+        )
+
+    deltas = [float(row["delta"]) for row in rows if row.get("delta") is not None]
+    average_delta = sum(deltas) / len(deltas) if deltas else None
+    max_delta = max(deltas) if deltas else None
+    passed_gate = bool(deltas) and average_delta <= 1.0 and max_delta <= 2.0
+    report = {
+        "created_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        "output_dir": str(folder.resolve()),
+        "validation_mode": "strategic_per_frame_vs_contact_sheet",
+        "sample_size": len(rows),
+        "comparable_count": len(deltas),
+        "average_delta": round(average_delta, 4) if average_delta is not None else None,
+        "max_delta": round(max_delta, 4) if max_delta is not None else None,
+        "passed_gate": passed_gate,
+        "thresholds": {"average_delta_max": 1.0, "max_delta_max": 2.0},
+        "frame_sample_rate": frame_sample_rate,
+        "contact_sheet_max_frames": max(1, int(getattr(cfg, "SCORER_VISION_CONTACT_SHEET_MAX_FRAMES", 6) or 6)),
+        "contact_sheet_cell_size": max(256, int(getattr(cfg, "SCORER_VISION_CONTACT_SHEET_CELL_SIZE", 384) or 384)),
+        "duration_seconds": round(time.time() - started, 2),
+        "rows": rows,
+    }
+    report_path = folder / "contact_sheet_validation.json"
+    _write_json_atomic(report_path, report)
+    report["report_path"] = str(report_path.resolve())
+    print(f"Validation report: {report_path.resolve()}")
+    print(
+        json.dumps(
+            {
+                "sample_size": report["sample_size"],
+                "comparable_count": report["comparable_count"],
+                "average_delta": report["average_delta"],
+                "max_delta": report["max_delta"],
+                "passed_gate": report["passed_gate"],
+                "duration_seconds": report["duration_seconds"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return report
+
+
+def _contact_sheet_validation_clip_paths(folder: Path, limit: int) -> list[Path]:
+    limit = max(1, int(limit or 10))
+    seen: set[str] = set()
+    paths: list[Path] = []
+
+    def add_path(value: Any) -> None:
+        if len(paths) >= limit:
+            return
+        text = str(value or "").strip()
+        if not text:
+            return
+        candidate = Path(text)
+        if not candidate.is_absolute():
+            candidate = folder / text.replace("\\", "/")
+        if not candidate.exists() and candidate.name:
+            matches = list(folder.rglob(candidate.name))
+            if matches:
+                candidate = matches[0]
+        if not candidate.exists() or not candidate.is_file() or candidate.suffix.lower() != ".mp4":
+            return
+        try:
+            key = str(candidate.resolve()).casefold()
+        except OSError:
+            key = str(candidate).casefold()
+        if key in seen:
+            return
+        seen.add(key)
+        paths.append(candidate)
+
+    summary_path = folder / "scores_summary.json"
+    if summary_path.exists():
+        try:
+            payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {}
+        groups = payload.get("groups", []) if isinstance(payload, dict) else []
+        if isinstance(groups, list):
+            for group in groups:
+                if isinstance(group, dict):
+                    add_path(group.get("representative_clip_path") or group.get("clip_path"))
+                    if len(paths) >= limit:
+                        break
+        clips = payload.get("clips", []) if isinstance(payload, dict) else []
+        if isinstance(clips, list) and len(paths) < limit:
+            for clip in clips:
+                if isinstance(clip, dict):
+                    add_path(clip.get("clip_path"))
+                    if len(paths) >= limit:
+                        break
+
+    manifest_path = folder / "manifest.json"
+    if manifest_path.exists() and len(paths) < limit:
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            manifest = []
+        if isinstance(manifest, list):
+            for row in manifest:
+                if isinstance(row, dict):
+                    add_path(row.get("output_file"))
+                    if len(paths) >= limit:
+                        break
+
+    if len(paths) < limit:
+        for path in sorted(folder.rglob("*.mp4"), key=lambda item: str(item).casefold()):
+            add_path(path)
+            if len(paths) >= limit:
+                break
+    return paths
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -3186,6 +3841,17 @@ if __name__ == "__main__":
         help="Enable optional Qwen2.5-VL host_focus_score for this run",
     )
     parser.add_argument(
+        "--validate-contact-sheet",
+        action="store_true",
+        help="Compare strategic per-frame Qwen-VL labels against contact-sheet batching",
+    )
+    parser.add_argument(
+        "--validation-limit",
+        type=int,
+        default=10,
+        help="Maximum rendered clips to use for --validate-contact-sheet",
+    )
+    parser.add_argument(
         "--vision-base-url",
         help="OpenAI-compatible LM Studio endpoint for the vision model, e.g. http://localhost:1235/v1",
     )
@@ -3213,7 +3879,11 @@ if __name__ == "__main__":
     if args.vision_timeout is not None:
         cfg.SCORER_VISION_TIMEOUT = args.vision_timeout
 
-    if args.output_dir:
+    if args.validate_contact_sheet:
+        if not args.output_dir:
+            parser.error("--validate-contact-sheet requires --output-dir")
+        validate_contact_sheet_scoring(args.output_dir, cfg=cfg, limit=args.validation_limit)
+    elif args.output_dir:
         scores = score_output_tree(
             args.output_dir,
             working_root=args.working_dir,

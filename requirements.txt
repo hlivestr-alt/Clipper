@@ -12,3 +12,4 @@ altair>=5.0.0
 pytest>=8.0.0
 torch
 transformers
+portalocker>=2.8.0
