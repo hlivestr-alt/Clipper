@@ -203,7 +203,8 @@ class VideoQueueRunner:
             return PAUSED_EXIT_CODE
         self._start_workers()
         with self.state_lock:
-            self.state["queue_status"] = "running"
+            self._mark_queue_running_locked()
+            self._save_state_locked()
             self._schedule_locked("bootstrap")
 
         try:
@@ -242,7 +243,7 @@ class VideoQueueRunner:
             self._stop_workers()
 
         with self.state_lock:
-            self.state["queue_status"] = "completed"
+            self._mark_queue_completed_locked()
             self._save_state_locked()
             active_video_keys = self._active_video_keys_locked()
             completed = sum(
@@ -289,6 +290,8 @@ class VideoQueueRunner:
         state.setdefault("queue_status", "idle")
         state.setdefault("control_file", self.control_path)
         state.setdefault("videos", {})
+        if state.get("queue_status") != queue_control.PAUSED_STATUS:
+            state.pop("paused_at", None)
         for entry in state["videos"].values():
             if isinstance(entry, dict):
                 entry.setdefault("run_history", [])
@@ -490,6 +493,7 @@ class VideoQueueRunner:
             stage_state = entry["stages"][job.stage]
             if self._pause_requested():
                 stage_state["queued"] = False
+                stage_state["queued_at"] = None
                 if stage_state.get("status") == "queued":
                     stage_state["status"] = "pending"
                 if entry.get("status") == "queued":
@@ -497,13 +501,24 @@ class VideoQueueRunner:
                 self._save_state_locked()
                 return
             if stage_state["status"] == "done":
+                stage_state["queued"] = False
+                stage_state["queued_at"] = None
+                if entry.get("current_stage") == job.stage:
+                    entry["current_stage"] = None
+                self._save_state_locked()
                 return
             if entry["status"] in TERMINAL_VIDEO_STATUSES:
+                stage_state["queued"] = False
+                stage_state["queued_at"] = None
+                if entry.get("current_stage") == job.stage:
+                    entry["current_stage"] = None
+                self._save_state_locked()
                 return
 
             attempt = int(stage_state.get("attempts", 0)) + 1
             stage_state["attempts"] = attempt
             stage_state["queued"] = False
+            stage_state["queued_at"] = None
             stage_state["status"] = "running"
             stage_state["started_at"] = self._now_iso()
             stage_state["last_error"] = None
@@ -539,9 +554,14 @@ class VideoQueueRunner:
             entry = self.state["videos"][job.video_path]
             stage_state = entry["stages"][job.stage]
             stage_state["status"] = "done"
+            stage_state["queued"] = False
+            stage_state["queued_at"] = None
             stage_state["finished_at"] = self._now_iso()
             stage_state["duration_sec"] = round(duration, 3)
             stage_state["last_error"] = None
+            if job.stage == EDIT_STAGE:
+                stage_state["active_clip_renders"] = 0
+                stage_state["render_paused"] = False
             entry["current_stage"] = None
             next_stage = self._next_stage_locked(entry)
             if next_stage is None:
@@ -566,6 +586,8 @@ class VideoQueueRunner:
             stage_state = entry["stages"][job.stage]
             attempts = int(stage_state.get("attempts", 0))
             stage_state["status"] = "failed"
+            stage_state["queued"] = False
+            stage_state["queued_at"] = None
             stage_state["finished_at"] = self._now_iso()
             stage_state["duration_sec"] = round(duration, 3)
             stage_state["last_error"] = error_text
@@ -574,6 +596,9 @@ class VideoQueueRunner:
             if attempts <= self.max_retries:
                 retry_job = True
                 entry["status"] = "queued"
+                stage_state["status"] = "pending"
+                stage_state["finished_at"] = None
+                stage_state["duration_sec"] = None
                 self._enqueue_stage_locked(job.video_path, job.stage, reason="retry")
             else:
                 entry["status"] = "failed"
@@ -599,6 +624,7 @@ class VideoQueueRunner:
             stage_state = entry["stages"][job.stage]
             stage_state["status"] = "paused"
             stage_state["queued"] = False
+            stage_state["queued_at"] = None
             stage_state["finished_at"] = self._now_iso()
             stage_state["duration_sec"] = round(duration, 3)
             stage_state["last_error"] = None
@@ -627,6 +653,7 @@ class VideoQueueRunner:
             if stage_state.get("status") in {"pending", "queued", "running", "paused"}:
                 stage_state["status"] = "skipped"
                 stage_state["queued"] = False
+                stage_state["queued_at"] = None
                 stage_state["finished_at"] = stage_state.get("finished_at") or self._now_iso()
 
     def _mark_job_crashed(self, job: StageJob, exc: Exception) -> None:
@@ -638,6 +665,7 @@ class VideoQueueRunner:
             if stage_state is None:
                 return
             stage_state["queued"] = False
+            stage_state["queued_at"] = None
             stage_state["status"] = "failed"
             stage_state["finished_at"] = self._now_iso()
             stage_state["last_error"] = f"{type(exc).__name__}: {exc}"
@@ -721,6 +749,7 @@ class VideoQueueRunner:
 
         original_max_parallel_clips = getattr(self.cfg, "MAX_PARALLEL_CLIPS", None)
         original_ffmpeg_priority_flag = os.environ.get("PROYA_QUEUE_FFMPEG_BELOW_NORMAL")
+        original_export_async_flag = os.environ.get("PROYA_QUEUE_EXPORT_PACKAGING_ASYNC")
         if self.ffmpeg_max_parallel_clips is not None:
             log.info(
                 "Queue FFmpeg throttle active: "
@@ -728,6 +757,7 @@ class VideoQueueRunner:
             )
             self.cfg.MAX_PARALLEL_CLIPS = self.ffmpeg_max_parallel_clips
             os.environ["PROYA_QUEUE_FFMPEG_BELOW_NORMAL"] = "1"
+        os.environ["PROYA_QUEUE_EXPORT_PACKAGING_ASYNC"] = "1"
 
         try:
             try:
@@ -761,6 +791,10 @@ class VideoQueueRunner:
                 os.environ.pop("PROYA_QUEUE_FFMPEG_BELOW_NORMAL", None)
             else:
                 os.environ["PROYA_QUEUE_FFMPEG_BELOW_NORMAL"] = original_ffmpeg_priority_flag
+            if original_export_async_flag is None:
+                os.environ.pop("PROYA_QUEUE_EXPORT_PACKAGING_ASYNC", None)
+            else:
+                os.environ["PROYA_QUEUE_EXPORT_PACKAGING_ASYNC"] = original_export_async_flag
 
     def _handle_ffmpeg_progress(self, video_path: str, stage: str, pct: int, message: str, **payload) -> None:
         with self.state_lock:
@@ -823,6 +857,14 @@ class VideoQueueRunner:
         self.state["paused_at"] = self._now_iso()
         if save:
             self._save_state_locked()
+
+    def _mark_queue_running_locked(self) -> None:
+        self.state["queue_status"] = "running"
+        self.state.pop("paused_at", None)
+
+    def _mark_queue_completed_locked(self) -> None:
+        self.state["queue_status"] = "completed"
+        self.state.pop("paused_at", None)
 
     def _has_active_work_locked(self) -> bool:
         if any(not queue.empty() for queue in self.queues.values()):
@@ -917,6 +959,7 @@ class VideoQueueRunner:
             "duration_sec": None,
             "last_error": None,
             "queued": False,
+            "queued_at": None,
         }
         stage_entry.update(CLIP_PROGRESS_DEFAULTS)
         return stage_entry
@@ -935,6 +978,7 @@ class VideoQueueRunner:
                 stages[stage].setdefault("duration_sec", None)
                 stages[stage].setdefault("last_error", None)
                 stages[stage].setdefault("queued", False)
+                stages[stage].setdefault("queued_at", None)
                 for key, value in CLIP_PROGRESS_DEFAULTS.items():
                     stages[stage].setdefault(key, value)
 
@@ -992,21 +1036,52 @@ class VideoQueueRunner:
         for stage, path in cache_checks.items():
             stage_state = stages[stage]
             stage_state["queued"] = False
+            stage_state["queued_at"] = None
+            stage_status = str(stage_state.get("status") or "pending").strip().lower()
+            if stage == EDIT_STAGE and (
+                stage_status in {"queued", "running"}
+                or entry.get("current_stage") == stage
+            ):
+                stage_state["active_clip_renders"] = 0
+                stage_state["render_paused"] = False
             if self._stage_output_current(entry, stage, path):
                 stage_state["status"] = "done"
                 stage_state["finished_at"] = stage_state.get("finished_at") or self._now_iso()
+                if stage == EDIT_STAGE:
+                    stage_state["active_clip_renders"] = 0
+                    stage_state["render_paused"] = False
+                if entry.get("current_stage") == stage:
+                    entry["current_stage"] = None
                 continue
-            if stage_state["status"] in {"queued", "running"}:
+            if stage_status in {"queued", "running"}:
                 stage_state["status"] = "pending"
-            if stage_state["status"] == "done":
+                if entry.get("current_stage") == stage:
+                    entry["current_stage"] = None
+            if str(stage_state.get("status") or "pending").strip().lower() == "done":
                 stage_state["status"] = "pending"
                 stage_state["queued"] = False
                 stage_state["finished_at"] = None
                 stage_state["duration_sec"] = None
                 stage_state["last_error"] = None
+                if entry.get("current_stage") == stage:
+                    entry["current_stage"] = None
+            if (
+                entry.get("current_stage") == stage
+                and str(stage_state.get("status") or "").strip().lower() != "running"
+            ):
+                entry["current_stage"] = None
 
         if stages["ffmpeg"]["status"] == "done":
             entry["status"] = "completed"
+        elif (
+            any(str(stages[s].get("status") or "").strip().lower() == "paused" for s in STAGES)
+            and (
+                str(self.state.get("queue_status") or "").strip().lower() == queue_control.PAUSED_STATUS
+                or self._pause_requested()
+            )
+        ):
+            entry["status"] = "paused"
+            entry["current_stage"] = None
         elif any(stages[s]["status"] == "running" for s in STAGES):
             entry["status"] = "queued"
         elif entry.get("status") == "completed" and stages["ffmpeg"]["status"] != "done":
@@ -1209,10 +1284,18 @@ class VideoQueueRunner:
         entry = self.state["videos"][video_path]
         stage_state = entry["stages"][stage]
         if (
+            entry.get("current_stage") == stage
+            and stage_state.get("status") == "pending"
+            and not stage_state.get("queued")
+        ):
+            entry["current_stage"] = None
+        if (
             stage_state.get("queued")
             or stage_state.get("status") in {"queued", "running"}
             or entry.get("current_stage") == stage
         ):
+            if stage_state.get("status") == "queued" and not stage_state.get("queued_at"):
+                stage_state["queued_at"] = self._now_iso()
             log.debug(
                 "Skip duplicate enqueue for %s stage=%s reason=%s status=%s queued=%s current_stage=%s",
                 Path(video_path).name,
@@ -1229,8 +1312,10 @@ class VideoQueueRunner:
         queue_name = self._queue_name_for_stage(stage)
         if self._stage_job_already_queued(queue_name, video_path, stage):
             stage_state["queued"] = True
-            if stage_state["status"] == "pending":
+            if stage_state["status"] != "running":
                 stage_state["status"] = "queued"
+            if not stage_state.get("queued_at"):
+                stage_state["queued_at"] = self._now_iso()
             log.debug(
                 "Skip duplicate enqueue already present in %s queue for %s stage=%s reason=%s",
                 queue_name,
@@ -1243,8 +1328,12 @@ class VideoQueueRunner:
             self._make_queue_payload(queue_name, StageJob(video_path=video_path, stage=stage))
         )
         stage_state["queued"] = True
-        if stage_state["status"] == "pending":
+        stage_state["queued_at"] = self._now_iso()
+        if stage_state["status"] != "running":
             stage_state["status"] = "queued"
+        if stage == EDIT_STAGE:
+            stage_state["active_clip_renders"] = 0
+            stage_state["render_paused"] = False
         entry["status"] = "queued"
         self._save_state_locked()
 

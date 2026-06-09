@@ -135,6 +135,23 @@ def extract_modules(
     library = Path(getattr(cfg, "MODULE_LIBRARY_DIR", r"D:\proya_modules"))
     working.mkdir(parents=True, exist_ok=True)
     _ensure_library_layout(library)
+    source_identity = _path_identity(source)
+    state_path = _module_extraction_state_path(working, source_identity, cfg)
+
+    if not force:
+        completed_state = _read_completed_module_extraction_state(state_path, source_identity, cfg)
+        if completed_state is not None:
+            stats = _skipped_completed_extraction_result(completed_state, state_path)
+            previous = completed_state.get("result") if isinstance(completed_state.get("result"), dict) else {}
+            log.info(
+                "Module extraction skipped: already completed for this source/policy | previous accepted=%s existing=%s duplicate=%s rejected=%s state=%s",
+                previous.get("accepted", 0),
+                previous.get("skipped_existing", 0),
+                previous.get("skipped_duplicate", 0),
+                previous.get("rejected", previous.get("rejected_total", 0)),
+                state_path,
+            )
+            return stats
 
     timings: dict[str, float] = {}
     stage_start = time.perf_counter()
@@ -151,6 +168,8 @@ def extract_modules(
             _annotate_candidate(candidate, "rejected", "no_sentence_boundaries")
         _write_candidate_cache(source, working, cfg, candidates)
         stats = _empty_result(len(candidates), reason="no_sentence_boundaries")
+        stats["module_extraction_state_path"] = str(state_path.resolve())
+        _write_completed_module_extraction_state(state_path, source, source_identity, cfg, stats)
         _log_rejection_breakdown(stats)
         return stats
 
@@ -263,11 +282,13 @@ def extract_modules(
     timings["final_index"] = time.perf_counter() - stage_start
     stats["index_path"] = str((library / "index.json").resolve())
     stats["library_module_count"] = len(final_index.get("modules", []))
+    stats["module_extraction_state_path"] = str(state_path.resolve())
 
     stage_start = time.perf_counter()
     _write_candidate_cache(source, working, cfg, candidates)
     timings["cache_write"] = time.perf_counter() - stage_start
     stats["timings"] = {key: round(value, 3) for key, value in timings.items()}
+    _write_completed_module_extraction_state(state_path, source, source_identity, cfg, stats)
 
     log.info(
         "Module extraction complete: candidates=%s accepted=%s existing=%s duplicate=%s rejected_total=%s rejected_pre_cut=%s failed_post_cut=%s failed=%s skipped_previous_failure=%s word_boundary_fallback=%s",
@@ -747,9 +768,9 @@ def cut_and_register_module(
 
 
 def module_output_path(library_dir: Path, candidate: dict[str, Any], source_video: Path, cfg) -> Path:
-    source_date = source_video_date(source_video)
+    source_key = _safe_filename_component(source_video.stem) or source_video_date(source_video)
     start_ms = int(round(float(candidate["start"]) * 1000))
-    filename = f"{candidate['product']}_{candidate['role']}_{source_date}_{start_ms}.mp4"
+    filename = f"{candidate['product']}_{candidate['role']}_{source_key}_{start_ms}.mp4"
     return library_dir / candidate["product"] / candidate["role"] / filename
 
 
@@ -1105,6 +1126,129 @@ def source_video_date(source_video: Path) -> str:
         return datetime.fromtimestamp(source_video.stat().st_mtime).strftime("%Y%m%d")
     except OSError:
         return datetime.now().strftime("%Y%m%d")
+
+
+def _module_extraction_state_path(working_dir: Path, source_identity: dict[str, Any], cfg) -> Path:
+    configured_root = getattr(cfg, "WORKING_DIR", None)
+    state_root = Path(str(configured_root)) if configured_root else working_dir.parent
+    return state_root / "_module_extraction_state" / f"{_module_extraction_state_key(source_identity, cfg)}.json"
+
+
+def _module_extraction_state_key(source_identity: dict[str, Any], cfg) -> str:
+    values = {
+        "source_video_identity": source_identity,
+        "candidate_cache_key": _candidate_cache_key(source_identity, cfg),
+        "extraction_policy_hash": _extraction_policy_hash(cfg),
+        "extractor_version": MODULE_EXTRACTOR_VERSION,
+        "module_library_dir": str(Path(getattr(cfg, "MODULE_LIBRARY_DIR", r"D:\proya_modules")).resolve()).casefold(),
+    }
+    raw = json.dumps(values, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _read_completed_module_extraction_state(
+    state_path: Path,
+    source_identity: dict[str, Any],
+    cfg,
+) -> dict[str, Any] | None:
+    if not state_path.exists():
+        return None
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.warning("Ignoring unreadable module extraction state %s: %s", state_path, exc)
+        return None
+    if not isinstance(payload, dict) or payload.get("status") != "completed":
+        return None
+    if payload.get("state_key") != _module_extraction_state_key(source_identity, cfg):
+        return None
+    if payload.get("source_video_identity") != source_identity:
+        return None
+    if payload.get("extraction_policy_hash") != _extraction_policy_hash(cfg):
+        return None
+    if payload.get("extractor_version") != MODULE_EXTRACTOR_VERSION:
+        return None
+    if not _completed_state_module_outputs_exist(payload):
+        log.warning("Ignoring incomplete module extraction state with missing module media: %s", state_path)
+        return None
+    return payload
+
+
+def _completed_state_module_outputs_exist(state: dict[str, Any]) -> bool:
+    result = state.get("result") if isinstance(state.get("result"), dict) else {}
+    try:
+        created_or_existing = int(result.get("accepted") or 0) + int(result.get("skipped_existing") or 0)
+    except (TypeError, ValueError):
+        return False
+    modules = result.get("modules") if isinstance(result.get("modules"), list) else []
+    if created_or_existing > 0 and not modules:
+        return False
+    for module in modules:
+        if not isinstance(module, dict):
+            return False
+        file_path = module.get("file_path")
+        if file_path and not Path(str(file_path)).exists():
+            return False
+    return True
+
+
+def _write_completed_module_extraction_state(
+    state_path: Path,
+    source: Path,
+    source_identity: dict[str, Any],
+    cfg,
+    stats: dict[str, Any],
+) -> None:
+    result = json.loads(json.dumps(stats, ensure_ascii=False))
+    state = {
+        "schema_version": MODULE_SCHEMA_VERSION,
+        "state_schema_version": 1,
+        "status": "completed",
+        "state_key": _module_extraction_state_key(source_identity, cfg),
+        "extractor_version": MODULE_EXTRACTOR_VERSION,
+        "candidate_cache_key": _candidate_cache_key(source_identity, cfg),
+        "extraction_policy": _extraction_policy(cfg),
+        "extraction_policy_hash": _extraction_policy_hash(cfg),
+        "module_library_dir": str(Path(getattr(cfg, "MODULE_LIBRARY_DIR", r"D:\proya_modules")).resolve()),
+        "source_video": str(source.resolve()),
+        "source_video_identity": source_identity,
+        "completed_at": _now_iso(),
+        "result": result,
+    }
+    try:
+        _write_json_atomic(state_path, state)
+    except Exception as exc:
+        log.warning("Could not write module extraction completion state %s: %s", state_path, exc)
+
+
+def _skipped_completed_extraction_result(state: dict[str, Any], state_path: Path) -> dict[str, Any]:
+    previous = state.get("result") if isinstance(state.get("result"), dict) else {}
+    return {
+        "candidates": 0,
+        "accepted": 0,
+        "skipped_existing": 0,
+        "skipped_duplicate": 0,
+        "rejected": 0,
+        "rejected_pre_cut": 0,
+        "failed_post_cut": 0,
+        "rejected_total": 0,
+        "failed": 0,
+        "skipped_previous_failure": 0,
+        "skipped_candidate_cap": 0,
+        "skipped_completed_extraction": 1,
+        "word_boundary_fallback": 0,
+        "modules": [],
+        "reject_reasons": {},
+        "reject_details": {},
+        "module_extraction_state_path": str(state_path.resolve()),
+        "module_extraction_completed_at": state.get("completed_at"),
+        "previous_candidates": previous.get("candidates", 0),
+        "previous_accepted": previous.get("accepted", 0),
+        "previous_skipped_existing": previous.get("skipped_existing", 0),
+        "previous_skipped_duplicate": previous.get("skipped_duplicate", 0),
+        "previous_rejected": previous.get("rejected", previous.get("rejected_total", 0)),
+        "previous_result": previous,
+    }
 
 
 class ModuleExtractionError(RuntimeError):
@@ -1572,6 +1716,7 @@ def _empty_result(candidate_count: int, reason: str) -> dict[str, Any]:
         "failed": 0,
         "skipped_previous_failure": 0,
         "skipped_candidate_cap": 0,
+        "skipped_completed_extraction": 0,
         "word_boundary_fallback": 0,
         "modules": [],
         "reject_reasons": {_public_reject_reason(reason): candidate_count},
@@ -1592,6 +1737,7 @@ def _new_stats(candidate_count: int) -> dict[str, Any]:
         "failed": 0,
         "skipped_previous_failure": 0,
         "skipped_candidate_cap": 0,
+        "skipped_completed_extraction": 0,
         "word_boundary_fallback": 0,
         "modules": [],
         "reject_reasons": {},
@@ -1766,6 +1912,13 @@ def _normalize_text(value: Any) -> str:
     text = str(value or "").casefold().replace("_", " ")
     text = re.sub(r"[^0-9a-zA-Z\u00c0-\u024f\u1e00-\u1eff\s]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _safe_filename_component(value: Any) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"[^0-9A-Za-z._-]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("._-")
+    return text or "source"
 
 
 def _source_identity_key(identity: Any) -> str:

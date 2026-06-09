@@ -39,6 +39,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from bisect import bisect_left, bisect_right
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -58,6 +59,11 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("proya.main")
+
+
+EXPORT_BATCH_ASYNC_ENV = "PROYA_QUEUE_EXPORT_PACKAGING_ASYNC"
+EXPORT_BATCH_TIMEOUT_ENV = "PROYA_EXPORT_BATCH_TIMEOUT_SECONDS"
+_EXPORT_BATCH_PACKAGING_LOCK = threading.Lock()
 
 
 class PipelinePaused(RuntimeError):
@@ -1442,29 +1448,81 @@ def _resolve_manifest_output_path(output_dir: Path, output_file: str) -> Path:
     return path if path.is_absolute() else output_dir / path
 
 
-def _package_export_batches_if_enabled(cfg, progress_callback=None) -> dict:
+def _export_batch_timeout_seconds(cfg) -> float:
+    raw_value = os.environ.get(
+        EXPORT_BATCH_TIMEOUT_ENV,
+        getattr(cfg, "EXPORT_BATCH_TIMEOUT_SECONDS", 900),
+    )
+    try:
+        return max(0.0, float(raw_value))
+    except (TypeError, ValueError):
+        return 900.0
+
+
+def _export_batch_folder_count(result: dict) -> int:
+    folders = {
+        str(item.get("batch_folder"))
+        for item in result.get("assignments", [])
+        if isinstance(item, dict) and item.get("batch_folder") is not None
+    }
+    return len(folders)
+
+
+def _log_export_batch_success(result: dict) -> None:
+    packed = int(result.get("packaged_count", 0) or 0)
+    folders = _export_batch_folder_count(result)
+    log.info("Export batch packaging complete: %s clips packed into %s folders", packed, folders)
+
+
+def _run_export_batch_packaging(
+    cfg,
+    progress_callback=None,
+    lock_timeout: float | None = None,
+    queue_continues: bool = False,
+) -> dict:
     if not bool(getattr(cfg, "EXPORT_BATCHES_ENABLED", False)):
         return {}
     try:
         from export_packager import package_export_batches
     except Exception as exc:
-        log.warning(f"Export batch packager unavailable; skipping affiliate batches: {exc}")
+        if queue_continues:
+            log.warning("Export batch packaging failed: %s — queue continues", exc)
+        else:
+            log.warning(f"Export batch packager unavailable; skipping affiliate batches: {exc}")
         return {}
 
     output_root = Path(getattr(cfg, "OUTPUT_DIR", r"D:\output_clips"))
     batch_size = int(getattr(cfg, "EXPORT_BATCH_SIZE", 30) or 30)
-    _report(
-        progress_callback,
-        "export_batches",
-        99,
-        "Packaging export-ready clips into affiliate folders...",
-    )
+    if progress_callback is not None:
+        _report(
+            progress_callback,
+            "export_batches",
+            99,
+            "Packaging export-ready clips into affiliate folders...",
+        )
+    acquired = False
     try:
+        if lock_timeout is None:
+            _EXPORT_BATCH_PACKAGING_LOCK.acquire()
+            acquired = True
+        else:
+            acquired = _EXPORT_BATCH_PACKAGING_LOCK.acquire(timeout=lock_timeout)
+            if not acquired:
+                raise TimeoutError(
+                    f"another export batch packaging job is still running after {lock_timeout:.0f}s"
+                )
         result = package_export_batches(output_root, cfg=cfg, batch_size=batch_size)
     except Exception as exc:
-        log.warning(f"Could not package export-ready clips into affiliate folders: {exc}")
+        if queue_continues:
+            log.warning("Export batch packaging failed: %s — queue continues", exc)
+        else:
+            log.warning(f"Could not package export-ready clips into affiliate folders: {exc}")
         return {"error_count": 1, "errors": [str(exc)]}
+    finally:
+        if acquired:
+            _EXPORT_BATCH_PACKAGING_LOCK.release()
 
+    _log_export_batch_success(result)
     log.info(
         "  Export batch packaging: eligible=%s new_unique=%s moved=%s duplicate_existing=%s duplicate_candidate=%s errors=%s",
         result.get("eligible_count", 0),
@@ -1476,7 +1534,65 @@ def _package_export_batches_if_enabled(cfg, progress_callback=None) -> dict:
     )
     if result.get("manifest_path"):
         log.info("  Export batch manifest: %s", result.get("manifest_path"))
+    if result.get("legacy_batch_folder_cutoff") is not None:
+        log.info("  Export batch legacy cutoff: %s", result.get("legacy_batch_folder_cutoff"))
     return result
+
+
+def _start_export_batch_packaging_thread(cfg) -> threading.Thread:
+    timeout = _export_batch_timeout_seconds(cfg)
+
+    def worker() -> None:
+        done = threading.Event()
+
+        if timeout > 0:
+            def watchdog() -> None:
+                if not done.wait(timeout):
+                    log.warning(
+                        "Export batch packaging failed: timed out after %.0fs — queue continues",
+                        timeout,
+                    )
+
+            threading.Thread(
+                target=watchdog,
+                name="export-batch-packaging-timeout-watch",
+                daemon=True,
+            ).start()
+
+        try:
+            _run_export_batch_packaging(
+                cfg,
+                progress_callback=None,
+                lock_timeout=timeout if timeout > 0 else None,
+                queue_continues=True,
+            )
+        finally:
+            done.set()
+
+    thread = threading.Thread(
+        target=worker,
+        name=f"export-batch-packaging-{int(time.time())}",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def _package_export_batches_if_enabled(cfg, progress_callback=None) -> dict:
+    if not bool(getattr(cfg, "EXPORT_BATCHES_ENABLED", False)):
+        return {}
+    if os.environ.get(EXPORT_BATCH_ASYNC_ENV) == "1":
+        if progress_callback is not None:
+            _report(
+                progress_callback,
+                "export_batches",
+                99,
+                "Export batch packaging submitted in background...",
+            )
+        thread = _start_export_batch_packaging_thread(cfg)
+        log.info("Export batch packaging submitted in background: %s", thread.name)
+        return {"async": True, "thread_name": thread.name}
+    return _run_export_batch_packaging(cfg, progress_callback=progress_callback)
 
 
 def _attach_score_to_manifest(row: dict, score: dict, cfg) -> None:
@@ -2150,13 +2266,19 @@ def run_pipeline(
     if scores_summary_path:
         log.info(f"  Scores:         {scores_summary_path}")
     if export_batch_result:
-        log.info(
-            "  Export batches: %s moved, %s duplicate(s), root=%s",
-            export_batch_result.get("packaged_count", 0),
-            export_batch_result.get("duplicate_existing_count", 0)
-            + export_batch_result.get("duplicate_candidate_count", 0),
-            export_batch_result.get("batch_root"),
-        )
+        if export_batch_result.get("async"):
+            log.info(
+                "  Export batches: background packaging started (%s)",
+                export_batch_result.get("thread_name"),
+            )
+        else:
+            log.info(
+                "  Export batches: %s moved, %s duplicate(s), root=%s",
+                export_batch_result.get("packaged_count", 0),
+                export_batch_result.get("duplicate_existing_count", 0)
+                + export_batch_result.get("duplicate_candidate_count", 0),
+                export_batch_result.get("batch_root"),
+            )
     log.info("=" * 70)
 
     _report(
@@ -2921,6 +3043,7 @@ def main():
         log.info("  Output root: %s", result.get("output_root"))
         log.info("  Batch root:  %s", result.get("batch_root"))
         log.info("  Manifest:    %s", result.get("manifest_path"))
+        log.info("  Legacy cutoff: %s", result.get("legacy_batch_folder_cutoff"))
         log.info("  Eligible:    %s", result.get("eligible_count", 0))
         log.info("  New unique:  %s", result.get("new_unique_count", 0))
         log.info("  Packaged:    %s", result.get("packaged_count", 0))

@@ -728,6 +728,153 @@ class ModuleExtractorTests(unittest.TestCase):
         self.assertEqual(mx._previous_post_cut_failure(candidate, Cfg, force=False), "validation_failed")
         self.assertIsNone(mx._previous_post_cut_failure(candidate, Cfg, force=True))
 
+    def test_completed_zero_accepted_extraction_skips_same_vod_rerun(self):
+        transcript = transcript_from_sentences(
+            ["produk ini bagus banget untuk kulit wajah kamu sekarang."]
+        )
+        candidate = {
+            "product": "serum",
+            "role": "hook",
+            "start_hint": 0.0,
+            "target_duration": 6.0,
+            "confidence": 0.9,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "2026-05-19-10-27-41.mp4"
+            video.write_bytes(b"source")
+
+            class CfgWithLibrary(Cfg):
+                MODULE_LIBRARY_DIR = str(root / "library")
+
+            with mock.patch.object(mx, "_require_portalocker"), \
+                mock.patch.object(mx, "_load_or_classify_candidates", return_value=[dict(candidate)]), \
+                mock.patch.object(mx, "library_index_lock", null_lock), \
+                mock.patch.object(mx, "cut_and_register_module", side_effect=AssertionError("unexpected cut")):
+                first = mx.extract_modules(str(video), transcript, [], str(root / "working" / "run_001"), CfgWithLibrary)
+
+            with mock.patch.object(mx, "_require_portalocker"), \
+                mock.patch.object(mx, "_load_or_classify_candidates", side_effect=AssertionError("unexpected candidate load")) as load, \
+                mock.patch.object(mx, "snap_to_sentence_boundaries", side_effect=AssertionError("unexpected snap")), \
+                mock.patch.object(mx, "cut_and_register_module", side_effect=AssertionError("unexpected cut")):
+                second = mx.extract_modules(str(video), transcript, [], str(root / "working" / "run_002"), CfgWithLibrary)
+
+        self.assertEqual(first["accepted"], 0)
+        self.assertEqual(first["reject_details"]["product_evidence_missing"], 1)
+        load.assert_not_called()
+        self.assertEqual(second["skipped_completed_extraction"], 1)
+        self.assertEqual(second["accepted"], 0)
+        self.assertEqual(second["previous_rejected"], 1)
+
+    def test_force_modules_bypasses_completed_extraction_state(self):
+        transcript = transcript_from_sentences(
+            ["produk ini bagus banget untuk kulit wajah kamu sekarang."]
+        )
+        candidate = {
+            "product": "serum",
+            "role": "hook",
+            "start_hint": 0.0,
+            "target_duration": 6.0,
+            "confidence": 0.9,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "2026-05-19-10-27-41.mp4"
+            video.write_bytes(b"source")
+
+            class CfgWithLibrary(Cfg):
+                MODULE_LIBRARY_DIR = str(root / "library")
+
+            with mock.patch.object(mx, "_require_portalocker"), \
+                mock.patch.object(mx, "_load_or_classify_candidates", return_value=[dict(candidate)]), \
+                mock.patch.object(mx, "library_index_lock", null_lock):
+                mx.extract_modules(str(video), transcript, [], str(root / "working" / "run_001"), CfgWithLibrary)
+
+            with mock.patch.object(mx, "_require_portalocker"), \
+                mock.patch.object(mx, "_load_or_classify_candidates", return_value=[dict(candidate)]) as load, \
+                mock.patch.object(mx, "library_index_lock", null_lock), \
+                mock.patch.object(mx, "cut_and_register_module", side_effect=AssertionError("unexpected cut")):
+                forced = mx.extract_modules(
+                    str(video),
+                    transcript,
+                    [],
+                    str(root / "working" / "run_002"),
+                    CfgWithLibrary,
+                    force=True,
+                )
+
+        load.assert_called_once()
+        self.assertEqual(forced["skipped_completed_extraction"], 0)
+        self.assertEqual(forced["reject_details"]["product_evidence_missing"], 1)
+
+    def test_policy_change_invalidates_completed_extraction_state(self):
+        transcript = transcript_from_sentences(
+            ["produk ini bagus banget untuk kulit wajah kamu sekarang."]
+        )
+        candidate = {
+            "product": "serum",
+            "role": "hook",
+            "start_hint": 0.0,
+            "target_duration": 6.0,
+            "confidence": 0.9,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "2026-05-19-10-27-41.mp4"
+            video.write_bytes(b"source")
+
+            class CfgWithLibrary(Cfg):
+                MODULE_LIBRARY_DIR = str(root / "library")
+
+            class ChangedPolicyCfg(CfgWithLibrary):
+                MODULE_PRODUCT_EVIDENCE_CONTEXT_SECONDS = 24.0
+
+            with mock.patch.object(mx, "_require_portalocker"), \
+                mock.patch.object(mx, "_load_or_classify_candidates", return_value=[dict(candidate)]), \
+                mock.patch.object(mx, "library_index_lock", null_lock):
+                mx.extract_modules(str(video), transcript, [], str(root / "working" / "run_001"), CfgWithLibrary)
+
+            with mock.patch.object(mx, "_require_portalocker"), \
+                mock.patch.object(mx, "_load_or_classify_candidates", return_value=[dict(candidate)]) as load, \
+                mock.patch.object(mx, "library_index_lock", null_lock), \
+                mock.patch.object(mx, "cut_and_register_module", side_effect=AssertionError("unexpected cut")):
+                changed = mx.extract_modules(
+                    str(video),
+                    transcript,
+                    [],
+                    str(root / "working" / "run_002"),
+                    ChangedPolicyCfg,
+                )
+
+        load.assert_called_once()
+        self.assertEqual(changed["skipped_completed_extraction"], 0)
+        self.assertEqual(changed["reject_details"]["product_evidence_missing"], 1)
+
+    def test_module_output_path_uses_source_stem_to_avoid_same_day_collisions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            library = Path(tmp)
+            candidate = {"product": "serum", "role": "cta", "start": 410.110}
+
+            morning = mx.module_output_path(
+                library,
+                candidate,
+                Path(r"D:\VOD\2026-05-19-10-27-41.mp4"),
+                Cfg,
+            )
+            noon = mx.module_output_path(
+                library,
+                candidate,
+                Path(r"D:\VOD\2026-05-19-11-48-15.mp4"),
+                Cfg,
+            )
+
+        self.assertNotEqual(morning.name, noon.name)
+        self.assertIn("2026-05-19-10-27-41", morning.name)
+        self.assertIn("2026-05-19-11-48-15", noon.name)
+
     def test_module_cut_uses_cpu_encoder_and_config_timeout(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_path = Path(tmp) / "module.mp4"

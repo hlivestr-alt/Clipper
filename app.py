@@ -20,13 +20,88 @@ import streamlit as st
 
 import config as cfg
 import queue_control
+import queue_state_health as qh
 
+
+COLOR_BLUE = "#3b82f6"
+COLOR_BLUE_SOFT = "#60a5fa"
+COLOR_GREEN = "#22c55e"
+COLOR_YELLOW = "#fbbf24"
+COLOR_ORANGE = "#f59e0b"
+COLOR_RED = "#ef4444"
+COLOR_RED_STRONG = "#dc2626"
+COLOR_VIOLET = "#8b5cf6"
+COLOR_SLATE = "#64748b"
+COLOR_WHITE = "#ffffff"
+COLOR_TEXT = "#edf3ff"
+COLOR_TEXT_STRONG = "#f8fafc"
+COLOR_MUTED = "#94a3b8"
+COLOR_TABLE_TEXT = "#e2e8f0"
+COLOR_SLATE_TEXT = "#cbd5e1"
+COLOR_BLUE_TEXT = "#dbeafe"
+COLOR_BLUE_BADGE = "#bfdbfe"
+COLOR_GREEN_TEXT = "#86efac"
+COLOR_GREEN_BADGE = "#bbf7d0"
+COLOR_YELLOW_TEXT = "#fde68a"
+COLOR_RED_TEXT = "#fecaca"
+COLOR_CHART_GRID = "rgba(148,163,184,0.12)"
+COLOR_MUTED_WASH = "rgba(148, 163, 184, 0.08)"
+COLOR_SUCCESS_WASH = "rgba(34, 197, 94, 0.16)"
+COLOR_WARNING_WASH = "rgba(251, 191, 36, 0.16)"
+COLOR_DANGER_WASH = "rgba(239, 68, 68, 0.16)"
+
+BADGE_SUCCESS_SOFT = (COLOR_GREEN_TEXT, "rgba(22, 163, 74, 0.22)", "rgba(34, 197, 94, 0.32)")
+BADGE_SUCCESS = (COLOR_GREEN_TEXT, "rgba(22, 163, 74, 0.22)", "rgba(34, 197, 94, 0.34)")
+BADGE_SUCCESS_LOW = (COLOR_GREEN_BADGE, COLOR_SUCCESS_WASH, "rgba(34, 197, 94, 0.30)")
+BADGE_WARNING_SOFT = (COLOR_YELLOW_TEXT, "rgba(202, 138, 4, 0.22)", "rgba(251, 191, 36, 0.32)")
+BADGE_WARNING = (COLOR_YELLOW_TEXT, "rgba(202, 138, 4, 0.22)", "rgba(251, 191, 36, 0.34)")
+BADGE_DANGER_SOFT = (COLOR_RED_TEXT, "rgba(220, 38, 38, 0.22)", "rgba(239, 68, 68, 0.32)")
+BADGE_DANGER = (COLOR_RED_TEXT, "rgba(220, 38, 38, 0.24)", "rgba(239, 68, 68, 0.36)")
+BADGE_INFO = (COLOR_BLUE_BADGE, "rgba(59, 130, 246, 0.18)", "rgba(96, 165, 250, 0.30)")
+BADGE_MUTED = (COLOR_SLATE_TEXT, "rgba(100, 116, 139, 0.16)", "rgba(148, 163, 184, 0.24)")
+
+QUALITY_BADGE_TONES = {
+    "High": BADGE_SUCCESS_SOFT,
+    "Medium": BADGE_WARNING_SOFT,
+    "Low": BADGE_DANGER_SOFT,
+    "Unknown": BADGE_MUTED,
+}
+STATUS_BADGE_TONES = {
+    "Strong": BADGE_SUCCESS,
+    "Review": BADGE_WARNING,
+    "Okay": BADGE_INFO,
+    "Blocked": BADGE_DANGER,
+}
+FLAG_BADGE_TONES = {
+    "high": (COLOR_WHITE, COLOR_RED_STRONG, "rgba(248, 113, 113, 0.55)"),
+    "medium": (COLOR_WHITE, COLOR_ORANGE, "rgba(251, 191, 36, 0.55)"),
+    "none": (COLOR_WHITE, COLOR_SLATE, "rgba(148, 163, 184, 0.48)"),
+}
+SEVERITY_BADGE_TONES = {
+    "high": BADGE_DANGER,
+    "medium": BADGE_WARNING,
+    "low": BADGE_INFO,
+    "none": BADGE_SUCCESS_LOW,
+}
+SCORE_BAND_BACKGROUNDS = {
+    "unknown": COLOR_MUTED_WASH,
+    "strong": COLOR_SUCCESS_WASH,
+    "review": COLOR_WARNING_WASH,
+    "weak": COLOR_DANGER_WASH,
+}
+COMPLIANCE_SEVERITY_STYLES = {
+    "high": "background-color: rgba(239, 68, 68, 0.24); color: #fee2e2;",
+    "medium": "background-color: rgba(249, 115, 22, 0.22); color: #ffedd5;",
+    "low": "background-color: rgba(234, 179, 8, 0.20); color: #fef9c3;",
+}
+SCORE_REVIEW_HEADER_STYLE = f"color:{COLOR_MUTED};font-weight:800;"
+SCORE_SELECTED_BORDER_STYLE = "border-color: rgba(124, 58, 237, 0.62);"
 
 STAGES = [
-    ("transcribe", "Transcription", "audio", "#22c55e"),
-    ("llm", "LLM Processing", "chip", "#3b82f6"),
-    ("yolo", "YOLO Detection", "focus", "#fbbf24"),
-    ("ffmpeg", "Video Editing", "scissors", "#8b5cf6"),
+    ("transcribe", "Transcription", "audio", COLOR_GREEN),
+    ("llm", "Sales Moment Detection", "chip", COLOR_BLUE),
+    ("yolo", "Product/Face Scan", "focus", COLOR_YELLOW),
+    ("ffmpeg", "Clip Rendering", "scissors", COLOR_VIOLET),
 ]
 STAGE_LABELS = {key: label for key, label, _, _ in STAGES}
 DEFAULT_STATE_CANDIDATES = [
@@ -74,7 +149,7 @@ SCORES_DETAIL_CACHE_KEY = "scores_detail_cache"
 SCORES_EXPORT_CACHE_KEY = "scores_export_cache"
 SCORES_CACHE_VERSION = 4
 SCORES_DEFAULT_SORT_VERSION = 2
-AUTO_REFRESH_TABS = {"overview", "videos", "analytics", "queues"}
+AUTO_REFRESH_TABS = {"overview", "queues"}
 LOGGER = logging.getLogger(__name__)
 LOCAL_TIMEZONE = datetime.now().astimezone().tzinfo
 MIN_SORT_TIMESTAMP = datetime.min.replace(tzinfo=LOCAL_TIMEZONE)
@@ -139,12 +214,26 @@ st.markdown(
         --panel-rail: #0b1422;
         --line: rgba(148, 163, 184, 0.12);
         --text: #edf3ff;
+        --text-strong: #f8fafc;
+        --text-table: #e2e8f0;
+        --text-slate: #cbd5e1;
+        --text-blue: #dbeafe;
+        --text-green: #86efac;
+        --text-yellow: #fde68a;
+        --text-red: #fecaca;
         --muted: #94a3b8;
         --blue: #3b82f6;
+        --blue-soft: #60a5fa;
         --green: #22c55e;
         --yellow: #fbbf24;
+        --orange: #f59e0b;
         --red: #ef4444;
+        --red-strong: #dc2626;
         --violet: #8b5cf6;
+        --violet-strong: #7c3aed;
+        --slate: #64748b;
+        --video-black: #020617;
+        --chart-grid: rgba(148, 163, 184, 0.12);
     }
 
     .stApp {
@@ -190,7 +279,7 @@ st.markdown(
     }
 
     div[data-testid="stProgressBar"] > div > div {
-        background: linear-gradient(90deg, #3b82f6, #60a5fa);
+        background: linear-gradient(90deg, var(--blue), var(--blue-soft));
         border-radius: 999px;
     }
 
@@ -230,7 +319,20 @@ st.markdown(
         font-size: 1.9rem;
         font-weight: 700;
         color: var(--text);
-        margin-bottom: 0.1rem;
+        margin: 0 0 0.1rem 0;
+        line-height: 1.1;
+    }
+
+    .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
     }
 
     .app-subtitle {
@@ -242,12 +344,36 @@ st.markdown(
         display: inline-flex;
         align-items: center;
         gap: 0.45rem;
+        max-width: 100%;
+        min-width: 0;
         padding: 0.5rem 0.8rem;
         border-radius: 999px;
         border: 1px solid var(--line);
         background: rgba(12, 20, 33, 0.72);
         color: var(--text);
         font-size: 0.88rem;
+    }
+
+    .status-pill-copy {
+        display: grid;
+        gap: 0.08rem;
+        line-height: 1.15;
+        min-width: 0;
+    }
+
+    .status-pill-main {
+        font-weight: 700;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .status-pill-sub {
+        color: var(--muted);
+        font-size: 0.76rem;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
     }
 
     .status-dot {
@@ -258,12 +384,40 @@ st.markdown(
         box-shadow: 0 0 10px rgba(34, 197, 94, 0.5);
     }
 
+    .status-pill.attention {
+        border-color: rgba(251, 191, 36, 0.32);
+        background: rgba(120, 53, 15, 0.22);
+        color: #fde68a;
+    }
+
+    .status-pill.attention .status-dot {
+        background: var(--yellow);
+        box-shadow: 0 0 10px rgba(251, 191, 36, 0.44);
+    }
+
+    .status-pill.critical {
+        border-color: rgba(239, 68, 68, 0.36);
+        background: rgba(127, 29, 29, 0.24);
+        color: #fecdd3;
+    }
+
+    .status-pill.critical .status-dot {
+        background: var(--red);
+        box-shadow: 0 0 10px rgba(239, 68, 68, 0.46);
+    }
+
     .header-actions {
         display: flex;
         justify-content: flex-end;
         align-items: center;
         gap: 0.55rem;
         padding-top: 0.45rem;
+        width: 100%;
+    }
+
+    .header-actions .status-pill {
+        width: 100%;
+        justify-content: flex-start;
     }
 
     .nav-shell {
@@ -302,7 +456,7 @@ st.markdown(
         justify-content: center;
         background: rgba(148, 163, 184, 0.08);
         border: 1px solid rgba(148, 163, 184, 0.08);
-        color: #dbeafe;
+        color: var(--text-blue);
         font-weight: 700;
         font-size: 0.85rem;
     }
@@ -371,17 +525,45 @@ st.markdown(
         color: var(--muted);
     }
 
-    .panel-title {
-        font-size: 1.05rem;
-        font-weight: 700;
-        margin-bottom: 0.85rem;
+    h1.sr-only {
+        font-size: 1px !important;
+        line-height: 1 !important;
     }
 
-    .page-title {
+    .panel-title,
+    h1.panel-title,
+    h2.panel-title,
+    h3.panel-title,
+    h4.panel-title {
+        color: var(--text) !important;
+        font-weight: 700 !important;
+        line-height: 1.2 !important;
+        margin: 0 0 0.85rem 0 !important;
+    }
+
+    h1.panel-title:not([style]),
+    h2.panel-title:not([style]),
+    h3.panel-title:not([style]),
+    h4.panel-title:not([style]) {
+        font-size: 1.05rem;
+    }
+
+    .page-title,
+    h1.page-title,
+    h2.page-title,
+    h3.page-title,
+    h4.page-title {
+        color: var(--text) !important;
+        font-weight: 700 !important;
+        line-height: 1.18 !important;
+        margin: 0 0 0.2rem 0 !important;
+    }
+
+    h1.page-title:not([style]),
+    h2.page-title:not([style]),
+    h3.page-title:not([style]),
+    h4.page-title:not([style]) {
         font-size: 1.3rem;
-        font-weight: 700;
-        color: var(--text);
-        margin-bottom: 0.2rem;
     }
 
     .page-subtitle {
@@ -532,19 +714,19 @@ st.markdown(
     }
 
     .module-ready-badge.ready {
-        color: #86efac;
+        color: var(--text-green);
         background: rgba(22, 163, 74, 0.14);
         border-color: rgba(34, 197, 94, 0.18);
     }
 
     .module-ready-badge.partial {
-        color: #fde68a;
+        color: var(--text-yellow);
         background: rgba(202, 138, 4, 0.16);
         border-color: rgba(251, 191, 36, 0.18);
     }
 
     .module-ready-badge.empty {
-        color: #cbd5e1;
+        color: var(--text-slate);
         background: rgba(100, 116, 139, 0.14);
         border-color: rgba(148, 163, 184, 0.16);
     }
@@ -589,15 +771,34 @@ st.markdown(
         display: flex;
         justify-content: space-between;
         align-items: center;
+        gap: 0.65rem;
         color: #dce7f9;
         font-size: 0.95rem;
         margin-bottom: 0.35rem;
+        min-width: 0;
     }
 
     .system-left {
         display: flex;
         align-items: center;
         gap: 0.45rem;
+        min-width: 0;
+        flex: 1 1 auto;
+    }
+
+    .system-label {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .system-value {
+        flex: 0 0 auto;
+        color: var(--text);
+        font-variant-numeric: tabular-nums;
+        text-align: right;
+        white-space: nowrap;
     }
 
     .system-dot {
@@ -607,9 +808,63 @@ st.markdown(
         background: var(--green);
     }
 
+    .system-dot.warning {
+        background: var(--yellow);
+    }
+
+    .system-dot.critical {
+        background: var(--red);
+    }
+
+    .system-dot.unknown {
+        background: #64748b;
+    }
+
+    .system-status {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.35rem;
+        padding: 0.18rem 0.45rem;
+        border-radius: 999px;
+        border: 1px solid rgba(148, 163, 184, 0.14);
+        font-size: 0.74rem;
+        font-weight: 800;
+        text-transform: uppercase;
+    }
+
+    .system-status.healthy {
+        color: var(--text-green);
+        background: rgba(22, 163, 74, 0.14);
+        border-color: rgba(34, 197, 94, 0.18);
+    }
+
+    .system-status.warning {
+        color: var(--text-yellow);
+        background: rgba(202, 138, 4, 0.16);
+        border-color: rgba(251, 191, 36, 0.22);
+    }
+
+    .system-status.critical {
+        color: var(--text-red);
+        background: rgba(220, 38, 38, 0.18);
+        border-color: rgba(239, 68, 68, 0.24);
+    }
+
+    .system-status.unknown {
+        color: var(--text-slate);
+        background: rgba(100, 116, 139, 0.14);
+        border-color: rgba(148, 163, 184, 0.18);
+    }
+
     .small-muted {
         color: var(--muted);
         font-size: 0.84rem;
+    }
+
+    .system-detail {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
     }
 
     .table-shell {
@@ -705,11 +960,15 @@ st.markdown(
     .mobile-progress-fill {
         height: 100%;
         border-radius: 999px;
-        background: linear-gradient(90deg, #3b82f6, #60a5fa);
+        background: linear-gradient(90deg, var(--blue), var(--blue-soft));
+    }
+
+    .mobile-progress-fill.attention {
+        background: linear-gradient(90deg, #b45309, var(--yellow));
     }
 
     .mobile-progress-label {
-        color: #dbeafe;
+        color: var(--text-blue);
         font-size: 0.78rem;
         margin-top: 0.3rem;
     }
@@ -730,11 +989,42 @@ st.markdown(
     }
 
     .video-table tbody td {
-        padding: 0.95rem 1rem;
+        padding: 0.78rem 0.85rem;
         border-bottom: 1px solid rgba(148, 163, 184, 0.08);
-        color: #e2e8f0;
-        font-size: 0.92rem;
+        color: var(--text-table);
+        font-size: 0.88rem;
         vertical-align: middle;
+    }
+
+    .video-name-cell {
+        color: var(--text);
+        font-weight: 800;
+        line-height: 1.2;
+        overflow-wrap: anywhere;
+    }
+
+    .video-meta-line {
+        color: var(--muted);
+        font-size: 0.76rem;
+        line-height: 1.35;
+        margin-top: 0.24rem;
+    }
+
+    .attention-cell {
+        color: #fed7aa;
+        font-size: 0.82rem;
+        line-height: 1.3;
+        max-width: 34ch;
+    }
+
+    .loading-shell {
+        border: 1px solid rgba(96, 165, 250, 0.18);
+        border-radius: 14px;
+        background: rgba(15, 23, 42, 0.44);
+        color: var(--text-blue);
+        padding: 0.8rem 0.95rem;
+        margin: 0.35rem 0 0.9rem 0;
+        font-size: 0.9rem;
     }
 
     .video-table tbody tr:hover {
@@ -744,6 +1034,7 @@ st.markdown(
     .status-badge {
         display: inline-flex;
         align-items: center;
+        gap: 0.35rem;
         padding: 0.3rem 0.65rem;
         border-radius: 10px;
         font-size: 0.82rem;
@@ -764,7 +1055,7 @@ st.markdown(
     }
 
     .status-waiting {
-        color: #fde68a;
+        color: var(--text-yellow);
         background: rgba(202, 138, 4, 0.16);
         border-color: rgba(251, 191, 36, 0.15);
     }
@@ -773,6 +1064,141 @@ st.markdown(
         color: #fda4af;
         background: rgba(220, 38, 38, 0.15);
         border-color: rgba(239, 68, 68, 0.15);
+    }
+
+    .status-attention {
+        color: var(--text-yellow);
+        background: rgba(180, 83, 9, 0.18);
+        border-color: rgba(251, 191, 36, 0.28);
+    }
+
+    .attention-panel {
+        border: 1px solid rgba(251, 191, 36, 0.28);
+        border-radius: 14px;
+        background: rgba(69, 26, 3, 0.22);
+        padding: 0.95rem 1rem;
+        margin: 0.75rem 0 1rem 0;
+    }
+
+    .attention-head {
+        display: flex;
+        align-items: flex-start;
+        gap: 0.8rem;
+        margin-bottom: 0.8rem;
+    }
+
+    .attention-icon {
+        width: 34px;
+        height: 34px;
+        border-radius: 10px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        color: #fde68a;
+        background: rgba(180, 83, 9, 0.24);
+        border: 1px solid rgba(251, 191, 36, 0.28);
+        flex: 0 0 auto;
+    }
+
+    .attention-title {
+        color: #fef3c7;
+        font-weight: 800;
+        font-size: 1.04rem;
+        line-height: 1.2;
+    }
+
+    .attention-meta {
+        color: #fcd34d;
+        font-size: 0.84rem;
+        line-height: 1.35;
+        margin-top: 0.18rem;
+    }
+
+    .attention-chip-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        margin-bottom: 0.75rem;
+    }
+
+    .attention-chip {
+        border: 1px solid rgba(251, 191, 36, 0.2);
+        background: rgba(15, 23, 42, 0.44);
+        border-radius: 999px;
+        color: #fef3c7;
+        font-size: 0.78rem;
+        padding: 0.28rem 0.55rem;
+    }
+
+    .attention-list {
+        display: grid;
+        gap: 0.5rem;
+    }
+
+    .attention-next {
+        border: 1px solid rgba(96, 165, 250, 0.2);
+        border-radius: 10px;
+        background: rgba(15, 23, 42, 0.44);
+        padding: 0.7rem 0.8rem;
+        margin: 0.75rem 0 0.7rem 0;
+    }
+
+    .attention-next-title {
+        color: #dbeafe;
+        font-size: 0.78rem;
+        font-weight: 800;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        margin-bottom: 0.25rem;
+    }
+
+    .attention-next-copy {
+        color: var(--text);
+        font-size: 0.9rem;
+        line-height: 1.35;
+    }
+
+    .attention-row {
+        display: grid;
+        grid-template-columns: minmax(104px, 0.55fr) minmax(0, 1.8fr) minmax(0, 2.3fr);
+        gap: 0.75rem;
+        align-items: center;
+        padding: 0.58rem 0.65rem;
+        border-radius: 10px;
+        border: 1px solid rgba(251, 191, 36, 0.16);
+        background: rgba(15, 23, 42, 0.42);
+    }
+
+    .attention-stage {
+        color: var(--text-yellow);
+        font-size: 0.76rem;
+        font-weight: 800;
+        text-transform: uppercase;
+    }
+
+    .attention-video {
+        color: var(--text);
+        font-weight: 700;
+        min-width: 0;
+        overflow-wrap: anywhere;
+    }
+
+    .attention-message {
+        color: #fed7aa;
+        font-size: 0.84rem;
+        line-height: 1.35;
+        min-width: 0;
+    }
+
+    .mobile-card-alert {
+        border: 1px solid rgba(251, 191, 36, 0.24);
+        border-radius: 8px;
+        background: rgba(120, 53, 15, 0.18);
+        color: #fed7aa;
+        font-size: 0.8rem;
+        line-height: 1.35;
+        padding: 0.55rem;
+        margin-top: 0.7rem;
     }
 
     .progress-wrap {
@@ -793,24 +1219,40 @@ st.markdown(
     .progress-fill {
         height: 100%;
         border-radius: 999px;
-        background: linear-gradient(90deg, #3b82f6, #60a5fa);
+        background: linear-gradient(90deg, var(--blue), var(--blue-soft));
     }
 
     .progress-fill.completed {
-        background: linear-gradient(90deg, #16a34a, #22c55e);
+        background: linear-gradient(90deg, #16a34a, var(--green));
+    }
+
+    .progress-fill.attention {
+        background: linear-gradient(90deg, #b45309, var(--yellow));
     }
 
     .progress-value {
-        color: #dbeafe;
+        color: var(--text-blue);
         font-size: 0.86rem;
         min-width: 38px;
     }
 
-    .row-action {
-        color: #94a3b8;
-        text-align: center;
-        font-weight: 700;
-        letter-spacing: 0.2em;
+    .accessible-progress {
+        width: 100%;
+        height: 0.55rem;
+        border-radius: 999px;
+        background: rgba(30, 41, 59, 0.9);
+        overflow: hidden;
+        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.05);
+    }
+
+    .accessible-progress-fill {
+        height: 100%;
+        border-radius: inherit;
+        background: linear-gradient(90deg, var(--blue), var(--blue-soft));
+    }
+
+    .accessible-progress-fill.attention {
+        background: linear-gradient(90deg, #b45309, var(--yellow));
     }
 
     div[data-testid="stButton"] > button {
@@ -820,11 +1262,42 @@ st.markdown(
         color: var(--text);
         min-height: 2.5rem;
         box-shadow: none;
+        white-space: nowrap;
+        transition:
+            border-color 180ms cubic-bezier(0.22, 1, 0.36, 1),
+            background 180ms cubic-bezier(0.22, 1, 0.36, 1),
+            box-shadow 180ms cubic-bezier(0.22, 1, 0.36, 1),
+            color 180ms cubic-bezier(0.22, 1, 0.36, 1),
+            transform 120ms cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    button,
+    button p {
+        white-space: nowrap !important;
     }
 
     div[data-testid="stButton"] > button:hover {
         border-color: rgba(96, 165, 250, 0.22);
-        color: white;
+        color: var(--text-strong);
+    }
+
+    div[data-testid="stButton"] > button:active {
+        transform: translateY(1px);
+    }
+
+    div[data-testid="stButton"] > button:disabled,
+    div[data-testid="stButton"] > button[disabled] {
+        cursor: not-allowed;
+        opacity: 0.54;
+        transform: none;
+    }
+
+    div[data-testid="stButton"] > button:focus-visible,
+    div[data-baseweb="select"] > div:focus-within,
+    div[data-baseweb="input"] > div:focus-within,
+    div[data-baseweb="base-input"] > div:focus-within {
+        outline: 3px solid rgba(147, 197, 253, 0.9);
+        outline-offset: 2px;
     }
 
     div[data-testid="stButton"] > button[kind="primary"] {
@@ -837,6 +1310,7 @@ st.markdown(
         justify-content: flex-start;
         padding-left: 0.95rem;
         font-weight: 500;
+        white-space: nowrap;
     }
 
     .nav-shell div[data-testid="stButton"] > button[kind="primary"] {
@@ -866,7 +1340,18 @@ st.markdown(
     .stTabs [aria-selected="true"] {
         color: var(--text) !important;
         background: rgba(59, 130, 246, 0.08) !important;
-        box-shadow: inset 0 -2px 0 #3b82f6;
+        box-shadow: inset 0 -2px 0 var(--blue);
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+        *,
+        *::before,
+        *::after {
+            animation-duration: 0.01ms !important;
+            animation-iteration-count: 1 !important;
+            scroll-behavior: auto !important;
+            transition-duration: 0.01ms !important;
+        }
     }
 
     div[data-testid="stSelectbox"] label,
@@ -940,6 +1425,19 @@ st.markdown(
             justify-content: center;
             padding: 0.48rem 0.6rem;
             font-size: 0.8rem;
+        }
+
+        .attention-panel {
+            padding: 0.82rem;
+        }
+
+        .attention-head {
+            gap: 0.62rem;
+        }
+
+        .attention-row {
+            grid-template-columns: 1fr;
+            gap: 0.32rem;
         }
 
         div[data-testid="stButton"] > button {
@@ -1070,7 +1568,7 @@ st.markdown(
         video[data-testid="stVideo"] {
             max-height: 62vh;
             object-fit: contain;
-            background: #020617;
+            background: var(--video-black);
         }
 
         .module-ready-grid {
@@ -1615,101 +2113,6 @@ def load_scorer_stats(output_dirs: tuple[str, ...]) -> dict[str, Any]:
 
 
 load_scorer_stats.clear = _load_scorer_stats_cached.clear  # type: ignore[attr-defined]
-
-
-@st.cache_data(show_spinner=False, max_entries=32)
-def _load_score_trend_payload_cached(summary_signature: tuple[tuple[str, int, int], ...]) -> dict[str, Any]:
-    product_scores: dict[str, list[float]] = {product: [] for product in TREND_PRODUCTS}
-    dimension_scores: dict[str, list[float]] = {"Content": [], "Quality": [], "Engagement": []}
-    tier_counts: Counter[str] = Counter()
-    flag_counter: Counter[str] = Counter()
-    top_candidates: list[dict[str, Any]] = []
-    clip_count = 0
-
-    def add_clip(row: dict[str, Any]) -> None:
-        nonlocal clip_count
-        clip_count += 1
-        total_score = score_float(row.get("Total Score"))
-        product = trend_product_bucket(row.get("Product"))
-        if total_score is not None and product in product_scores:
-            product_scores[product].append(total_score)
-        for label in dimension_scores:
-            value = score_float(row.get(label))
-            if value is not None:
-                dimension_scores[label].append(value)
-        tier_counts.update([score_tier_label(total_score)])
-        flag_counter.update(split_flags_for_trends(row.get("Flags")))
-        top_candidates.append(
-            {
-                "Clip ID": row.get("Clip ID", ""),
-                "Product": row.get("Product", ""),
-                "Total Score": total_score,
-                "Summary": row.get("Summary", ""),
-            }
-        )
-
-    for path_key, _mtime_ns, _size in summary_signature:
-        folder = Path(path_key).parent
-        payload = load_json_dict_by_signature((path_key, _mtime_ns, _size))
-        if not payload:
-            continue
-        source_video, run_tag = split_output_folder_name(folder.name)
-        for group in score_groups_from_summary(payload):
-            for row in build_group_score_rows(group, source_video, run_tag):
-                if row.get("_row_type") in {"base", "variant"}:
-                    add_clip(row)
-
-    product_df = pd.DataFrame(
-        [
-            {
-                "Product": product,
-                "Average Total": round(float(sum(values) / len(values)), 2) if values else None,
-                "Clips": len(values),
-            }
-            for product, values in product_scores.items()
-        ]
-    )
-    dimension_df = pd.DataFrame(
-        [
-            {
-                "Dimension": label,
-                "Average Score": round(float(sum(values) / len(values)), 2) if values else None,
-            }
-            for label, values in dimension_scores.items()
-        ]
-    )
-    tier_order = ["Export Ready", "Review Needed", "Rejected"]
-    tier_df = pd.DataFrame(
-        [{"Tier": tier, "Clips": int(tier_counts.get(tier, 0))} for tier in tier_order]
-    )
-    flags_df = pd.DataFrame(
-        [{"Flag": flag, "Count": count} for flag, count in flag_counter.most_common(10)]
-    )
-    top_df = pd.DataFrame(
-        sorted(
-            top_candidates,
-            key=lambda row: (score_float(row.get("Total Score")) is not None, score_float(row.get("Total Score")) or -1),
-            reverse=True,
-        )[:3]
-    )
-    if top_df.empty:
-        top_df = pd.DataFrame(columns=["Clip ID", "Product", "Total Score", "Summary"])
-    return {
-        "clip_count": clip_count,
-        "product_df": product_df,
-        "dimension_df": dimension_df,
-        "tier_df": tier_df,
-        "flags_df": flags_df,
-        "top_df": top_df[["Clip ID", "Product", "Total Score", "Summary"]],
-        "tier_order": tier_order,
-    }
-
-
-def load_score_trend_payload(output_dirs: tuple[str, ...]) -> dict[str, Any]:
-    return _load_score_trend_payload_cached(build_scores_summary_signature(output_dirs))
-
-
-load_score_trend_payload.clear = _load_score_trend_payload_cached.clear  # type: ignore[attr-defined]
 
 
 def module_index_signature(library_dir: str) -> tuple[str, int, int]:
@@ -2465,15 +2868,6 @@ def trend_product_bucket(value: Any) -> str:
     return ""
 
 
-def split_flags_for_trends(value: Any) -> list[str]:
-    flags = []
-    for part in str(value or "").split(","):
-        clean = part.strip()
-        if clean and clean != "inherits base":
-            flags.append(clean)
-    return flags
-
-
 def _output_root_mtime_ns(root: Path) -> int:
     try:
         return root.stat().st_mtime_ns
@@ -2682,7 +3076,34 @@ def get_system_stats() -> dict[str, Any]:
     }
 
 
-def infer_video_status(video: dict[str, Any]) -> str:
+def attention_items_for_video(
+    video: dict[str, Any],
+    attention_by_video: dict[str, list[dict[str, Any]]] | None,
+) -> list[dict[str, Any]]:
+    if not attention_by_video:
+        return []
+    return attention_by_video.get(qh.video_key(video), [])
+
+
+def attention_text_for_video(
+    video: dict[str, Any],
+    attention_by_video: dict[str, list[dict[str, Any]]] | None,
+) -> str:
+    issues = attention_items_for_video(video, attention_by_video)
+    if not issues:
+        return ""
+    first = issues[0]
+    stage = str(first.get("stage_label") or "Queue")
+    message = str(first.get("message") or "")
+    return f"{stage}: {message}" if message else stage
+
+
+def infer_video_status(
+    video: dict[str, Any],
+    attention_by_video: dict[str, list[dict[str, Any]]] | None = None,
+) -> str:
+    if attention_items_for_video(video, attention_by_video):
+        return "Needs Attention"
     status = (video.get("status") or "").lower()
     if status == "completed":
         return "Completed"
@@ -2698,7 +3119,40 @@ def infer_video_status(video: dict[str, Any]) -> str:
     return "Waiting"
 
 
-def infer_current_step(video: dict[str, Any]) -> str:
+def stage_status_value(stage_state: dict[str, Any]) -> str:
+    return str(stage_state.get("status") or "pending").strip().lower()
+
+
+def video_status_value(video: dict[str, Any]) -> str:
+    return str(video.get("status") or "").strip().lower()
+
+
+def stage_counts_as_running(video: dict[str, Any], stage_state: dict[str, Any]) -> bool:
+    return (
+        video_status_value(video) not in {"completed", "failed", "paused"}
+        and stage_status_value(stage_state) == "running"
+    )
+
+
+def stage_counts_as_queued(video: dict[str, Any], stage_state: dict[str, Any]) -> bool:
+    if video_status_value(video) in {"completed", "failed", "paused"}:
+        return False
+    stage_status = stage_status_value(stage_state)
+    if stage_status == "queued":
+        return True
+    return bool(stage_state.get("queued")) and stage_status not in {"done", "failed", "paused", "skipped", "running"}
+
+
+def infer_current_step(
+    video: dict[str, Any],
+    attention_by_video: dict[str, list[dict[str, Any]]] | None = None,
+) -> str:
+    issues = attention_items_for_video(video, attention_by_video)
+    if issues:
+        stage_key = issues[0].get("stage")
+        if stage_key:
+            return STAGE_LABELS.get(str(stage_key), str(stage_key).title())
+
     current_stage = video.get("current_stage")
     if current_stage:
         return STAGE_LABELS.get(current_stage, current_stage.title())
@@ -2713,11 +3167,14 @@ def infer_current_step(video: dict[str, Any]) -> str:
     return "Completed"
 
 
-def compute_progress(video: dict[str, Any]) -> int:
+def compute_progress(
+    video: dict[str, Any],
+    attention_by_video: dict[str, list[dict[str, Any]]] | None = None,
+) -> int:
     stages = video.get("stages", {})
     done = sum(1 for key, _, _, _ in STAGES if stages.get(key, {}).get("status") == "done")
     progress = (done / len(STAGES)) * 100
-    status = infer_video_status(video)
+    status = infer_video_status(video, attention_by_video)
     if status == "Processing":
         progress = min(progress + 12.5, 98.0)
     if status == "Completed":
@@ -2763,8 +3220,16 @@ def summarize_state(state: dict[str, Any]) -> dict[str, Any]:
     videos = [aggregate_video_entry(video) for video in state.get("videos", {}).values()]
     now = datetime.now().astimezone()
     fallback_sort_time = datetime(1970, 1, 1, tzinfo=now.tzinfo)
+    queue_health = qh.derive_queue_health(
+        state,
+        now=now,
+        stage_labels=STAGE_LABELS,
+        running_stall_seconds=float(getattr(cfg, "QUEUE_DASHBOARD_RUNNING_STALL_SECONDS", qh.DEFAULT_RUNNING_STALL_SECONDS)),
+        queued_stall_seconds=float(getattr(cfg, "QUEUE_DASHBOARD_QUEUED_STALL_SECONDS", qh.DEFAULT_QUEUED_STALL_SECONDS)),
+    )
+    attention_by_video = queue_health.get("attention_by_video", {})
 
-    statuses = Counter(infer_video_status(video) for video in videos)
+    statuses = Counter(infer_video_status(video, attention_by_video) for video in videos)
     stage_running = Counter()
     stage_queued = Counter()
     stage_distribution = Counter()
@@ -2787,15 +3252,15 @@ def summarize_state(state: dict[str, Any]) -> dict[str, Any]:
         stage_bucket = video.get("current_stage")
         for stage_key, _, _, _ in STAGES:
             stage_state = stages.get(stage_key, {})
-            if stage_state.get("status") == "running":
+            if stage_counts_as_running(video, stage_state):
                 stage_running[stage_key] += 1
-            if stage_state.get("queued") or stage_state.get("status") == "queued":
+            if stage_counts_as_queued(video, stage_state):
                 stage_queued[stage_key] += 1
-            if stage_state.get("status") in {"queued", "running"}:
+            if stage_counts_as_queued(video, stage_state) or stage_counts_as_running(video, stage_state):
                 queue_items[stage_key].append(
                     {
                         "name": video.get("name", "-"),
-                        "status": stage_state.get("status", "queued").title(),
+                        "status": stage_status_value(stage_state).title(),
                     }
                 )
             if stage_bucket is None and (
@@ -2828,16 +3293,18 @@ def summarize_state(state: dict[str, Any]) -> dict[str, Any]:
             end_time = completed_at or now
             duration = format_duration((end_time - created_at).total_seconds())
 
-        if infer_video_status(video) == "Completed":
+        status_label = infer_video_status(video, attention_by_video)
+        if status_label == "Completed":
             stage_bucket = "ffmpeg"
         stage_distribution[stage_bucket or "transcribe"] += 1
 
         table_rows.append(
             {
                 "Video Name": video.get("name", "-"),
-                "Status": infer_video_status(video),
-                "Current Step": infer_current_step(video),
-                "Progress": compute_progress(video),
+                "Status": status_label,
+                "Current Step": infer_current_step(video, attention_by_video),
+                "Progress": compute_progress(video, attention_by_video),
+                "Attention": attention_text_for_video(video, attention_by_video),
                 "Clips Generated": clips_generated,
                 "Runs": int(video.get("run_count", 1)),
                 "Redos": int(video.get("redo_count", 0)),
@@ -2907,7 +3374,7 @@ def summarize_state(state: dict[str, Any]) -> dict[str, Any]:
 
     table_df = pd.DataFrame(table_rows)
     if not table_df.empty:
-        status_rank = {"Processing": 0, "Waiting": 1, "Completed": 2, "Failed": 3}
+        status_rank = {"Needs Attention": 0, "Processing": 1, "Waiting": 2, "Failed": 3, "Completed": 4, "Paused": 5}
         table_df["_status_rank"] = table_df["Status"].map(status_rank).fillna(9)
         table_df = (
             table_df.sort_values(
@@ -2935,6 +3402,7 @@ def summarize_state(state: dict[str, Any]) -> dict[str, Any]:
         "clips_per_minute": clips_per_minute,
         "clips_per_hour": clips_per_hour,
         "clips_per_day": clips_per_day,
+        "queue_health": queue_health,
     }
 
 
@@ -3057,6 +3525,41 @@ def svg_icon(name: str, color: str = "currentColor", size: int = 18, stroke: flo
     )
 
 
+def heading_html(level: int, text: str, class_name: str, style: str | None = None) -> str:
+    safe_level = max(1, min(int(level), 6))
+    tag = f"h{safe_level}"
+    style_attr = f' style="{html.escape(style, quote=True)}"' if style else ""
+    return f'<{tag} class="{html.escape(class_name, quote=True)}"{style_attr}>{html.escape(text)}</{tag}>'
+
+
+def render_panel_heading(text: str, level: int = 3, style: str | None = None) -> None:
+    st.markdown(heading_html(level, text, "panel-title", style), unsafe_allow_html=True)
+
+
+def render_accessible_progress(
+    value: float,
+    label: str,
+    value_text: str | None = None,
+    fill_class: str = "",
+) -> None:
+    bounded = max(0.0, min(float(value or 0.0), 1.0))
+    percent = int(round(bounded * 100))
+    value_text_attr = f' aria-valuetext="{html.escape(value_text, quote=True)}"' if value_text else ""
+    fill_classes = "accessible-progress-fill"
+    if fill_class:
+        fill_classes = f"{fill_classes} {html.escape(fill_class, quote=True)}"
+    st.markdown(
+        f"""
+        <div class="accessible-progress" role="progressbar"
+            aria-label="{html.escape(label, quote=True)}"
+            aria-valuemin="0" aria-valuemax="100" aria-valuenow="{percent}"{value_text_attr}>
+            <div class="{fill_classes}" style="width:{percent}%;"></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_kpi_card(title: str, value: int, subtitle: str, icon: str, accent: str) -> None:
     st.markdown(
         f"""
@@ -3078,11 +3581,17 @@ def render_kpi_card(title: str, value: int, subtitle: str, icon: str, accent: st
 def render_mobile_overview_strip(summary: dict[str, Any]) -> None:
     running_total = sum(int(value or 0) for value in summary["stage_running"].values())
     queued_total = sum(int(value or 0) for value in summary["stage_queued"].values())
-    queue_label = "Running" if running_total else ("Queued" if queued_total else "Idle")
+    queue_health = summary.get("queue_health", {})
+    if queue_health.get("status") == "needs_attention":
+        queue_label = str(queue_health.get("status_label") or "Needs Attention")
+        queue_sub = str(queue_health.get("summary") or "Review queue state")
+    else:
+        queue_label = "Running" if running_total else ("Queued" if queued_total else "Idle")
+        queue_sub = f"{running_total} running, {queued_total} queued"
     items = [
         ("Clips / 24h", f"{summary['clips_last_24h']:,}", "Produced today"),
-        ("Queue", queue_label, f"{running_total} running, {queued_total} queued"),
-        ("Waiting", f"{summary['status_counts'].get('Waiting', 0):,}", "Videos"),
+        ("Queue", queue_label, queue_sub),
+        ("Attention", f"{summary['status_counts'].get('Needs Attention', 0):,}", "Needs review"),
         ("Failed", f"{summary['status_counts'].get('Failed', 0):,}", "Needs attention"),
     ]
     cards = []
@@ -3097,23 +3606,56 @@ def render_mobile_overview_strip(summary: dict[str, Any]) -> None:
     st.markdown(f"<div class='mobile-overview-strip'>{''.join(cards)}</div>", unsafe_allow_html=True)
 
 
+def system_metric_state(label: str, percent: float | None, trailing: str) -> tuple[str, str]:
+    if percent is None:
+        return "unknown", "Unavailable" if label == "GPU" else "Unknown"
+    if label == "GPU":
+        return "healthy", "Active"
+    warning_threshold = 80.0 if label in {"RAM", "Disk"} else 85.0
+    critical_threshold = 92.0 if label in {"RAM", "Disk"} else 95.0
+    if percent >= critical_threshold:
+        return "critical", "Critical"
+    if percent >= warning_threshold:
+        return "warning", "High"
+    return "healthy", "Healthy"
+
+
+def compact_gpu_label(trailing: str) -> str:
+    parts = [part.strip() for part in str(trailing or "").split("|") if part.strip()]
+    return parts[0] if parts else ""
+
+
 def render_system_metric(label: str, percent: float | None, trailing: str) -> None:
     pct_text = "N/A" if percent is None else f"{percent:.0f}%"
     progress = 0.0 if percent is None else max(0.0, min(percent / 100.0, 1.0))
+    state_class, state_label = system_metric_state(label, percent, trailing)
+    right_text = trailing if label == "Disk" else pct_text
+    detail_text = ""
+    if label == "GPU":
+        right_text = pct_text if percent is not None else state_label
+        detail_text = compact_gpu_label(trailing) if percent is not None else ""
+    elif label != "Disk" and trailing and trailing != pct_text:
+        detail_text = str(trailing)
     st.markdown(
         f"""
         <div class="system-row">
             <div class="system-line">
-                <div class="system-left"><div class="system-dot"></div><div>{label}</div></div>
-                <div>{trailing if label == 'Disk' else pct_text}</div>
+                <div class="system-left">
+                    <div class="system-dot {state_class}"></div>
+                    <div class="system-label">{html.escape(label)}</div>
+                    <span class="system-status {state_class}">{html.escape(state_label)}</span>
+                </div>
+                <div class="system-value">{html.escape(str(right_text))}</div>
             </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
-    st.progress(progress)
-    if label not in {"Disk", "GPU"} and trailing:
-        st.markdown(f"<div class='small-muted'>{trailing}</div>", unsafe_allow_html=True)
+    progress_label = f"{label} usage" if percent is not None else f"{label} status"
+    progress_text = f"{label}: {right_text}" if percent is not None else f"{label}: {state_label}"
+    render_accessible_progress(progress, progress_label, progress_text)
+    if detail_text:
+        st.markdown(f"<div class='small-muted system-detail'>{html.escape(detail_text)}</div>", unsafe_allow_html=True)
 
 
 def queue_fill_ratio(queued_count: int, running_count: int) -> float:
@@ -3126,14 +3668,11 @@ def queue_fill_ratio(queued_count: int, running_count: int) -> float:
 def dashboard_nav_items() -> list[tuple[str, str, str]]:
     items = [
         ("overview", "Overview", "home"),
-        ("videos", "Videos", "video"),
         ("analytics", "Analytics", "chart"),
         ("scores", "Scores", "check-circle"),
         ("compliance", "Compliance", "alert-circle"),
         ("modules", "Modules", "grid"),
-        ("trends", "Trends", "chart"),
         ("queues", "Queues", "list"),
-        ("settings", "Settings", "gear"),
     ]
     if scorer_vision_debug_enabled():
         items.insert(5, ("focus_debug", "Focus Debug", "focus"))
@@ -3145,7 +3684,7 @@ def render_nav_controls(active_tab: str) -> None:
     for tab_key, label, icon_name in items:
         cols = st.columns([0.24, 1], gap="small")
         with cols[0]:
-            st.markdown(f"<div class='nav-icon'>{svg_icon(icon_name, '#dbeafe', size=16, stroke=1.8)}</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='nav-icon'>{svg_icon(icon_name, COLOR_BLUE_TEXT, size=16, stroke=1.8)}</div>", unsafe_allow_html=True)
         with cols[1]:
             if st.button(
                 label,
@@ -3153,6 +3692,7 @@ def render_nav_controls(active_tab: str) -> None:
                 use_container_width=True,
                 type="primary" if active_tab == tab_key else "secondary",
             ):
+                st.session_state.pending_active_tab = tab_key
                 st.session_state.active_tab = tab_key
                 st.session_state.mobile_nav_select = tab_key
                 st.rerun()
@@ -3178,12 +3718,13 @@ def render_mobile_nav_controls(active_tab: str) -> None:
         label_visibility="collapsed",
     )
     if selected_tab != active_tab:
+        st.session_state.pending_active_tab = selected_tab
         st.session_state.active_tab = selected_tab
         st.rerun()
 
 
 def render_system_panel(system: dict[str, Any]) -> None:
-    st.markdown("<div class='panel-title'>System Status</div>", unsafe_allow_html=True)
+    render_panel_heading("System Status", level=2)
     render_system_metric("GPU", system["gpu_percent"], system["gpu_label"])
     render_system_metric("CPU", system["cpu_percent"], f"{system['cpu_percent']:.0f}%")
     render_system_metric("RAM", system["ram_percent"], system["ram_label"])
@@ -3192,19 +3733,31 @@ def render_system_panel(system: dict[str, Any]) -> None:
     st.markdown("<div class='small-muted'>VOD Pipeline v1.0.0</div>", unsafe_allow_html=True)
 
 
-def render_header(updated_at: datetime | None) -> None:
-    header_cols = st.columns([4.2, 1.35], gap="medium")
+def render_header(updated_at: datetime | None, queue_health: dict[str, Any] | None = None) -> None:
+    health = queue_health or {}
+    severity = str(health.get("severity") or "ok")
+    freshness_text = f"Data updated {format_relative_time(updated_at)}"
+    if severity == "critical":
+        pill_class = "status-pill critical"
+        pill_text = str(health.get("status_label") or "Queue stalled")
+    elif health.get("status") == "needs_attention":
+        pill_class = "status-pill attention"
+        pill_text = str(health.get("status_label") or "Queue needs attention")
+    else:
+        pill_class = "status-pill"
+        pill_text = "Queue healthy"
+    header_cols = st.columns([3.05, 2.25], gap="medium")
     with header_cols[0]:
         st.markdown(
             """
             <div class="topbar">
                 <div class="topbar-left">
                     <div class="app-icon">"""
-            + svg_icon("clapboard", "#edf3ff", size=24, stroke=1.8)
+            + svg_icon("clapboard", COLOR_TEXT, size=24, stroke=1.8)
             + """</div>
                     <div>
-                        <div class="app-title">VOD Processing Dashboard</div>
-                        <div class="app-subtitle">Live monitoring for transcription, LLM, YOLO, and video editing.</div>
+                        <div class="app-title" aria-hidden="true">VOD Processing Dashboard</div>
+                        <div class="app-subtitle">Live monitoring for transcription, sales detection, product scans, and clip rendering.</div>
                     </div>
                 </div>
             </div>
@@ -3212,27 +3765,28 @@ def render_header(updated_at: datetime | None) -> None:
             unsafe_allow_html=True,
         )
     with header_cols[1]:
-        action_cols = st.columns([2.2, 0.7, 0.7], gap="small")
-        with action_cols[0]:
-            st.markdown(
-                f"""
-                <div class="header-actions">
-                    <div class="status-pill">
-                        <div class="status-dot"></div>
-                        <div>Last updated: {format_relative_time(updated_at)}</div>
+        st.markdown(
+            f"""
+            <div class="header-actions">
+                <div class="{pill_class}">
+                    <div class="status-dot"></div>
+                    <div class="status-pill-copy">
+                        <div class="status-pill-main">{html.escape(pill_text)}</div>
+                        <div class="status-pill-sub">{html.escape(freshness_text)}</div>
                     </div>
                 </div>
-                """,
-                unsafe_allow_html=True,
-            )
-        with action_cols[1]:
-            if st.button("\u21bb", key="header_refresh", help="Refresh now", use_container_width=True):
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        action_cols = st.columns([1, 1], gap="small")
+        with action_cols[0]:
+            if st.button("Refresh", key="header_refresh", help="Refresh now", use_container_width=True):
                 load_state.clear()
                 load_json_payload_by_signature.clear()
                 load_manifest_clip_count.clear()
                 load_score_rows.clear()
                 load_scorer_stats.clear()
-                load_score_trend_payload.clear()
                 load_compliance_rows.clear()
                 load_compliance_detail_rows.clear()
                 invalidate_scores_session_cache()
@@ -3245,8 +3799,8 @@ def render_header(updated_at: datetime | None) -> None:
                 load_module_library_rows.clear()
                 _discover_score_output_dirs_cached.clear()
                 st.rerun()
-        with action_cols[2]:
-            with st.popover("\u2699", use_container_width=True):
+        with action_cols[1]:
+            with st.popover("Settings", use_container_width=True):
                 pending_auto = st.toggle(
                     "Auto refresh",
                     value=st.session_state.auto_refresh_enabled,
@@ -3259,11 +3813,14 @@ def render_header(updated_at: datetime | None) -> None:
                     st.session_state.refresh_seconds_value,
                     key="settings_refresh_seconds",
                 )
-                pending_state_path = st.text_input(
-                    "State JSON path",
-                    value=st.session_state.state_path_value,
-                    key="settings_state_path",
-                )
+                pending_state_path = st.session_state.state_path_value
+                with st.expander("Advanced state file"):
+                    pending_state_path = st.text_input(
+                        "Queue state JSON path",
+                        value=st.session_state.state_path_value,
+                        key="settings_state_path",
+                        help="Only change this when reviewing a different queue state file.",
+                    )
                 if st.button("Apply", key="settings_apply", use_container_width=True):
                     st.session_state.auto_refresh_enabled = pending_auto
                     st.session_state.refresh_seconds_value = pending_seconds
@@ -3273,7 +3830,6 @@ def render_header(updated_at: datetime | None) -> None:
                     load_manifest_clip_count.clear()
                     load_score_rows.clear()
                     load_scorer_stats.clear()
-                    load_score_trend_payload.clear()
                     load_compliance_rows.clear()
                     load_compliance_detail_rows.clear()
                     invalidate_scores_session_cache()
@@ -3288,10 +3844,164 @@ def render_header(updated_at: datetime | None) -> None:
                     st.rerun()
 
 
+def render_queue_attention_panel(queue_health: dict[str, Any]) -> None:
+    if not isinstance(queue_health, dict) or queue_health.get("status") != "needs_attention":
+        return
+
+    severity = str(queue_health.get("severity") or "warning")
+    title = "Queue stalled" if severity == "critical" else "Queue needs attention"
+    summary = str(queue_health.get("summary") or "Review the queue state.")
+    chips = [
+        ("Affected videos", int(queue_health.get("attention_video_count") or 0)),
+        ("Stalled", int(queue_health.get("stalled_stage_count") or 0)),
+        ("Waiting stale", int(queue_health.get("stale_waiting_stage_count") or 0)),
+        ("Queue markers", int(queue_health.get("stale_queue_marker_count") or 0)),
+        ("Failed stages", int(queue_health.get("failed_stage_count") or 0)),
+    ]
+    chip_html = "".join(
+        f"<span class='attention-chip'>{html.escape(label)}: {value:,}</span>"
+        for label, value in chips
+        if value
+    )
+    if not chip_html:
+        chip_html = "<span class='attention-chip'>State mismatch</span>"
+
+    issue_rows = []
+    for issue in list(queue_health.get("top_issues") or [])[:2] + list(queue_health.get("top_videos") or [])[:6]:
+        if not isinstance(issue, dict):
+            continue
+        name = str(issue.get("name") or "Queue")
+        stage = str(issue.get("stage_label") or "Queue")
+        message = str(issue.get("message") or "Review this queue item.")
+        issue_rows.append(
+            "<div class='attention-row'>"
+            f"<div class='attention-stage'>{html.escape(stage)}</div>"
+            f"<div class='attention-video'>{html.escape(name)}</div>"
+            f"<div class='attention-message'>{html.escape(message)}</div>"
+            "</div>"
+        )
+
+    rows_html = "".join(issue_rows)
+    if rows_html:
+        rows_html = f"<div class='attention-list'>{rows_html}</div>"
+
+    st.markdown(
+        f"""
+        <div class="attention-panel">
+            <div class="attention-head">
+                <div class="attention-icon">{svg_icon("alert-circle", COLOR_YELLOW_TEXT, size=19, stroke=2.0)}</div>
+                <div>
+                    <div class="attention-title">{html.escape(title)}</div>
+                    <div class="attention-meta">{html.escape(summary)}</div>
+                </div>
+            </div>
+            <div class="attention-chip-row">{chip_html}</div>
+            <div class="attention-next">
+                <div class="attention-next-title">Recommended next step</div>
+                <div class="attention-next-copy">Continue the queue, then inspect the Queues tab if the same stage remains stalled after the next refresh.</div>
+            </div>
+            {rows_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    action_cols = st.columns([1.2, 1.2, 4], gap="small")
+    with action_cols[0]:
+        if st.button("Continue queue", key="attention_continue_queue", type="primary", use_container_width=True):
+            queue_control.request_continue(DEFAULT_CONTROL_FILE)
+            load_queue_control_snapshot.clear()
+            st.success("Continue requested for the current queue.")
+    with action_cols[1]:
+        if st.button("Open Queues", key="attention_open_queues", use_container_width=True):
+            st.session_state.pending_active_tab = "queues"
+            st.session_state.active_tab = "queues"
+            st.session_state.mobile_nav_select = "queues"
+            st.rerun()
+
+
+def chart_frame_has_data(frame: pd.DataFrame, value_col: str | None = None) -> bool:
+    if frame.empty:
+        return False
+    if value_col is None or value_col not in frame.columns:
+        return True
+    values = pd.to_numeric(frame[value_col], errors="coerce").fillna(0)
+    return bool((values != 0).any())
+
+
+def render_timeline_chart(frame: pd.DataFrame, height: int = 300) -> None:
+    line_chart = (
+        alt.Chart(frame)
+        .mark_line(strokeWidth=3, color=COLOR_BLUE, point=alt.OverlayMarkDef(color=COLOR_BLUE_SOFT, filled=True, size=64))
+        .encode(
+            x=alt.X("timestamp:T", title=None, axis=alt.Axis(labelColor=COLOR_MUTED, grid=False)),
+            y=alt.Y("clips:Q", title=None, axis=alt.Axis(labelColor=COLOR_MUTED, gridColor=COLOR_CHART_GRID)),
+            tooltip=[alt.Tooltip("timestamp:T", title="Time"), alt.Tooltip("clips:Q", title="Clips")],
+        )
+        .properties(height=height)
+        .configure_view(strokeOpacity=0)
+        .configure(background="transparent")
+    )
+    st.altair_chart(line_chart, use_container_width=True)
+
+
+def render_stage_distribution_chart(frame: pd.DataFrame) -> None:
+    donut = (
+        alt.Chart(frame)
+        .mark_arc(innerRadius=55, outerRadius=95)
+        .encode(
+            theta=alt.Theta("count:Q"),
+            color=alt.Color(
+                "stage:N",
+                scale=alt.Scale(
+                    domain=[label for _, label, _, _ in STAGES],
+                    range=[accent for _, _, _, accent in STAGES],
+                ),
+                legend=alt.Legend(labelColor=COLOR_SLATE_TEXT, titleColor=COLOR_MUTED),
+            ),
+            tooltip=[alt.Tooltip("stage:N", title="Stage"), alt.Tooltip("count:Q", title="Videos")],
+        )
+        .properties(height=300)
+        .configure_view(strokeOpacity=0)
+        .configure(background="transparent")
+    )
+    st.altair_chart(donut, use_container_width=True)
+
+
+def render_hourly_clips_chart(frame: pd.DataFrame) -> None:
+    bar = (
+        alt.Chart(frame)
+        .mark_bar(color=COLOR_BLUE, cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
+        .encode(
+            x=alt.X("hour:O", title=None, axis=alt.Axis(labelColor=COLOR_MUTED)),
+            y=alt.Y("clips:Q", title=None, axis=alt.Axis(labelColor=COLOR_MUTED, gridColor=COLOR_CHART_GRID)),
+            tooltip=[alt.Tooltip("hour:O", title="Hour"), alt.Tooltip("clips:Q", title="Clips")],
+        )
+        .properties(height=280)
+        .configure_view(strokeOpacity=0)
+        .configure(background="transparent")
+    )
+    st.altair_chart(bar, use_container_width=True)
+
+
+def render_throughput_chart(frame: pd.DataFrame, accent: str) -> None:
+    chart = (
+        alt.Chart(frame)
+        .mark_line(strokeWidth=2, color=accent)
+        .encode(
+            x=alt.X("timestamp:T", title=None, axis=alt.Axis(labels=False, ticks=False, domain=False)),
+            y=alt.Y("count:Q", title=None, axis=alt.Axis(labels=False, ticks=False, domain=False, grid=False)),
+        )
+        .properties(height=90)
+        .configure_view(strokeOpacity=0)
+        .configure(background="transparent")
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+
 def render_page_intro(title: str, subtitle: str) -> None:
     st.markdown(
         f"""
-        <div class="page-title">{html.escape(title)}</div>
+        {heading_html(2, title, "page-title")}
         <div class="page-subtitle">{html.escape(subtitle)}</div>
         """,
         unsafe_allow_html=True,
@@ -3299,22 +4009,23 @@ def render_page_intro(title: str, subtitle: str) -> None:
 
 
 def render_video_table_panel(summary: dict[str, Any], compact: bool = False) -> None:
-    table_header_cols = st.columns([1.5, 1.5, 1.05, 1.05, 0.75], gap="small")
+    mode = "compact" if compact else "full"
+    table_header_cols = st.columns([1.4, 1.45, 1.0, 1.0, 0.7, 0.9], gap="small")
     with table_header_cols[0]:
-        st.markdown("<div class='panel-title'>Videos</div>", unsafe_allow_html=True)
+        render_panel_heading("Videos")
     with table_header_cols[1]:
         search_term = st.text_input(
             "Search videos",
             placeholder="Search videos...",
             label_visibility="collapsed",
-            key=f"search_term_{'compact' if compact else 'full'}",
+            key=f"search_term_{mode}",
         )
     with table_header_cols[2]:
         status_filter = st.selectbox(
             "Status filter",
-            ["All Statuses", "Processing", "Completed", "Waiting", "Failed"],
+            ["All Statuses", "Needs Attention", "Processing", "Waiting", "Failed", "Completed", "Paused"],
             label_visibility="collapsed",
-            key=f"status_filter_{'compact' if compact else 'full'}",
+            key=f"status_filter_{mode}",
         )
     with table_header_cols[3]:
         step_options = ["All Steps"] + [label for _, label, _, _ in STAGES] + ["Completed"]
@@ -3322,13 +4033,20 @@ def render_video_table_panel(summary: dict[str, Any], compact: bool = False) -> 
             "Step filter",
             step_options,
             label_visibility="collapsed",
-            key=f"step_filter_{'compact' if compact else 'full'}",
+            key=f"step_filter_{mode}",
         )
     with table_header_cols[4]:
-        if st.button("Refresh", key=f"table_refresh_{'compact' if compact else 'full'}", use_container_width=True):
+        if st.button("Refresh", key=f"table_refresh_{mode}", use_container_width=True):
             load_state.clear()
             load_manifest_clip_count.clear()
             st.rerun()
+    with table_header_cols[5]:
+        if st.button("Reset", key=f"table_reset_{mode}", use_container_width=True):
+            st.session_state[f"search_term_{mode}"] = ""
+            st.session_state[f"status_filter_{mode}"] = "All Statuses"
+            st.session_state[f"step_filter_{mode}"] = "All Steps"
+            st.session_state[f"table_page_{mode}"] = 1
+            st.rerun(scope="fragment")
 
     table_df = summary["table_df"].copy()
     if search_term:
@@ -3349,13 +4067,13 @@ def render_video_table_panel(summary: dict[str, Any], compact: bool = False) -> 
             "Rows",
             [7, 10, 20, 50],
             index=default_index,
-            key=f"page_size_{'compact' if compact else 'full'}",
+            key=f"page_size_{mode}",
             label_visibility="collapsed",
         )
 
     total_rows = len(table_df)
     total_pages = max((total_rows - 1) // page_size + 1, 1)
-    page_key = f"table_page_{'compact' if compact else 'full'}"
+    page_key = f"table_page_{mode}"
     current_page = min(max(st.session_state.get(page_key, 1), 1), total_pages)
     st.session_state[page_key] = current_page
 
@@ -3370,9 +4088,9 @@ def render_video_table_panel(summary: dict[str, Any], compact: bool = False) -> 
         st.caption(f"Showing {start_idx + 1} to {end_idx} of {total_rows} videos")
 
     with pager_col:
-        pager = st.columns([0.7, 2.5, 0.7, 1.2], gap="small")
+        pager = st.columns([0.9, 2.1, 0.9, 1.2], gap="small")
         with pager[0]:
-            if st.button("\u2039", key=f"page_prev_{'compact' if compact else 'full'}", use_container_width=True, disabled=current_page <= 1):
+            if st.button("Prev", key=f"page_prev_{mode}", help="Previous video page", use_container_width=True, disabled=current_page <= 1):
                 st.session_state[page_key] = max(1, current_page - 1)
                 st.rerun(scope="fragment")
         with pager[1]:
@@ -3389,14 +4107,14 @@ def render_video_table_panel(summary: dict[str, Any], compact: bool = False) -> 
                 with col:
                     if st.button(
                         str(page_num),
-                        key=f"page_{page_num}_{'compact' if compact else 'full'}",
+                        key=f"page_{page_num}_{mode}",
                         use_container_width=True,
                         type="primary" if page_num == current_page else "secondary",
                     ):
                         st.session_state[page_key] = page_num
                         st.rerun(scope="fragment")
         with pager[2]:
-            if st.button("\u203a", key=f"page_next_{'compact' if compact else 'full'}", use_container_width=True, disabled=current_page >= total_pages):
+            if st.button("Next", key=f"page_next_{mode}", help="Next video page", use_container_width=True, disabled=current_page >= total_pages):
                 st.session_state[page_key] = min(total_pages, current_page + 1)
                 st.rerun(scope="fragment")
         with pager[3]:
@@ -3428,7 +4146,7 @@ def render_product_readiness_panel() -> None:
     with st.container(border=True):
         header_cols = st.columns([2.2, 1.0], gap="medium")
         with header_cols[0]:
-            st.markdown("<div class='panel-title'>Product Readiness</div>", unsafe_allow_html=True)
+            render_panel_heading("Product Readiness")
             st.markdown(
                 (
                     "<div class='small-muted'>"
@@ -3511,7 +4229,7 @@ def render_visual_readiness_panel() -> None:
     with st.container(border=True):
         header_cols = st.columns([2.2, 1.0], gap="medium")
         with header_cols[0]:
-            st.markdown("<div class='panel-title'>Visual Readiness</div>", unsafe_allow_html=True)
+            render_panel_heading("Visual Readiness")
             st.markdown(
                 (
                     "<div class='small-muted'>"
@@ -3595,7 +4313,7 @@ def render_module_library_panel() -> None:
     with st.container(border=True):
         header_cols = st.columns([2.2, 1.0], gap="medium")
         with header_cols[0]:
-            st.markdown("<div class='panel-title'>Module Library</div>", unsafe_allow_html=True)
+            render_panel_heading("Module Library")
             st.caption(
                 f"Index: {payload.get('index_path')} | "
                 f"Indexed modules: {int(payload.get('index_module_count') or 0):,} | "
@@ -3629,7 +4347,7 @@ def render_module_library_panel() -> None:
         filter_col, table_col = st.columns([0.9, 2.4], gap="medium")
         with filter_col:
             with st.container(border=True):
-                st.markdown("<div class='panel-title' style='font-size:1rem;'>Filters</div>", unsafe_allow_html=True)
+                render_panel_heading("Filters", style="font-size:1rem;")
                 search_term = st.text_input("Search", placeholder="Module, video, transcript...", key="modules_search")
                 filter_options = payload.get("filter_options", {}) if isinstance(payload.get("filter_options"), dict) else {}
                 product_options = list(filter_options.get("product") or sorted(value for value in df["product"].dropna().unique() if value))
@@ -3693,15 +4411,15 @@ def render_module_library_panel() -> None:
             start_idx = (page - 1) * page_size
             end_idx = min(start_idx + page_size, total_rows)
             page_df = filtered.iloc[start_idx:end_idx].reset_index(drop=True)
-            pager_cols = st.columns([0.65, 0.8, 0.65, 1.9, 1.05], gap="small")
+            pager_cols = st.columns([0.9, 0.8, 0.9, 1.65, 1.05], gap="small")
             with pager_cols[0]:
-                if st.button("<", key="modules_prev", use_container_width=True, disabled=page <= 1):
+                if st.button("Prev", key="modules_prev", help="Previous module page", use_container_width=True, disabled=page <= 1):
                     st.session_state.modules_page = max(1, page - 1)
                     st.rerun(scope="fragment")
             with pager_cols[1]:
                 st.caption(f"Page {page} / {total_pages}")
             with pager_cols[2]:
-                if st.button(">", key="modules_next", use_container_width=True, disabled=page >= total_pages):
+                if st.button("Next", key="modules_next", help="Next module page", use_container_width=True, disabled=page >= total_pages):
                     st.session_state.modules_page = min(total_pages, page + 1)
                     st.rerun(scope="fragment")
             with pager_cols[3]:
@@ -3734,7 +4452,7 @@ def render_module_library_panel() -> None:
 
 def render_module_detail_panel(selected: pd.Series) -> None:
     with st.container(border=True):
-        st.markdown("<div class='panel-title'>Selected Module</div>", unsafe_allow_html=True)
+        render_panel_heading("Selected Module")
         metric_cols = st.columns(6, gap="medium")
         details = [
             ("Product", selected.get("product", "")),
@@ -3777,7 +4495,7 @@ def render_module_review_controls(selected: pd.Series) -> None:
     if not module_id:
         return
     st.divider()
-    st.markdown("<div class='panel-title' style='font-size:1rem;'>Review</div>", unsafe_allow_html=True)
+    render_panel_heading("Review", style="font-size:1rem;")
     current_quality = str(selected.get("quality_status") or "-")
     current_review = str(selected.get("review_status") or "-")
     st.caption(f"Current: quality={current_quality} | review={current_review}")
@@ -3828,13 +4546,12 @@ def apply_module_review_from_dashboard(module_id: str, status: str, reviewer: st
 def render_overview_tab(summary: dict[str, Any]) -> None:
     render_page_intro("Overview", "Live operational view across the whole VOD pipeline.")
     render_mobile_overview_strip(summary)
-    kpi_cols = st.columns(5, gap="medium")
+    kpi_cols = st.columns(4, gap="medium")
     kpis = [
-        ("Total Videos", len(summary["videos"]), "All time", "grid", "#8b5cf6"),
-        ("Videos Processing", summary["status_counts"].get("Processing", 0), "In progress", "refresh", "#3b82f6"),
-        ("Videos Completed", summary["status_counts"].get("Completed", 0), "Completed", "check-circle", "#22c55e"),
-        ("Videos Waiting", summary["status_counts"].get("Waiting", 0), "In queue", "clock", "#fbbf24"),
-        ("Videos Failed", summary["status_counts"].get("Failed", 0), "Failed", "alert-circle", "#ef4444"),
+        ("Needs Attention", summary["status_counts"].get("Needs Attention", 0), "Review now", "alert-circle", COLOR_YELLOW),
+        ("Videos Processing", summary["status_counts"].get("Processing", 0), "In progress", "refresh", COLOR_BLUE),
+        ("Videos Waiting", summary["status_counts"].get("Waiting", 0), "In queue", "clock", COLOR_YELLOW),
+        ("Videos Failed", summary["status_counts"].get("Failed", 0), "Failed", "alert-circle", COLOR_RED),
     ]
     for col, (title, value, subtitle, icon, accent) in zip(kpi_cols, kpis):
         with col:
@@ -3845,7 +4562,7 @@ def render_overview_tab(summary: dict[str, Any]) -> None:
     center_cols = st.columns([1.05, 1.18], gap="medium")
     with center_cols[0]:
         with st.container(border=True):
-            st.markdown("<div class='panel-title'>Pipeline Status</div>", unsafe_allow_html=True)
+            render_panel_heading("Pipeline Status")
             stage_cols = st.columns([1, 0.2, 1, 0.2, 1, 0.2, 1], gap="small")
             for index, (stage_key, label, icon, accent) in enumerate(STAGES):
                 target_col = index * 2
@@ -3857,7 +4574,7 @@ def render_overview_tab(summary: dict[str, Any]) -> None:
 
             st.markdown("<div style='height:0.8rem'></div>", unsafe_allow_html=True)
             st.divider()
-            st.markdown("<div class='panel-title' style='font-size:1rem;'>Queues</div>", unsafe_allow_html=True)
+            render_panel_heading("Queues", style="font-size:1rem;")
             for stage_key, label, _, _ in STAGES:
                 queued_count = summary["stage_queued"].get(stage_key, 0)
                 running_count = summary["stage_running"].get(stage_key, 0)
@@ -3866,7 +4583,13 @@ def render_overview_tab(summary: dict[str, Any]) -> None:
                 with q_cols[0]:
                     st.markdown(f"<div class='queue-label'>{label.replace(' Processing', '')} Queue</div>", unsafe_allow_html=True)
                 with q_cols[1]:
-                    st.progress(queue_fill_ratio(queued_count, running_count))
+                    queue_label = f"{label} queue"
+                    queue_text = f"{queued_count} queued of {active_count} active"
+                    render_accessible_progress(
+                        queue_fill_ratio(queued_count, running_count),
+                        queue_label,
+                        queue_text,
+                    )
                 with q_cols[2]:
                     st.markdown(f"<div class='queue-count'>{queued_count} / {active_count}</div>", unsafe_allow_html=True)
 
@@ -3874,7 +4597,7 @@ def render_overview_tab(summary: dict[str, Any]) -> None:
         with st.container(border=True):
             chart_controls = st.columns([2.6, 1], gap="small")
             with chart_controls[0]:
-                st.markdown("<div class='panel-title'>Clips Generated</div>", unsafe_allow_html=True)
+                render_panel_heading("Clips Generated")
             with chart_controls[1]:
                 window_label = st.selectbox(
                     "Window",
@@ -3913,28 +4636,10 @@ def render_overview_tab(summary: dict[str, Any]) -> None:
             if timeline_df.empty:
                 st.info("No completed clip history yet.")
             else:
-                line_chart = (
-                    alt.Chart(timeline_df)
-                    .mark_line(strokeWidth=3, color="#3b82f6", point=alt.OverlayMarkDef(color="#60a5fa", filled=True, size=64))
-                    .encode(
-                        x=alt.X("timestamp:T", title=None, axis=alt.Axis(labelColor="#94a3b8", grid=False)),
-                        y=alt.Y("clips:Q", title=None, axis=alt.Axis(labelColor="#94a3b8", gridColor="rgba(148,163,184,0.12)")),
-                        tooltip=[alt.Tooltip("timestamp:T", title="Time"), alt.Tooltip("clips:Q", title="Clips")],
-                    )
-                    .properties(height=300)
-                    .configure_view(strokeOpacity=0)
-                    .configure(background="transparent")
-                )
-                st.altair_chart(line_chart, use_container_width=True)
+                render_timeline_chart(timeline_df)
 
     with st.container(border=True):
         render_video_table_panel(summary, compact=True)
-
-
-def render_videos_tab(summary: dict[str, Any]) -> None:
-    render_page_intro("Videos", "Search, filter, and inspect the current video processing catalog.")
-    with st.container(border=True):
-        render_video_table_panel(summary, compact=False)
 
 
 def render_analytics_tab(summary: dict[str, Any]) -> None:
@@ -3964,66 +4669,32 @@ def render_analytics_tab(summary: dict[str, Any]) -> None:
     chart_cols = st.columns([1.45, 0.9], gap="medium")
     with chart_cols[0]:
         with st.container(border=True):
-            st.markdown("<div class='panel-title'>Clips Generated Over Time</div>", unsafe_allow_html=True)
-            line_chart = (
-                alt.Chart(summary["timeline_df"])
-                .mark_line(strokeWidth=3, color="#3b82f6", point=alt.OverlayMarkDef(color="#60a5fa", filled=True, size=64))
-                .encode(
-                    x=alt.X("timestamp:T", title=None, axis=alt.Axis(labelColor="#94a3b8", grid=False)),
-                    y=alt.Y("clips:Q", title=None, axis=alt.Axis(labelColor="#94a3b8", gridColor="rgba(148,163,184,0.12)")),
-                    tooltip=[alt.Tooltip("timestamp:T", title="Time"), alt.Tooltip("clips:Q", title="Clips")],
-                )
-                .properties(height=300)
-                .configure_view(strokeOpacity=0)
-                .configure(background="transparent")
-            )
-            st.altair_chart(line_chart, use_container_width=True)
+            render_panel_heading("Clips Generated Over Time")
+            if summary["timeline_df"].empty:
+                st.info("No completed clip history yet.")
+            else:
+                render_timeline_chart(summary["timeline_df"])
 
     with chart_cols[1]:
         with st.container(border=True):
-            st.markdown("<div class='panel-title'>Clips by Processing Stage</div>", unsafe_allow_html=True)
-            donut = (
-                alt.Chart(summary["stage_distribution_df"])
-                .mark_arc(innerRadius=55, outerRadius=95)
-                .encode(
-                    theta=alt.Theta("count:Q"),
-                    color=alt.Color(
-                        "stage:N",
-                        scale=alt.Scale(
-                            domain=[label for _, label, _, _ in STAGES],
-                            range=[accent for _, _, _, accent in STAGES],
-                        ),
-                        legend=alt.Legend(labelColor="#cbd5e1", titleColor="#94a3b8"),
-                    ),
-                    tooltip=[alt.Tooltip("stage:N", title="Stage"), alt.Tooltip("count:Q", title="Videos")],
-                )
-                .properties(height=300)
-                .configure_view(strokeOpacity=0)
-                .configure(background="transparent")
-            )
-            st.altair_chart(donut, use_container_width=True)
+            render_panel_heading("Clips by Processing Stage")
+            if chart_frame_has_data(summary["stage_distribution_df"], "count"):
+                render_stage_distribution_chart(summary["stage_distribution_df"])
+            else:
+                st.info("No video stage data yet.")
 
     bottom_cols = st.columns([1.3, 0.9], gap="medium")
     with bottom_cols[0]:
         with st.container(border=True):
-            st.markdown("<div class='panel-title'>Clips Generated by Hour of Day (avg)</div>", unsafe_allow_html=True)
-            bar = (
-                alt.Chart(summary["hourly_clips_df"])
-                .mark_bar(color="#3b82f6", cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
-                .encode(
-                    x=alt.X("hour:O", title=None, axis=alt.Axis(labelColor="#94a3b8")),
-                    y=alt.Y("clips:Q", title=None, axis=alt.Axis(labelColor="#94a3b8", gridColor="rgba(148,163,184,0.12)")),
-                    tooltip=[alt.Tooltip("hour:O", title="Hour"), alt.Tooltip("clips:Q", title="Clips")],
-                )
-                .properties(height=280)
-                .configure_view(strokeOpacity=0)
-                .configure(background="transparent")
-            )
-            st.altair_chart(bar, use_container_width=True)
+            render_panel_heading("Clips Generated by Hour of Day (avg)")
+            if chart_frame_has_data(summary["hourly_clips_df"], "clips"):
+                render_hourly_clips_chart(summary["hourly_clips_df"])
+            else:
+                st.info("No hourly clip history yet.")
 
     with bottom_cols[1]:
         with st.container(border=True):
-            st.markdown("<div class='panel-title'>Top Videos by Clips Generated</div>", unsafe_allow_html=True)
+            render_panel_heading("Top Videos by Clips Generated")
             st.dataframe(summary["top_videos_df"], use_container_width=True, hide_index=True)
 
 
@@ -4057,7 +4728,6 @@ def render_scores_tab(summary: dict[str, Any]) -> None:
                 invalidate_scores_session_cache()
                 load_score_rows.clear()
                 load_scorer_stats.clear()
-                load_score_trend_payload.clear()
                 _discover_score_output_dirs_cached.clear()
                 st.rerun(scope="fragment")
         with action_cols[1]:
@@ -4109,6 +4779,9 @@ def render_scores_tab(summary: dict[str, Any]) -> None:
     with right_panel:
         st.markdown("<div class='desktop-score-detail-anchor'></div>", unsafe_allow_html=True)
         render_score_detail_panel(selected, score_df)
+
+    st.markdown("<div style='height:0.85rem'></div>", unsafe_allow_html=True)
+    render_score_methodology()
 
 
 def ensure_scores_filter_state(product_options: list[str], flag_options: list[str]) -> None:
@@ -4176,11 +4849,11 @@ def render_scores_review_styles() -> None:
         .score-kpi-card {
             min-height: 96px;
             border: 1px solid rgba(148, 163, 184, 0.14);
-            border-left: 3px solid var(--score-kpi-accent, #3b82f6);
             border-radius: 8px;
             background: linear-gradient(180deg, rgba(15, 23, 42, 0.78), rgba(8, 15, 27, 0.72));
             padding: 0.72rem 0.68rem 0.72rem 0.78rem;
             min-width: 0;
+            box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--score-kpi-accent, var(--blue)) 24%, transparent);
         }
         .score-kpi-icon {
             width: 26px;
@@ -4192,14 +4865,14 @@ def render_scores_review_styles() -> None:
             margin-bottom: 0.42rem;
         }
         .score-kpi-label {
-            color: #cbd5e1;
+            color: var(--text-slate);
             font-size: 0.68rem;
             font-weight: 700;
             line-height: 1.1;
             word-break: normal;
         }
         .score-kpi-value {
-            color: #f8fafc;
+            color: var(--text-strong);
             font-size: 28px;
             font-weight: 800;
             line-height: 1.05;
@@ -4218,10 +4891,10 @@ def render_scores_review_styles() -> None:
         }
         .score-review-header {
             display: grid;
-            grid-template-columns: 0.22fr 1.12fr 1.02fr 0.74fr 0.62fr 0.72fr 0.68fr 0.46fr;
+            grid-template-columns: 0.44fr 1.06fr 0.98fr 0.7fr 0.6fr 0.7fr 0.66fr 0.62fr;
             gap: 0.46rem;
             align-items: center;
-            color: #94a3b8;
+            color: var(--muted);
             font-size: 0.74rem;
             font-weight: 800;
             padding: 0.5rem 0.58rem;
@@ -4250,32 +4923,32 @@ def render_scores_review_styles() -> None:
             font-variant-numeric: tabular-nums;
         }
         .score-table-row-marker + div[data-testid="stHorizontalBlock"] {
-            border-left: 2px solid transparent;
-            padding: 0.08rem 0 0.08rem 0.18rem;
+            border: 1px solid transparent;
+            padding: 0.08rem 0.18rem;
             border-radius: 6px;
         }
         div[data-testid="stElementContainer"]:has(.score-table-row-marker) + div[data-testid="stLayoutWrapper"] {
-            border-left: 2px solid transparent;
-            padding: 0.08rem 0 0.08rem 0.18rem;
+            border: 1px solid transparent;
+            padding: 0.08rem 0.18rem;
             border-radius: 6px;
         }
         .score-table-row-marker.is-selected + div[data-testid="stHorizontalBlock"] {
-            border-left-color: #7c3aed;
+            border-color: rgba(124, 58, 237, 0.48);
             background: rgba(99, 102, 241, 0.055);
         }
         div[data-testid="stElementContainer"]:has(.score-table-row-marker.is-selected) + div[data-testid="stLayoutWrapper"] {
-            border-left-color: #7c3aed;
+            border-color: rgba(124, 58, 237, 0.48);
             background: rgba(99, 102, 241, 0.055);
         }
         .score-variant-row-marker + div[data-testid="stHorizontalBlock"] {
             padding: 0.12rem 0.2rem;
             border-radius: 6px;
-            border-left: 2px solid transparent;
+            border: 1px solid transparent;
         }
         div[data-testid="stElementContainer"]:has(.score-variant-row-marker) + div[data-testid="stLayoutWrapper"] {
             padding: 0.12rem 0.2rem;
             border-radius: 6px;
-            border-left: 2px solid transparent;
+            border: 1px solid transparent;
         }
         .score-variant-row-marker.is-alt + div[data-testid="stHorizontalBlock"] {
             background: rgba(148, 163, 184, 0.055);
@@ -4284,11 +4957,11 @@ def render_scores_review_styles() -> None:
             background: rgba(148, 163, 184, 0.055);
         }
         .score-variant-row-marker.is-selected + div[data-testid="stHorizontalBlock"] {
-            border-left-color: #7c3aed;
+            border-color: rgba(124, 58, 237, 0.48);
             background: rgba(99, 102, 241, 0.075);
         }
         div[data-testid="stElementContainer"]:has(.score-variant-row-marker.is-selected) + div[data-testid="stLayoutWrapper"] {
-            border-left-color: #7c3aed;
+            border-color: rgba(124, 58, 237, 0.48);
             background: rgba(99, 102, 241, 0.075);
         }
         .score-filter-table-gap {
@@ -4297,12 +4970,12 @@ def render_scores_review_styles() -> None:
         div[data-testid="stElementContainer"]:has(.score-today-button-marker) + div[data-testid="stElementContainer"] button {
             border-color: rgba(148, 163, 184, 0.28);
             background: rgba(15, 23, 42, 0.24);
-            color: #edf3ff;
+            color: var(--text);
         }
         div[data-testid="stElementContainer"]:has(.score-today-button-marker.is-active) + div[data-testid="stElementContainer"] button {
             border-color: rgba(124, 58, 237, 0.82);
             background: linear-gradient(135deg, rgba(37, 99, 235, 0.88), rgba(124, 58, 237, 0.88));
-            color: #ffffff;
+            color: var(--text-strong);
             box-shadow: 0 8px 22px rgba(59, 130, 246, 0.18);
         }
         .score-detail-title-row {
@@ -4313,18 +4986,18 @@ def render_scores_review_styles() -> None:
             margin-bottom:0.45rem;
         }
         .score-detail-title {
-            color:#f8fafc;
+            color:var(--text-strong);
             font-size:1.1rem;
             font-weight:800;
             line-height:1.15;
         }
         .score-detail-product {
-            color:#cbd5e1;
+            color:var(--text-slate);
             font-size:0.88rem;
             margin-top:0.18rem;
         }
         .score-meta-line {
-            color:#94a3b8;
+            color:var(--muted);
             font-size:0.78rem;
             margin-bottom:0.75rem;
         }
@@ -4336,7 +5009,7 @@ def render_scores_review_styles() -> None:
             margin:0 0 12px 0;
         }
         .score-dimension-label {
-            color:#cbd5e1;
+            color:var(--text-slate);
             font-size:0.78rem;
         }
         .score-dimension-track {
@@ -4350,7 +5023,7 @@ def render_scores_review_styles() -> None:
             border-radius:4px;
         }
         .score-dimension-value {
-            color:#e2e8f0;
+            color:var(--text-table);
             font-size:0.78rem;
             text-align:right;
             font-variant-numeric:tabular-nums;
@@ -4362,7 +5035,7 @@ def render_scores_review_styles() -> None:
             border-radius:8px;
             padding:0.82rem;
             background:rgba(2, 8, 23, 0.22);
-            color:#dbeafe;
+            color:var(--text-blue);
             font-size:0.86rem;
             line-height:1.55;
         }
@@ -4388,15 +5061,15 @@ def render_scores_review_styles() -> None:
         div[data-testid="stColumn"]:has(.score-detail-anchor) video[data-testid="stVideo"] {
             max-height: 220px;
             object-fit: contain;
-            background: #020617;
+            background: var(--video-black);
             width: 100%;
         }
         div[data-testid="stColumn"]:has(.score-detail-anchor) video[data-testid="stVideo"] {
             margin-bottom: 0.25rem;
         }
         div[data-testid="stColumn"]:has(.score-detail-anchor) button[data-baseweb="tab"][aria-selected="true"] {
-            border-bottom: 2px solid #7c3aed;
-            color: #dbeafe;
+            border-bottom: 2px solid var(--violet-strong);
+            color: var(--text-blue);
         }
         div[data-testid="stColumn"]:has(.score-detail-anchor) button[data-baseweb="tab"] {
             padding-bottom: 0.42rem;
@@ -4584,11 +5257,11 @@ def render_scores_kpi_cards(filtered: pd.DataFrame, filtered_all_dates: pd.DataF
     blocked_count = int(filtered["Compliance Blocked"].fillna(False).astype(bool).sum()) if total else 0
     delta = average_delta_vs_yesterday(average_score, filtered_all_dates)
     cards = [
-        ("Base Clips", f"{total:,}", "Filtered", "clapboard", "#3b82f6"),
-        ("Average Score", f"{average_score:.2f}", delta, "star", "#8b5cf6"),
-        ("Strong Clips", f"{strong_count:,}", f"{percentage(strong_count, total)} of total", "check-circle", "#22c55e"),
-        ("Needs Review", f"{needs_review_count:,}", f"{percentage(needs_review_count, total)} of total", "alert-circle", "#f59e0b"),
-        ("Compliance Blocked", f"{blocked_count:,}", f"{percentage(blocked_count, total)} of total", "shield", "#ef4444"),
+        ("Base Clips", f"{total:,}", "Filtered", "clapboard", COLOR_BLUE),
+        ("Average Score", f"{average_score:.2f}", delta, "star", COLOR_VIOLET),
+        ("Strong Clips", f"{strong_count:,}", f"{percentage(strong_count, total)} of total", "check-circle", COLOR_GREEN),
+        ("Needs Review", f"{needs_review_count:,}", f"{percentage(needs_review_count, total)} of total", "alert-circle", COLOR_ORANGE),
+        ("Compliance Blocked", f"{blocked_count:,}", f"{percentage(blocked_count, total)} of total", "shield", COLOR_RED),
     ]
     card_html = []
     for label, value, sub, icon, accent in cards:
@@ -4643,8 +5316,19 @@ def render_scores_filter_bar(product_options: list[str], flag_options: list[str]
             st.selectbox("Sort By", score_sort_options(), key="scores_sort_preset")
 
 
+def reset_scores_filters() -> None:
+    st.session_state.scores_product_filter = "All Products"
+    st.session_state.scores_search = ""
+    st.session_state.scores_score_range = (0.0, 10.0)
+    st.session_state.scores_status_filter = "All Statuses"
+    st.session_state.scores_flag_filter = "All Flags"
+    st.session_state.scores_sort_preset = "Scored At"
+    st.session_state.scores_today_only = False
+    st.session_state.scores_page = 1
+
+
 def render_scores_table_toolbar(filtered: pd.DataFrame) -> None:
-    cols = st.columns([0.8, 2.0, 1.2], gap="small")
+    cols = st.columns([0.85, 1.7, 1.05, 1.15], gap="small")
     with cols[0]:
         today_active = bool(st.session_state.get("scores_today_only", False))
         marker_class = "score-today-button-marker is-active" if today_active else "score-today-button-marker"
@@ -4662,7 +5346,11 @@ def render_scores_table_toolbar(filtered: pd.DataFrame) -> None:
         suffix = "from today's source videos" if bool(st.session_state.get("scores_today_only", False)) else "after filters"
         st.caption(f"{len(filtered):,} clips {suffix}")
     with cols[2]:
-        st.caption("Preview loads in the right panel")
+        st.caption("Select Preview to load a clip in the detail panel")
+    with cols[3]:
+        if st.button("Reset filters", key="scores_reset_filters", use_container_width=True):
+            reset_scores_filters()
+            st.rerun(scope="fragment")
 
 
 def render_paginated_dataframe(
@@ -4688,15 +5376,15 @@ def render_paginated_dataframe(
     end_idx = min(start_idx + page_size, total_rows)
     page_df = frame.iloc[start_idx:end_idx]
 
-    control_cols = st.columns([0.7, 1.2, 0.7, 2.2, 1.0], gap="small")
+    control_cols = st.columns([0.9, 1.2, 0.9, 1.8, 1.0], gap="small")
     with control_cols[0]:
-        if st.button("<", key=f"{key_prefix}_prev", use_container_width=True, disabled=page <= 1):
+        if st.button("Prev", key=f"{key_prefix}_prev", help="Previous page", use_container_width=True, disabled=page <= 1):
             st.session_state[page_key] = max(1, page - 1)
             st.rerun(scope="fragment")
     with control_cols[1]:
         st.caption(f"Page {page} / {total_pages}")
     with control_cols[2]:
-        if st.button(">", key=f"{key_prefix}_next", use_container_width=True, disabled=page >= total_pages):
+        if st.button("Next", key=f"{key_prefix}_next", help="Next page", use_container_width=True, disabled=page >= total_pages):
             st.session_state[page_key] = min(total_pages, page + 1)
             st.rerun(scope="fragment")
     with control_cols[3]:
@@ -4847,10 +5535,10 @@ def render_compliance_tab(summary: dict[str, Any]) -> None:
 
     kpi_cols = st.columns(4, gap="medium")
     kpis = [
-        ("Scanned", int(totals.get("scanned") or 0), "clips", "focus", "#3b82f6"),
-        ("Passed", int(totals.get("passed") or 0), "clips", "check-circle", "#22c55e"),
-        ("Blocked", int(totals.get("blocked") or 0), "high severity", "alert-circle", "#ef4444"),
-        ("Auto-fixed", int(totals.get("auto_fixed") or 0), "low severity", "refresh", "#fbbf24"),
+        ("Scanned", int(totals.get("scanned") or 0), "clips", "focus", COLOR_BLUE),
+        ("Passed", int(totals.get("passed") or 0), "clips", "check-circle", COLOR_GREEN),
+        ("Blocked", int(totals.get("blocked") or 0), "high severity", "alert-circle", COLOR_RED),
+        ("Auto-fixed", int(totals.get("auto_fixed") or 0), "low severity", "refresh", COLOR_YELLOW),
     ]
     for col, (title, value, subtitle, icon_name, accent) in zip(kpi_cols, kpis):
         with col:
@@ -4862,7 +5550,7 @@ def render_compliance_tab(summary: dict[str, Any]) -> None:
 
     st.markdown("<div style='height:0.8rem'></div>", unsafe_allow_html=True)
     with st.container(border=True):
-        st.markdown("<div class='panel-title'>Re-scan</div>", unsafe_allow_html=True)
+        render_panel_heading("Re-scan")
         run_options = ["Select run"] + list(output_dirs)
         selected_run = st.selectbox(
             "Output Run",
@@ -4886,7 +5574,6 @@ def render_compliance_tab(summary: dict[str, Any]) -> None:
                 load_compliance_detail_rows.clear()
                 load_score_rows.clear()
                 load_scorer_stats.clear()
-                load_score_trend_payload.clear()
                 invalidate_scores_session_cache()
                 load_manifest_clip_count.clear()
                 st.success(
@@ -5039,94 +5726,8 @@ def render_compliance_tab(summary: dict[str, Any]) -> None:
 
 def _compliance_severity_style(row: pd.Series) -> list[str]:
     severity = str(row.get("Severity") or "").lower()
-    colors = {
-        "high": "background-color: rgba(239, 68, 68, 0.24); color: #fee2e2;",
-        "medium": "background-color: rgba(249, 115, 22, 0.22); color: #ffedd5;",
-        "low": "background-color: rgba(234, 179, 8, 0.20); color: #fef9c3;",
-    }
-    style = colors.get(severity, "")
+    style = COMPLIANCE_SEVERITY_STYLES.get(severity, "")
     return [style for _ in row]
-
-
-def render_trends_tab(summary: dict[str, Any]) -> None:
-    render_page_intro("Trends", "Score trends by product, dimension, tier, and recurring flags.")
-    trend_payload = load_score_trend_payload(collect_score_output_dirs(summary))
-    if not int(trend_payload.get("clip_count") or 0):
-        with st.container(border=True):
-            st.info("No score trend data found yet.")
-        return
-
-    product_df = trend_payload["product_df"]
-    dimension_df = trend_payload["dimension_df"]
-    tier_df = trend_payload["tier_df"]
-    flags_df = trend_payload["flags_df"]
-    top_df = trend_payload["top_df"]
-    tier_order = trend_payload["tier_order"]
-
-    chart_cols = st.columns([1, 1], gap="medium")
-    with chart_cols[0]:
-        with st.container(border=True):
-            st.markdown("<div class='panel-title'>Average Total by Product</div>", unsafe_allow_html=True)
-            chart = (
-                alt.Chart(product_df)
-                .mark_bar(color="#22c55e", cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
-                .encode(
-                    x=alt.X("Product:N", sort=TREND_PRODUCTS, title=None, axis=alt.Axis(labelColor="#94a3b8")),
-                    y=alt.Y("Average Total:Q", title=None, scale=alt.Scale(domain=[0, 10]), axis=alt.Axis(labelColor="#94a3b8", gridColor="rgba(148,163,184,0.12)")),
-                    tooltip=["Product", "Average Total", "Clips"],
-                )
-            )
-            st.altair_chart(chart, use_container_width=True)
-
-    with chart_cols[1]:
-        with st.container(border=True):
-            st.markdown("<div class='panel-title'>Average by Dimension</div>", unsafe_allow_html=True)
-            chart = (
-                alt.Chart(dimension_df)
-                .mark_bar(color="#3b82f6", cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
-                .encode(
-                    x=alt.X("Dimension:N", title=None, axis=alt.Axis(labelColor="#94a3b8")),
-                    y=alt.Y("Average Score:Q", title=None, scale=alt.Scale(domain=[0, 10]), axis=alt.Axis(labelColor="#94a3b8", gridColor="rgba(148,163,184,0.12)")),
-                    tooltip=["Dimension", "Average Score"],
-                )
-            )
-            st.altair_chart(chart, use_container_width=True)
-
-    lower_cols = st.columns([0.8, 1.2], gap="medium")
-    with lower_cols[0]:
-        with st.container(border=True):
-            st.markdown("<div class='panel-title'>Score Tiers</div>", unsafe_allow_html=True)
-            chart = (
-                alt.Chart(tier_df)
-                .mark_bar(color="#fbbf24", cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
-                .encode(
-                    x=alt.X("Tier:N", sort=tier_order, title=None, axis=alt.Axis(labelColor="#94a3b8")),
-                    y=alt.Y("Clips:Q", title=None, axis=alt.Axis(labelColor="#94a3b8", gridColor="rgba(148,163,184,0.12)")),
-                    tooltip=["Tier", "Clips"],
-                )
-            )
-            st.altair_chart(chart, use_container_width=True)
-
-    with lower_cols[1]:
-        with st.container(border=True):
-            st.markdown("<div class='panel-title'>Most Common Flags</div>", unsafe_allow_html=True)
-            if flags_df.empty:
-                st.info("No flags found.")
-            else:
-                chart = (
-                    alt.Chart(flags_df)
-                    .mark_bar(color="#8b5cf6", cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
-                    .encode(
-                        x=alt.X("Count:Q", title=None, axis=alt.Axis(labelColor="#94a3b8", gridColor="rgba(148,163,184,0.12)")),
-                        y=alt.Y("Flag:N", sort="-x", title=None, axis=alt.Axis(labelColor="#94a3b8")),
-                        tooltip=["Flag", "Count"],
-                    )
-                )
-                st.altair_chart(chart, use_container_width=True)
-
-    with st.container(border=True):
-        st.markdown("<div class='panel-title'>Top 3 Clips Overall</div>", unsafe_allow_html=True)
-        st.dataframe(top_df, use_container_width=True, hide_index=True)
 
 
 def render_focus_debug_tab(summary: dict[str, Any]) -> None:
@@ -5151,7 +5752,7 @@ def render_focus_debug_tab(summary: dict[str, Any]) -> None:
     selected = rows[selected_index]
 
     with st.container(border=True):
-        st.markdown("<div class='panel-title'>Contact Sheet</div>", unsafe_allow_html=True)
+        render_panel_heading("Contact Sheet")
         image_path = Path(selected["Image Path"])
         if image_path.exists():
             image_key = hashlib.sha1(str(image_path).encode("utf-8", errors="ignore")).hexdigest()[:12]
@@ -5179,7 +5780,7 @@ def render_focus_debug_tab(summary: dict[str, Any]) -> None:
             if col in frame.columns
         ]
         with st.container(border=True):
-            st.markdown("<div class='panel-title'>Per-Frame Breakdown</div>", unsafe_allow_html=True)
+            render_panel_heading("Per-Frame Breakdown")
             st.dataframe(frame[visible_cols], use_container_width=True, hide_index=True)
 
 
@@ -5252,15 +5853,15 @@ def render_scores_click_table(filtered: pd.DataFrame, selected_key: str, score_d
     selected_key = render_scores_compact_table(page_df, selected_key)
     selected_key = render_scores_mobile_cards(page_df, selected_key, score_df)
 
-    pager_cols = st.columns([0.65, 0.7, 0.65, 1.75, 1.05], gap="small")
+    pager_cols = st.columns([0.9, 0.7, 0.9, 1.5, 1.05], gap="small")
     with pager_cols[0]:
-        if st.button("\u2039", key="scores_prev", use_container_width=True, disabled=page <= 1):
+        if st.button("Prev", key="scores_prev", help="Previous scores page", use_container_width=True, disabled=page <= 1):
             st.session_state.scores_page = max(1, page - 1)
             st.rerun(scope="fragment")
     with pager_cols[1]:
         st.caption(f"Page {page} / {total_pages}")
     with pager_cols[2]:
-        if st.button("\u203a", key="scores_next", use_container_width=True, disabled=page >= total_pages):
+        if st.button("Next", key="scores_next", help="Next scores page", use_container_width=True, disabled=page >= total_pages):
             st.session_state.scores_page = min(total_pages, page + 1)
             st.rerun(scope="fragment")
     with pager_cols[3]:
@@ -5275,7 +5876,7 @@ def render_scores_compact_table(page_df: pd.DataFrame, selected_key: str) -> str
         """
         <div class="score-review-shell">
         <div class="score-review-header">
-            <div></div>
+            <div>Variants</div>
             <div>Clip ID</div>
             <div>Product</div>
             <div>Total Score</div>
@@ -5299,12 +5900,12 @@ def render_scores_compact_table(page_df: pd.DataFrame, selected_key: str) -> str
             row_classes.append("is-selected")
         st.markdown(f"<div class='{' '.join(row_classes)}'></div>", unsafe_allow_html=True)
 
-        cols = st.columns([0.22, 1.12, 1.02, 0.74, 0.62, 0.72, 0.68, 0.46], gap="small")
+        cols = st.columns([0.44, 1.06, 0.98, 0.7, 0.6, 0.7, 0.66, 0.62], gap="small")
         with cols[0]:
             if st.button(
-                "v" if expanded else ">",
+                "Hide" if expanded else "Show",
                 key=f"score_expand_{base_key}_{row_index}",
-                help="Show variants",
+                help="Hide variants" if expanded else "Show variants",
                 use_container_width=True,
             ):
                 st.session_state.expanded_score_base_key = "" if expanded else base_key
@@ -5326,9 +5927,9 @@ def render_scores_compact_table(page_df: pd.DataFrame, selected_key: str) -> str
             st.markdown(render_status_badge(row), unsafe_allow_html=True)
         with cols[7]:
             if st.button(
-                "▶",
+                "Preview",
                 key=f"score_preview_{key}_{row_index}",
-                help="Preview in the detail panel",
+                help="Preview this clip in the detail panel",
                 use_container_width=True,
                 type="secondary",
             ):
@@ -5350,7 +5951,7 @@ def render_scores_mobile_cards(page_df: pd.DataFrame, selected_key: str, score_d
         key = str(row.get("_score_key", ""))
         base_key = str(row.get("_base_score_key", key))
         selected = key == selected_key
-        selected_style = "border-color: rgba(124, 58, 237, 0.62);" if selected else ""
+        selected_style = SCORE_SELECTED_BORDER_STYLE if selected else ""
         flags = render_flags_count_cell(row.get("Flag Count"), str(row.get("Flag Severity") or "none"))
         variants = int(score_float(row.get("Variants")) or 0)
         st.markdown(
@@ -5436,10 +6037,10 @@ def render_score_variants_panel(
     selected_key: str,
     key_prefix: str = "variants",
 ) -> str:
-    header = st.columns([1.55, 0.72, 0.7, 1.0, 0.42], gap="small")
+    header = st.columns([1.45, 0.7, 0.68, 0.95, 0.62], gap="small")
     for col, label in zip(header, ["Variant ID", "Total Score", "Similarity", "Render Status", "Preview"]):
         with col:
-            st.markdown(f"<div class='score-review-cell' style='color:#94a3b8;font-weight:800;'>{label}</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='score-review-cell' style='{SCORE_REVIEW_HEADER_STYLE}'>{label}</div>", unsafe_allow_html=True)
 
     if variants.empty:
         st.caption("No variants found for this clip.")
@@ -5454,7 +6055,7 @@ def render_score_variants_panel(
         if selected:
             row_classes.append("is-selected")
         st.markdown(f"<div class='{' '.join(row_classes)}'></div>", unsafe_allow_html=True)
-        cols = st.columns([1.55, 0.72, 0.7, 1.0, 0.42], gap="small")
+        cols = st.columns([1.45, 0.7, 0.68, 0.95, 0.62], gap="small")
         with cols[0]:
             variant_id = str((row.get("_raw") or {}).get("variant_id") or row.get("Clip ID", ""))
             st.markdown(f"<div class='score-review-cell'>{html.escape(variant_id)}</div>", unsafe_allow_html=True)
@@ -5466,7 +6067,7 @@ def render_score_variants_panel(
             st.markdown(render_variant_status_badge(row), unsafe_allow_html=True)
         with cols[4]:
             if st.button(
-                "▶",
+                "Preview",
                 key=f"score_variant_preview_{key_prefix}_{base_key}_{key}_{row_index}",
                 help="Preview this variant",
                 use_container_width=True,
@@ -5508,13 +6109,7 @@ def render_total_score_cell(value: Any) -> str:
 
 def render_quality_badge(value: Any) -> str:
     label = score_quality_label(value)
-    colors = {
-        "High": ("#86efac", "rgba(22, 163, 74, 0.22)", "rgba(34, 197, 94, 0.32)"),
-        "Medium": ("#fde68a", "rgba(202, 138, 4, 0.22)", "rgba(251, 191, 36, 0.32)"),
-        "Low": ("#fecaca", "rgba(220, 38, 38, 0.22)", "rgba(239, 68, 68, 0.32)"),
-        "Unknown": ("#cbd5e1", "rgba(100, 116, 139, 0.16)", "rgba(148, 163, 184, 0.24)"),
-    }
-    color, background, border = colors.get(label, colors["Unknown"])
+    color, background, border = QUALITY_BADGE_TONES.get(label, QUALITY_BADGE_TONES["Unknown"])
     return (
         "<div class='score-review-cell'>"
         f"<span class='score-table-badge' style='color:{color}; background:{background}; border-color:{border};'>"
@@ -5524,13 +6119,7 @@ def render_quality_badge(value: Any) -> str:
 
 def render_status_badge(row: pd.Series) -> str:
     status = str(row.get("Status") or score_status_label(row.get("Total Score"), row.get("Flag Severity"), bool(row.get("Compliance Blocked"))))
-    colors = {
-        "Strong": ("#86efac", "rgba(22, 163, 74, 0.22)", "rgba(34, 197, 94, 0.34)"),
-        "Review": ("#fde68a", "rgba(202, 138, 4, 0.22)", "rgba(251, 191, 36, 0.34)"),
-        "Okay": ("#bfdbfe", "rgba(59, 130, 246, 0.18)", "rgba(96, 165, 250, 0.30)"),
-        "Blocked": ("#fecaca", "rgba(220, 38, 38, 0.24)", "rgba(239, 68, 68, 0.36)"),
-    }
-    color, background, border = colors.get(status, colors["Okay"])
+    color, background, border = STATUS_BADGE_TONES.get(status, STATUS_BADGE_TONES["Okay"])
     return (
         "<div class='score-review-cell'>"
         f"<span class='score-table-badge' style='color:{color}; background:{background}; border-color:{border};'>"
@@ -5550,11 +6139,11 @@ def render_variant_status_badge(row: pd.Series) -> str:
             status = "Pending"
     status_key = status.casefold()
     if "block" in status_key or "fail" in status_key:
-        color, background, border = "#fecaca", "rgba(220, 38, 38, 0.24)", "rgba(239, 68, 68, 0.36)"
+        color, background, border = BADGE_DANGER
     elif "render" in status_key or "export" in status_key:
-        color, background, border = "#86efac", "rgba(22, 163, 74, 0.22)", "rgba(34, 197, 94, 0.34)"
+        color, background, border = BADGE_SUCCESS
     else:
-        color, background, border = "#fde68a", "rgba(202, 138, 4, 0.22)", "rgba(251, 191, 36, 0.34)"
+        color, background, border = BADGE_WARNING
     return (
         "<div class='score-review-cell'>"
         f"<span class='score-table-badge' style='color:{color}; background:{background}; border-color:{border};'>"
@@ -5570,12 +6159,7 @@ def render_flags_count_cell(count_value: Any, severity: str) -> str:
     suffix = "" if count == 1 else "s"
     label = f"{count} flag{suffix}"
     severity_key = str(severity or "none").casefold()
-    colors = {
-        "high": ("#ffffff", "#dc2626", "rgba(248, 113, 113, 0.55)"),
-        "medium": ("#ffffff", "#f59e0b", "rgba(251, 191, 36, 0.55)"),
-        "none": ("#ffffff", "#64748b", "rgba(148, 163, 184, 0.48)"),
-    }
-    color, background, border = colors.get(severity_key, colors["none"])
+    color, background, border = FLAG_BADGE_TONES.get(severity_key, FLAG_BADGE_TONES["none"])
     return (
         "<div class='score-review-cell'>"
         f"<span class='score-table-badge' style='color:{color}; background:{background}; border-color:{border};'>"
@@ -5585,12 +6169,12 @@ def render_flags_count_cell(count_value: Any, severity: str) -> str:
 
 def score_band_color(score: float | None) -> str:
     if score is None:
-        return "rgba(148, 163, 184, 0.08)"
+        return SCORE_BAND_BACKGROUNDS["unknown"]
     if score >= 7:
-        return "rgba(34, 197, 94, 0.16)"
+        return SCORE_BAND_BACKGROUNDS["strong"]
     if score >= 5:
-        return "rgba(251, 191, 36, 0.16)"
-    return "rgba(239, 68, 68, 0.16)"
+        return SCORE_BAND_BACKGROUNDS["review"]
+    return SCORE_BAND_BACKGROUNDS["weak"]
 
 
 def score_format(value: Any) -> str:
@@ -5604,7 +6188,7 @@ def render_score_mobile_inline_detail(selected: pd.Series) -> None:
     base_raw = selected.get("_base_raw", {}) if isinstance(selected.get("_base_raw", {}), dict) else {}
     with st.container(border=True):
         st.markdown("<div class='mobile-inline-score-detail-anchor'></div>", unsafe_allow_html=True)
-        st.markdown("<div class='panel-title'>Selected Clip</div>", unsafe_allow_html=True)
+        render_panel_heading("Selected Clip")
         clip_path = score_clip_path(selected)
         if clip_path and clip_path.exists():
             if st.session_state.get("score_preview_loaded_key") == selected_key:
@@ -5613,7 +6197,7 @@ def render_score_mobile_inline_detail(selected: pd.Series) -> None:
                 st.session_state.score_preview_loaded_key = selected_key
                 st.rerun(scope="fragment")
             else:
-                st.caption("Preview is ready. Tap Load preview to stream the clip.")
+                st.caption("Preview is ready. Select Load preview to stream this clip.")
         else:
             st.caption(str(selected.get("Output File") or raw.get("output_file") or "Preview file unavailable"))
 
@@ -5647,7 +6231,7 @@ def render_score_detail_panel(selected: pd.Series | None, score_df: pd.DataFrame
     st.markdown("<div class='score-detail-anchor'></div>", unsafe_allow_html=True)
     with st.container(border=True):
         if selected is None:
-            st.markdown("<div class='panel-title'>Selected Clip</div>", unsafe_allow_html=True)
+            render_panel_heading("Selected Clip")
             st.info("Select a clip to preview")
             return
 
@@ -5685,7 +6269,7 @@ def render_score_detail_panel(selected: pd.Series | None, score_df: pd.DataFrame
                 st.session_state.score_preview_loaded_key = selected_key
                 st.rerun(scope="fragment")
             else:
-                st.caption("Preview is ready. Tap Load preview to stream the clip.")
+                st.caption("Preview is ready. Select Load preview to stream this clip.")
         else:
             st.caption(str(selected.get("Output File") or raw.get("output_file") or "Preview file unavailable"))
 
@@ -5885,10 +6469,10 @@ def render_detail_variants_panel(selected: pd.Series, score_df: pd.DataFrame) ->
     if variants.empty:
         st.caption("No variants found for this clip.")
         return
-    header = st.columns([1.2, 0.95, 0.65, 0.65, 0.95, 0.42], gap="small")
+    header = st.columns([1.1, 0.88, 0.62, 0.62, 0.86, 0.62], gap="small")
     for col, label in zip(header, ["Variant ID", "Hook Type", "Total", "Similarity", "Render Status", "Preview"]):
         with col:
-            st.markdown(f"<div class='score-review-cell' style='color:#94a3b8;font-weight:800;'>{label}</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='score-review-cell' style='{SCORE_REVIEW_HEADER_STYLE}'>{label}</div>", unsafe_allow_html=True)
     for idx, row in variants.iterrows():
         key = str(row.get("_score_key", ""))
         raw = row.get("_raw", {}) if isinstance(row.get("_raw", {}), dict) else {}
@@ -5898,7 +6482,7 @@ def render_detail_variants_panel(selected: pd.Series, score_df: pd.DataFrame) ->
         if key == str(st.session_state.get("selected_score_key", "")):
             row_classes.append("is-selected")
         st.markdown(f"<div class='{' '.join(row_classes)}'></div>", unsafe_allow_html=True)
-        cols = st.columns([1.2, 0.95, 0.65, 0.65, 0.95, 0.42], gap="small")
+        cols = st.columns([1.1, 0.88, 0.62, 0.62, 0.86, 0.62], gap="small")
         with cols[0]:
             st.markdown(f"<div class='score-review-cell'>{html.escape(str(raw.get('variant_id') or row.get('Clip ID', '')))}</div>", unsafe_allow_html=True)
         with cols[1]:
@@ -5910,7 +6494,12 @@ def render_detail_variants_panel(selected: pd.Series, score_df: pd.DataFrame) ->
         with cols[4]:
             st.markdown(render_variant_status_badge(row), unsafe_allow_html=True)
         with cols[5]:
-            if st.button("▶", key=f"score_detail_variant_preview_{key}_{idx}", use_container_width=True):
+            if st.button(
+                "Preview",
+                key=f"score_detail_variant_preview_{key}_{idx}",
+                help="Preview this variant",
+                use_container_width=True,
+            ):
                 st.session_state.selected_score_key = key
                 st.session_state.selected_score_base_key = base_key
                 st.session_state.score_preview_loaded_key = key
@@ -5965,13 +6554,7 @@ def render_detail_flags_panel(selected: pd.Series, compliance_result: dict[str, 
 
 def severity_badge_html(severity: str) -> str:
     severity_key = str(severity or "none").casefold()
-    colors = {
-        "high": ("#fecaca", "rgba(220, 38, 38, 0.24)", "rgba(239, 68, 68, 0.36)"),
-        "medium": ("#fde68a", "rgba(202, 138, 4, 0.22)", "rgba(251, 191, 36, 0.34)"),
-        "low": ("#bfdbfe", "rgba(59, 130, 246, 0.18)", "rgba(96, 165, 250, 0.30)"),
-        "none": ("#bbf7d0", "rgba(34, 197, 94, 0.16)", "rgba(34, 197, 94, 0.30)"),
-    }
-    color, background, border = colors.get(severity_key, colors["none"])
+    color, background, border = SEVERITY_BADGE_TONES.get(severity_key, SEVERITY_BADGE_TONES["none"])
     return (
         f"<span class='score-table-badge' style='min-width:3.2rem;color:{color};background:{background};border-color:{border};'>"
         f"{html.escape(severity_key.title())}</span>"
@@ -5980,7 +6563,7 @@ def severity_badge_html(severity: str) -> str:
 
 def render_score_methodology() -> None:
     with st.container(border=True):
-        st.markdown("<div class='panel-title'>How Scores Are Calculated</div>", unsafe_allow_html=True)
+        render_panel_heading("How Scores Are Calculated")
         st.markdown(
             """
             **Total Score** is a weighted average of available dimensions: Content 46.7%, Quality 20%, Engagement 33.3%. Host Focus receives 20% only when the vision scorer returns a score, with the other weights scaled down proportionally.
@@ -6004,12 +6587,12 @@ def render_score_methodology() -> None:
 
 def score_text_color(score: float | None) -> str:
     if score is None:
-        return "#94a3b8"
+        return COLOR_MUTED
     if score >= 7:
-        return "#22c55e"
+        return COLOR_GREEN
     if score >= 5:
-        return "#fbbf24"
-    return "#ef4444"
+        return COLOR_YELLOW
+    return COLOR_RED
 
 
 def score_band_label(score: float | None) -> str:
@@ -6022,7 +6605,7 @@ def score_band_label(score: float | None) -> str:
     return "Red"
 
 
-def render_queue_control_panel() -> None:
+def render_queue_control_panel(summary: dict[str, Any]) -> None:
     snapshot = load_queue_control_snapshot(st.session_state.state_path_value)
     control = snapshot.get("control") if isinstance(snapshot.get("control"), dict) else {}
     supervisor = snapshot.get("supervisor") if isinstance(snapshot.get("supervisor"), dict) else {}
@@ -6031,6 +6614,11 @@ def render_queue_control_panel() -> None:
     status = supervisor.get("status") or control.get("status") or "idle"
     requested = control.get("requested_action", "run")
     reason = queue_summary.get("reason", "")
+    queue_health = summary.get("queue_health", {}) if isinstance(summary, dict) else {}
+    effective_status = str(queue_health.get("status_label") or status).title()
+    if queue_health.get("status") == "needs_attention":
+        effective_status = str(queue_health.get("status_label") or "Needs Attention")
+        reason = str(queue_health.get("summary") or reason or "Review queue state.")
 
     with st.container(border=True):
         st.markdown(
@@ -6038,7 +6626,7 @@ def render_queue_control_panel() -> None:
             <div class="mobile-queue-status-card">
                 <div class="mobile-card-head">
                     <div>
-                        <div class="mobile-card-title">Queue {html.escape(str(status).title())}</div>
+                        <div class="mobile-card-title">Queue {html.escape(effective_status)}</div>
                         <div class="mobile-card-meta">Requested: {html.escape(str(requested).replace('_', ' ').title())}</div>
                     </div>
                     <span class="status-badge status-processing">{html.escape(str(current_run))}</span>
@@ -6055,12 +6643,12 @@ def render_queue_control_panel() -> None:
             st.markdown(f"### {html.escape(str(current_run))}")
         with cols[1]:
             st.markdown("<div class='small-muted'>Supervisor</div>", unsafe_allow_html=True)
-            st.markdown(f"### {html.escape(str(status).title())}")
+            st.markdown(f"### {html.escape(effective_status)}")
         with cols[2]:
             st.markdown("<div class='small-muted'>Requested Action</div>", unsafe_allow_html=True)
             st.markdown(f"### {html.escape(str(requested).replace('_', ' ').title())}")
         with cols[3]:
-            st.markdown("<div class='small-muted'>Terminal Check</div>", unsafe_allow_html=True)
+            st.markdown("<div class='small-muted'>Recovery Context</div>", unsafe_allow_html=True)
             st.caption(reason or "No terminal summary yet.")
 
         action_cols = st.columns([1, 1, 1, 3], gap="small")
@@ -6085,7 +6673,7 @@ def render_queue_control_panel() -> None:
 
 def render_queues_tab(summary: dict[str, Any]) -> None:
     render_page_intro("Queues", "Queue depth, pending items, and per-stage throughput at a glance.")
-    render_queue_control_panel()
+    render_queue_control_panel(summary)
     st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
     top_cards = st.columns(4, gap="medium")
     for col, (stage_key, label, icon, accent) in zip(top_cards, STAGES):
@@ -6111,7 +6699,7 @@ def render_queues_tab(summary: dict[str, Any]) -> None:
     for col, (stage_key, label, _, accent) in zip(queue_cols, STAGES):
         with col:
             with st.container(border=True):
-                st.markdown(f"<div class='panel-title'>{label.replace(' Processing', '')} Queue</div>", unsafe_allow_html=True)
+                render_panel_heading(f"{label.replace(' Processing', '')} Queue")
                 items = summary["queue_items"].get(stage_key, [])[:6]
                 if not items:
                     st.caption("No queued items")
@@ -6123,7 +6711,7 @@ def render_queues_tab(summary: dict[str, Any]) -> None:
                         )
 
     with st.container(border=True):
-        st.markdown("<div class='panel-title'>Queue Throughput (items per hour)</div>", unsafe_allow_html=True)
+        render_panel_heading("Queue Throughput (items per hour)")
         throughput_cols = st.columns(4, gap="medium")
         for col, (stage_key, label, _, accent) in zip(throughput_cols, STAGES):
             with col:
@@ -6131,76 +6719,10 @@ def render_queues_tab(summary: dict[str, Any]) -> None:
                 frame = summary["throughput_frames"][stage_key]
                 rate = frame["count"].mean() if not frame.empty else 0.0
                 st.markdown(f"### {rate:.1f} /hr")
-                chart = (
-                    alt.Chart(frame)
-                    .mark_line(strokeWidth=2, color=accent)
-                    .encode(
-                        x=alt.X("timestamp:T", title=None, axis=alt.Axis(labels=False, ticks=False, domain=False)),
-                        y=alt.Y("count:Q", title=None, axis=alt.Axis(labels=False, ticks=False, domain=False, grid=False)),
-                    )
-                    .properties(height=90)
-                    .configure_view(strokeOpacity=0)
-                    .configure(background="transparent")
-                )
-                st.altair_chart(chart, use_container_width=True)
-
-
-def render_settings_tab() -> None:
-    render_page_intro("Settings", "General controls for refresh, pipeline behavior, and future worker settings.")
-    try:
-        import config as runtime_cfg
-    except Exception:
-        runtime_cfg = None
-    settings_tabs = st.tabs(["General", "Pipeline", "Workers", "Paths", "Notifications", "Advanced"])
-    with settings_tabs[0]:
-        cols = st.columns(2, gap="medium")
-        with cols[0]:
-            with st.container(border=True):
-                st.markdown("<div class='panel-title'>General Settings</div>", unsafe_allow_html=True)
-                app_name = st.text_input("App Name", value=st.session_state.get("cfg_app_name", "VOD Processing Dashboard"))
-                refresh_interval = st.number_input("Refresh Interval (seconds)", min_value=2, max_value=30, value=int(st.session_state.get("cfg_refresh", 3)))
-                timezone = st.text_input("Timezone", value=st.session_state.get("cfg_timezone", "Asia/Jakarta"))
-                auto_start = st.toggle("Auto Start Processing", value=st.session_state.get("cfg_auto_start", True))
-                scan_new = st.toggle("Scan for New Videos", value=st.session_state.get("cfg_scan_new", True))
-                scan_interval = st.number_input("Scan Interval (minutes)", min_value=1, max_value=120, value=int(st.session_state.get("cfg_scan_interval", 5)))
-                if st.button("Save Changes", key="save_general"):
-                    st.session_state.cfg_app_name = app_name
-                    st.session_state.cfg_refresh = refresh_interval
-                    st.session_state.refresh_seconds_value = int(refresh_interval)
-                    st.session_state.cfg_timezone = timezone
-                    st.session_state.cfg_auto_start = auto_start
-                    st.session_state.cfg_scan_new = scan_new
-                    st.session_state.cfg_scan_interval = scan_interval
-                    st.success("General settings saved. Queue automation toggles require restarting the queue runner.")
-        with cols[1]:
-            with st.container(border=True):
-                st.markdown("<div class='panel-title'>Pipeline Settings</div>", unsafe_allow_html=True)
-                max_retries = st.number_input("Max Retries", min_value=0, max_value=10, value=int(st.session_state.get("cfg_max_retries", 3)))
-                retry_delay = st.number_input("Retry Delay (seconds)", min_value=0, max_value=3600, value=int(st.session_state.get("cfg_retry_delay", 30)))
-                delete_source = st.toggle("Delete Source After Processing", value=st.session_state.get("cfg_delete_source", False))
-                auto_generate = st.toggle("Auto Generate Clips", value=st.session_state.get("cfg_auto_generate", True))
-                min_default = int(getattr(runtime_cfg, "MIN_CLIP_DURATION", st.session_state.get("cfg_min_clip", 30)))
-                max_default = int(getattr(runtime_cfg, "MAX_CLIP_DURATION", st.session_state.get("cfg_max_clip", 120)))
-                min_clip = st.number_input("Min Clip Duration (seconds)", min_value=1, max_value=600, value=min_default)
-                max_clip = st.number_input("Max Clip Duration (seconds)", min_value=1, max_value=600, value=max_default)
-                st.caption("Clip duration values are hot-applied to this Streamlit process. Queue runner policy changes require restart.")
-                if st.button("Save Changes", key="save_pipeline"):
-                    st.session_state.cfg_max_retries = max_retries
-                    st.session_state.cfg_retry_delay = retry_delay
-                    st.session_state.cfg_delete_source = delete_source
-                    st.session_state.cfg_auto_generate = auto_generate
-                    st.session_state.cfg_min_clip = min_clip
-                    st.session_state.cfg_max_clip = max_clip
-                    if runtime_cfg is not None:
-                        runtime_cfg.MIN_CLIP_DURATION = int(min_clip)
-                        runtime_cfg.MAX_CLIP_DURATION = int(max_clip)
-                        st.success("Pipeline settings saved. Runtime clip duration config updated; queue runner-only controls require restart.")
-                    else:
-                        st.warning("Settings saved for this dashboard session, but config.py could not be imported.")
-
-    for tab in settings_tabs[1:]:
-        with tab:
-            st.info("This settings section is ready for wiring when those controls are finalized.")
+                if chart_frame_has_data(frame, "count"):
+                    render_throughput_chart(frame, accent)
+                else:
+                    st.caption("No completed items yet")
 
 
 def render_stage_card(label: str, count: int, icon: str, accent: str) -> None:
@@ -6226,12 +6748,30 @@ def build_status_badge(status: str) -> str:
         "Waiting": "status-waiting",
         "Failed": "status-failed",
         "Paused": "status-waiting",
+        "Needs Attention": "status-attention",
     }
-    return f"<span class='status-badge {css_map.get(status, 'status-waiting')}'>{html.escape(status)}</span>"
+    icon_map = {
+        "Processing": "refresh",
+        "Completed": "check-circle",
+        "Waiting": "clock",
+        "Failed": "alert-circle",
+        "Paused": "clock",
+        "Needs Attention": "alert-circle",
+    }
+    return (
+        f"<span class='status-badge {css_map.get(status, 'status-waiting')}'>"
+        f"{svg_icon(icon_map.get(status, 'clock'), 'currentColor', size=13, stroke=2.1)}"
+        f"{html.escape(status)}</span>"
+    )
 
 
 def build_progress_cell(progress: int, status: str) -> str:
-    fill_class = "progress-fill completed" if status == "Completed" else "progress-fill"
+    if status == "Completed":
+        fill_class = "progress-fill completed"
+    elif status == "Needs Attention":
+        fill_class = "progress-fill attention"
+    else:
+        fill_class = "progress-fill"
     bounded = max(0, min(progress, 100))
     return (
         "<div class='progress-wrap'>"
@@ -6243,33 +6783,31 @@ def build_progress_cell(progress: int, status: str) -> str:
 
 def render_html_table(table_df: pd.DataFrame) -> None:
     headers = [
-        "Video Name",
+        "Video",
         "Status",
-        "Current Step",
+        "Step",
         "Progress",
-        "Clips Generated",
-        "Runs",
-        "Redos",
-        "Duration",
-        "Started At",
-        "Completed At",
-        "",
+        "Attention",
     ]
     rows = []
     for _, row in table_df.iterrows():
+        meta_parts = [
+            f"Clips {int(row['Clips Generated'])}",
+            f"Runs {int(row['Runs'])}",
+            f"Redos {int(row['Redos'])}",
+            f"Duration {row['Duration']}",
+        ]
+        attention = str(row.get("Attention") or "-")
         rows.append(
             "<tr>"
-            f"<td>{html.escape(str(row['Video Name']))}</td>"
+            "<td>"
+            f"<div class='video-name-cell'>{html.escape(str(row['Video Name']))}</div>"
+            f"<div class='video-meta-line'>{html.escape(' | '.join(meta_parts))}</div>"
+            "</td>"
             f"<td>{build_status_badge(str(row['Status']))}</td>"
             f"<td>{html.escape(str(row['Current Step']))}</td>"
             f"<td>{build_progress_cell(int(row['Progress']), str(row['Status']))}</td>"
-            f"<td>{int(row['Clips Generated'])}</td>"
-            f"<td>{int(row['Runs'])}</td>"
-            f"<td>{int(row['Redos'])}</td>"
-            f"<td>{html.escape(str(row['Duration']))}</td>"
-            f"<td>{html.escape(str(row['Started At']))}</td>"
-            f"<td>{html.escape(str(row['Completed At']))}</td>"
-            "<td class='row-action'>&#8942;</td>"
+            f"<td><div class='attention-cell'>{html.escape(attention)}</div></td>"
             "</tr>"
         )
 
@@ -6293,6 +6831,13 @@ def render_video_mobile_cards(table_df: pd.DataFrame) -> None:
     for _, row in table_df.iterrows():
         progress = max(0, min(int(row.get("Progress", 0) or 0), 100))
         status = str(row.get("Status", ""))
+        progress_class = "mobile-progress-fill attention" if status == "Needs Attention" else "mobile-progress-fill"
+        attention = str(row.get("Attention") or "").strip()
+        attention_html = (
+            f"<div class='mobile-card-alert'>{html.escape(attention)}</div>"
+            if attention
+            else ""
+        )
         cards.append(
             "<div class='mobile-card'>"
             "<div class='mobile-card-head'>"
@@ -6317,9 +6862,10 @@ def render_video_mobile_cards(table_df: pd.DataFrame) -> None:
             f"<div class='mobile-card-stat-value'>{html.escape(str(row.get('Duration', '-')))}</div>"
             "</div>"
             "</div>"
+            f"{attention_html}"
             "<div class='mobile-progress'>"
             "<div class='mobile-progress-track'>"
-            f"<div class='mobile-progress-fill' style='width:{progress}%;'></div>"
+            f"<div class='{progress_class}' style='width:{progress}%;'></div>"
             "</div>"
             f"<div class='mobile-progress-label'>Progress {progress}%"
             f" | Started {html.escape(str(row.get('Started At', '-')))}</div>"
@@ -6338,6 +6884,19 @@ def chart_window_options() -> dict[str, timedelta | None]:
     }
 
 
+def render_tab_loading_shell(active_tab: str) -> None:
+    labels = {tab_key: label for tab_key, label, _icon_name in dashboard_nav_items()}
+    label = labels.get(active_tab, active_tab.replace("_", " ").title())
+    st.markdown(
+        f"""
+        <div class="loading-shell">
+            Loading {html.escape(label)}. Heavy score, compliance, and module views may take a moment while cached files are indexed.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 default_state_path = str(resolve_default_state_path())
 if "auto_refresh_enabled" not in st.session_state:
     st.session_state.auto_refresh_enabled = True
@@ -6348,6 +6907,10 @@ if "state_path_value" not in st.session_state:
 if "table_page" not in st.session_state:
     st.session_state.table_page = 1
 if "active_tab" not in st.session_state:
+    st.session_state.active_tab = "overview"
+
+available_tab_keys = {tab_key for tab_key, _label, _icon_name in dashboard_nav_items()}
+if st.session_state.active_tab not in available_tab_keys:
     st.session_state.active_tab = "overview"
 
 fragment_interval = (
@@ -6365,8 +6928,12 @@ def render_dashboard() -> None:
     system = get_system_stats()
     updated_at = parse_timestamp(state.get("updated_at"))
     active_tab = st.session_state.active_tab
+    if active_tab not in {tab_key for tab_key, _label, _icon_name in dashboard_nav_items()}:
+        active_tab = "overview"
+        st.session_state.active_tab = active_tab
 
-    shell_cols = st.columns([1.05, 5.3], gap="large")
+    st.markdown('<h1 class="sr-only">VOD Processing Dashboard</h1>', unsafe_allow_html=True)
+    shell_cols = st.columns([1.25, 5.1], gap="medium")
     left_rail, main_area = shell_cols
 
     with left_rail:
@@ -6380,15 +6947,18 @@ def render_dashboard() -> None:
 
     with main_area:
         render_mobile_nav_controls(active_tab)
-        render_header(updated_at)
+        render_header(updated_at, summary.get("queue_health", {}))
 
         if state.get("_error"):
             st.error(state["_error"])
 
+        render_queue_attention_panel(summary.get("queue_health", {}))
+        pending_active_tab = st.session_state.get("pending_active_tab")
+        if pending_active_tab == active_tab:
+            render_tab_loading_shell(active_tab)
+
         if active_tab == "overview":
             render_overview_tab(summary)
-        elif active_tab == "videos":
-            render_videos_tab(summary)
         elif active_tab == "analytics":
             render_analytics_tab(summary)
         elif active_tab == "scores":
@@ -6397,14 +6967,13 @@ def render_dashboard() -> None:
             render_compliance_tab(summary)
         elif active_tab == "modules":
             render_modules_tab(summary)
-        elif active_tab == "trends":
-            render_trends_tab(summary)
         elif active_tab == "focus_debug":
             render_focus_debug_tab(summary)
         elif active_tab == "queues":
             render_queues_tab(summary)
-        elif active_tab == "settings":
-            render_settings_tab()
+
+        if pending_active_tab == active_tab:
+            st.session_state.pending_active_tab = ""
 
 
 render_dashboard()

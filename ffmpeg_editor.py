@@ -457,11 +457,7 @@ def _write_ass_file(
     # of the text box, not the top edge.
     # line_gap = vertical distance between the two karaoke rows.
     # Keep it tighter so the 2-line block feels cohesive on mobile.
-    line_gap = int(ass_fontsize * 1.18)
-    # y_line2 is the center of the bottom line, at sub_y_frac of frame height
-    y_line2  = int(H * sub_y_frac)
-    # y_line1 is directly above it
-    y_line1  = y_line2 - line_gap
+    y_line1, y_line2, line_gap = _subtitle_line_centers(H, ass_fontsize, sub_y_frac, cfg)
     cx       = W // 2
 
     # ── Color helpers ─────────────────────────────────────────────────────────
@@ -480,6 +476,10 @@ def _write_ass_file(
     white_ass      = hex_to_ass("#FFFFFF")
     active_ass     = hex_to_ass(named_to_hex(active_color))
     inactive_alpha = int((1.0 - inactive_op) * 255)
+    price_text_ass = hex_to_ass("#1A1200")
+    price_bg_ass   = hex_to_ass("#F5A623")
+    price_badge_fs = max(28, int(ass_fontsize * 0.86))
+    price_badge_pad = max(5, int(ass_fontsize * 0.10))
 
     def word_color_ass(word_idx: int) -> str:
         mapped = None
@@ -504,6 +504,7 @@ ScaledBorderAndShadow: yes
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Default,{font_sub},{ass_fontsize},{white_ass},{white_ass},{outline_ass},&H00000000,-1,0,0,0,100,100,0,0,1,{stroke_w},0,5,0,0,0,1
+Style: PriceBadge,{font_sub},{price_badge_fs},{price_text_ass},{price_text_ass},{price_bg_ass},{price_bg_ass},-1,0,0,0,100,100,0,0,3,{price_badge_pad},0,5,0,0,0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -524,6 +525,39 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         cs = rem % 100
         return f"{h}:{m:02d}:{sec:02d}.{cs:02d}"
 
+    def estimate_word_width(text: str) -> float:
+        clean = str(text or "")
+        if not clean:
+            return 0.0
+        return max(ass_fontsize * 0.45, len(clean) * ass_fontsize * 0.56)
+
+    def emit_price_badges(t0: float, t1: float, line_words: list, y_pos: int) -> None:
+        entries = []
+        for wd in line_words:
+            display_word = _format_karaoke_display_word(wd["word"])
+            if display_word:
+                entries.append((wd, display_word, estimate_word_width(display_word)))
+        if not entries:
+            return
+
+        space_w = ass_fontsize * 0.34
+        total_w = sum(item[2] for item in entries) + space_w * max(0, len(entries) - 1)
+        cursor_x = cx - (total_w / 2.0)
+        start_cs = _to_centis(t0)
+        end_cs = _to_centis(t1)
+        if end_cs <= start_cs:
+            return
+
+        for _wd, display_word, word_w in entries:
+            word_center_x = int(round(cursor_x + (word_w / 2.0)))
+            if _is_price_badge_token(display_word):
+                badge_text = _escape_ass_text(display_word)
+                dialogue_lines.append(
+                    f"Dialogue: 1,{_ts_from_centis(start_cs)},{_ts_from_centis(end_cs)},"
+                    f"PriceBadge,,0,0,0,,{{\\an5\\pos({word_center_x},{y_pos})}}{badge_text}"
+                )
+            cursor_x += word_w + space_w
+
     def build_line_text(line_words: list, active_idx: int) -> str:
         """Build ASS text for one line. active_idx = -1 means all inactive."""
         parts = []
@@ -531,7 +565,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             display_word = _format_karaoke_display_word(wd["word"])
             if not display_word:
                 continue
-            if i == active_idx:
+            if _is_price_badge_token(display_word):
+                parts.append(f"{{\\alpha&HFF&}}{display_word}")
+            elif i == active_idx:
                 color = word_color_ass(int(wd.get("_highlight_idx", -1)))
                 parts.append(f"{{\\c{color}\\alpha&H00&}}{display_word}")
             else:
@@ -559,6 +595,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             f"Dialogue: 0,{_ts_from_centis(start_cs)},{_ts_from_centis(end_cs)},"
             f"Default,,0,0,0,,{{\\an5\\pos({cx},{y_pos})}}{text}"
         )
+        emit_price_badges(t0, t1, line_words, y_pos)
 
     # ── Chunk words and emit events ───────────────────────────────────────────
     chunks = _chunk_words(karaoke_words, words_per_chunk=4)
@@ -601,6 +638,33 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         f.write(ass_content)
 
     return str(ass_path), subtitle_fonts_dir
+
+
+def _subtitle_line_centers(H: int, ass_fontsize: int, sub_y_frac: float, cfg) -> tuple[int, int, int]:
+    line_gap = int(ass_fontsize * 1.18)
+    y_line2 = int(H * sub_y_frac)
+
+    safe_top = _clamp_float(getattr(cfg, "SUBTITLE_SAFE_ZONE_TOP", 0.08), 0.0, 0.45, 0.08)
+    safe_bottom = _clamp_float(getattr(cfg, "SUBTITLE_SAFE_ZONE_BOTTOM", 0.15), 0.0, 0.45, 0.15)
+    half_text_h = max(1, int(ass_fontsize * 0.62))
+    min_line1_y = int(H * safe_top) + half_text_h
+    max_line2_y = int(H * (1.0 - safe_bottom)) - half_text_h
+    min_line2_y = min_line1_y + line_gap
+
+    if max_line2_y >= min_line2_y:
+        y_line2 = max(min_line2_y, min(max_line2_y, y_line2))
+    else:
+        y_line2 = max_line2_y
+
+    y_line1 = y_line2 - line_gap
+    if y_line1 < min_line1_y:
+        y_line1 = min_line1_y
+        y_line2 = y_line1 + line_gap
+    if y_line2 > max_line2_y:
+        y_line2 = max_line2_y
+        y_line1 = y_line2 - line_gap
+
+    return int(y_line1), int(y_line2), line_gap
 
 
 def _hook_layout_settings(cfg, W: int, H: int) -> dict[str, Any]:
@@ -925,6 +989,8 @@ def _build_and_run(
         )
         vid = f"[{tag}out]"
 
+    vid = _add_cta_endcard_filters(fc, vid, moment, clip_duration, W, H, cfg)
+
     logo_input_idx = None
     for i, ei in enumerate(extra_inputs):
         if ei["type"] == "logo":
@@ -1011,6 +1077,8 @@ def _build_and_run(
 
     codec  = getattr(cfg, "OUTPUT_CODEC",  "h264_nvenc")
     preset = getattr(cfg, "OUTPUT_PRESET", "p1")
+    if str(codec).endswith("_nvenc"):
+        preset = getattr(cfg, "OUTPUT_NVENC_PRESET", preset)
     fps    = output_fps
     ab     = getattr(cfg, "OUTPUT_AUDIO_BITRATE", "128k")
 
@@ -1221,6 +1289,12 @@ def _add_before_after_overlay_filters(fc, vid, extra_inputs, clip_duration, W, H
     mode = str(getattr(cfg, "_before_after_variant_mode", "standard") or "standard")
     ba_s = max(0.0, float(getattr(cfg, "BEFORE_AFTER_START_T", 0.0)))
     ba_dur = max(0.0, float(getattr(cfg, "BEFORE_AFTER_DURATION", 2.5)))
+    ba_start_offset = max(0.0, float(getattr(cfg, "BEFORE_AFTER_START_OFFSET", 3.0)))
+    hook_block_duration = max(
+        ba_start_offset,
+        max(0.0, float(getattr(cfg, "HOOK_DURATION", 0.0) or 0.0)),
+        max(0.0, float(getattr(cfg, "MODULE_HOOK_DURATION", 0.0) or 0.0)),
+    )
     scale_ratio = 1.0
     overlay_x = "(W-overlay_w)/2"
     overlay_y = "(H-overlay_h)/2"
@@ -1247,6 +1321,7 @@ def _add_before_after_overlay_filters(fc, vid, extra_inputs, clip_duration, W, H
         overlay_x = "W*0.06"
         overlay_y = "H*0.14"
 
+    ba_s = max(ba_s, hook_block_duration)
     ba_e = min(ba_s + ba_dur, clip_duration)
     if ba_e <= ba_s + 0.01:
         return vid
@@ -1333,6 +1408,73 @@ def _add_product_caption_filters(fc, vid, prod_trigger, zoom_dur, W, H, cfg) -> 
         vid = "[vcap2]"
 
     return vid
+
+
+def _resolve_cta_endcard_text(moment: dict, cfg) -> str:
+    variant = moment.get("_variant") if isinstance(moment, dict) else None
+    candidates = [
+        getattr(cfg, "_cta_text", ""),
+        getattr(variant, "cta_text", "") if variant is not None else "",
+        variant.get("cta_text", "") if isinstance(variant, dict) else "",
+        moment.get("cta_text", "") if isinstance(moment, dict) else "",
+        getattr(cfg, "CTA_ENDCARD_DEFAULT_TEXT", "CEK ETALASE SEKARANG"),
+    ]
+    for candidate in candidates:
+        text = " ".join(str(candidate or "").split()).strip()
+        if text:
+            return text.upper()
+    return "CEK ETALASE SEKARANG"
+
+
+def _add_cta_endcard_filters(fc, vid, moment, clip_duration, W, H, cfg) -> str:
+    if not getattr(cfg, "CTA_ENDCARD_ENABLED", True):
+        return vid
+    if clip_duration <= 0.2:
+        return vid
+
+    duration = _clamp_float(getattr(cfg, "CTA_ENDCARD_DURATION", 2.0), 0.3, 10.0, 2.0)
+    duration = min(duration, clip_duration)
+    start_t = max(0.0, clip_duration - duration)
+    end_t = clip_duration
+    fade_d = min(0.25, max(0.05, duration / 2.0))
+
+    bottom_safe = _clamp_float(getattr(cfg, "SUBTITLE_SAFE_ZONE_BOTTOM", 0.15), 0.0, 0.45, 0.15)
+    bar_h = max(72, int(H * 0.085))
+    safe_bottom_y = int(H * (1.0 - bottom_safe))
+    bar_y = max(int(H * 0.08), safe_bottom_y - bar_h)
+
+    cta_text = _escape_drawtext(_resolve_cta_endcard_text(moment, cfg))
+    if not cta_text:
+        return vid
+
+    font_path = _font_file_with_fallback(
+        getattr(cfg, "FONT_HOOK", ""),
+        [getattr(cfg, "FONT_LABEL", ""), *getattr(cfg, "FONT_HOOK_FALLBACKS", [])],
+    )
+    font_arg = f":fontfile='{_escape_drawtext_path(font_path)}'" if font_path else ""
+    base_fs = max(34, int(H * 0.042))
+    max_fit_fs = max(28, int(W / max(len(cta_text) * 0.58, 1.0)))
+    font_size = min(base_fs, max_fit_fs)
+    alpha_expr = (
+        f"if(lt(t,{start_t:.2f}),0,"
+        f"if(lt(t,{start_t + fade_d:.2f}),(t-{start_t:.2f})/{fade_d:.2f},1))"
+    )
+
+    fc.append(
+        f"color=c=black@0.68:s={W}x{bar_h}:d={clip_duration:.3f},"
+        f"format=rgba,fade=t=in:st={start_t:.2f}:d={fade_d:.2f}:alpha=1[ctabarsrc]"
+    )
+    fc.append(
+        f"{vid}[ctabarsrc]overlay=x=0:y={bar_y}:enable='between(t,{start_t:.2f},{end_t:.2f})'[vctabar]"
+    )
+    fc.append(
+        f"[vctabar]drawtext=text='{cta_text}'{font_arg}"
+        f":fontsize={font_size}:fontcolor=white"
+        f":x=(w-text_w)/2:y={bar_y}+({bar_h}-text_h)/2"
+        f":alpha='{alpha_expr}'"
+        f":enable='between(t,{start_t:.2f},{end_t:.2f})'[vcta]"
+    )
+    return "[vcta]"
 
 
 # =============================================================================
@@ -1637,9 +1779,24 @@ def _strip_karaoke_word_punctuation(text: str) -> str:
     return text
 
 
+def _is_price_badge_token(text: str) -> bool:
+    clean = re.sub(r"[^\w\s]", "", str(text or ""), flags=re.UNICODE)
+    clean = re.sub(r"\s+", " ", clean).strip().lower()
+    compact = clean.replace(" ", "")
+    if not compact:
+        return False
+    if re.fullmatch(r"\d+(?:k|rb|ribu|juta)", compact):
+        return True
+    return bool(re.fullmatch(r"(?:rb|ribu|juta)", compact))
+
+
+def _escape_ass_text(text: str) -> str:
+    return str(text or "").replace("\\", "\\\\").replace("{", r"\{").replace("}", r"\}")
+
+
 def _format_karaoke_display_word(text: str) -> str:
     word = str(text or "").strip()
-    if re.fullmatch(r"\d+rb", word, flags=re.IGNORECASE):
+    if _is_price_badge_token(word) and re.search(r"\d", word):
         return word.lower()
     return word.upper()
 
@@ -2061,9 +2218,7 @@ def _plan_emoji_overlays(clip_words: list, clip_duration: float, W: int, H: int,
 
     sub_y_frac = float(getattr(cfg, "SUBTITLE_Y_POS", 0.80))
     ass_fontsize = int(getattr(cfg, "SUBTITLE_FONTSIZE", 68) * 0.85)
-    line_gap = int(ass_fontsize * 1.18)
-    y_line2 = int(H * sub_y_frac)
-    y_line1 = y_line2 - line_gap
+    y_line1, y_line2, _line_gap = _subtitle_line_centers(H, ass_fontsize, sub_y_frac, cfg)
     subtitle_block_top = max(0, int(y_line1 - ass_fontsize * 0.9))
     subtitle_block_bottom = min(H, int(y_line2 + ass_fontsize * 0.9))
     subtitle_block_left = max(0, int(W * 0.5 - W * 0.24))

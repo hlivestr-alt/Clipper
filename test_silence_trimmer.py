@@ -67,6 +67,17 @@ class SilenceTrimPlanTests(unittest.TestCase):
         )
         self.assertAlmostEqual(remapped[3]["start"], 1.55, places=2)
 
+    def test_stretched_alignment_word_does_not_hide_dead_air(self):
+        plan = build_silence_trim_plan(
+            words((0.0, 0.2), (0.5, 0.7), (1.3, 8.0), (8.1, 8.3), (8.5, 8.7), (8.9, 9.1)),
+            9.4,
+            cfg(SILENCE_TRIM_MAX_REMOVAL_FRACTION=0.8),
+        )
+
+        self.assertTrue(plan["trimmed"])
+        self.assertAlmostEqual(plan["silence_ranges"][0]["source_start"], 2.975, places=3)
+        self.assertAlmostEqual(plan["silence_ranges"][0]["source_end"], 7.925, places=3)
+
     def test_leading_and_trailing_silence_are_trimmed(self):
         plan = build_silence_trim_plan(
             words((2.0, 2.2), (2.5, 2.7), (3.0, 3.2), (3.5, 3.7), (4.0, 4.2), (4.5, 4.7)),

@@ -30,12 +30,13 @@ def build_silence_trim_plan(clip_words: list, clip_duration: float, cfg) -> dict
     keep_gap = max(0.0, float(getattr(cfg, "SILENCE_TRIM_KEEP_GAP", 0.35) or 0.0))
     edge_keep = max(0.0, float(getattr(cfg, "SILENCE_TRIM_EDGE_KEEP", 0.25) or 0.0))
     max_fraction = max(0.0, min(1.0, float(getattr(cfg, "SILENCE_TRIM_MAX_REMOVAL_FRACTION", 0.45) or 0.0)))
+    max_word_duration = _positive_float(getattr(cfg, "SILENCE_TRIM_MAX_WORD_DURATION", 1.5))
 
     raw_words = [word for word in clip_words or [] if _word_text(word)]
     if len(raw_words) < min_words:
         return _fallback_plan(duration, SKIP_INSUFFICIENT_WORDS)
 
-    timed_words = _coerce_timed_words(raw_words, duration)
+    timed_words = _coerce_timed_words(raw_words, duration, max_word_duration=max_word_duration)
     if timed_words is None:
         return _fallback_plan(duration, SKIP_WORD_TIMING_INVALID)
 
@@ -282,9 +283,14 @@ def _fallback_plan(duration: float, reason: str | None) -> dict[str, Any]:
     }
 
 
-def _coerce_timed_words(words: list[dict[str, Any]], duration: float) -> list[dict[str, float]] | None:
+def _coerce_timed_words(
+    words: list[dict[str, Any]],
+    duration: float,
+    max_word_duration: float | None = None,
+) -> list[dict[str, float]] | None:
     timed = []
     prev_start = -math.inf
+    duration_cap = _positive_float(max_word_duration)
     for word in words:
         if not isinstance(word, dict):
             return None
@@ -299,6 +305,8 @@ def _coerce_timed_words(words: list[dict[str, Any]], duration: float) -> list[di
         prev_start = start
         start = max(0.0, min(duration, start))
         end = max(start, min(duration, end))
+        if duration_cap > 0.0:
+            end = min(end, start + duration_cap)
         timed.append({"start": start, "end": end})
     return timed
 

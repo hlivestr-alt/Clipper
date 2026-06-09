@@ -1,0 +1,276 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-05-31T21:00:17.8995795+07:00",
+  "title": "Design System: PROYA VOD Processing Dashboard",
+  "extensions": {
+    "colorMeta": {
+      "operations-bg": {
+        "role": "neutral",
+        "displayName": "Operations Background",
+        "canonical": "#08111f",
+        "tonalRamp": ["#020617", "#07101c", "#08111f", "#0b1422", "#101a29", "#111e30", "#1e293b", "#edf3ff"]
+      },
+      "panel": {
+        "role": "neutral",
+        "displayName": "Panel Surface",
+        "canonical": "#101a29",
+        "tonalRamp": ["#020617", "#07101c", "#08111f", "#101a29", "#111e30", "#1e293b", "#334155", "#edf3ff"]
+      },
+      "panel-soft": {
+        "role": "neutral",
+        "displayName": "Soft Panel Surface",
+        "canonical": "#111e30",
+        "tonalRamp": ["#020617", "#07101c", "#0b1422", "#101a29", "#111e30", "#1e293b", "#334155", "#e2e8f0"]
+      },
+      "text": {
+        "role": "neutral",
+        "displayName": "Operator Text",
+        "canonical": "#edf3ff",
+        "tonalRamp": ["#334155", "#475569", "#64748b", "#94a3b8", "#cbd5e1", "#dbeafe", "#e2e8f0", "#edf3ff"]
+      },
+      "muted": {
+        "role": "neutral",
+        "displayName": "Muted Slate",
+        "canonical": "#94a3b8",
+        "tonalRamp": ["#0f172a", "#1e293b", "#334155", "#475569", "#64748b", "#94a3b8", "#cbd5e1", "#e2e8f0"]
+      },
+      "primary-blue": {
+        "role": "primary",
+        "displayName": "Command Blue",
+        "canonical": "#3b82f6",
+        "tonalRamp": ["#0b1f45", "#1e3a8a", "#1d4ed8", "#2563eb", "#3b82f6", "#60a5fa", "#93c5fd", "#dbeafe"]
+      },
+      "success-green": {
+        "role": "secondary",
+        "displayName": "Ready Green",
+        "canonical": "#22c55e",
+        "tonalRamp": ["#052e16", "#14532d", "#166534", "#16a34a", "#22c55e", "#86efac", "#bbf7d0", "#dcfce7"]
+      },
+      "warning-yellow": {
+        "role": "secondary",
+        "displayName": "Attention Yellow",
+        "canonical": "#fbbf24",
+        "tonalRamp": ["#422006", "#78350f", "#92400e", "#ca8a04", "#fbbf24", "#fde68a", "#fef3c7", "#fef9c3"]
+      },
+      "danger-red": {
+        "role": "secondary",
+        "displayName": "Blocker Red",
+        "canonical": "#ef4444",
+        "tonalRamp": ["#450a0a", "#7f1d1d", "#991b1b", "#dc2626", "#ef4444", "#fca5a5", "#fecaca", "#fee2e2"]
+      },
+      "review-violet": {
+        "role": "tertiary",
+        "displayName": "Review Violet",
+        "canonical": "#8b5cf6",
+        "tonalRamp": ["#2e1065", "#4c1d95", "#5b21b6", "#7c3aed", "#8b5cf6", "#c4b5fd", "#ddd6fe", "#ede9fe"]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Display",
+        "purpose": "App title and rare identity-level headings."
+      },
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "Page titles and detail titles."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Panel titles, KPI labels, module names, and card headings."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Tables, queue rows, captions, transcripts, metadata, and form labels."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Uppercase section kickers, compact badges, table headers, and mobile stat labels."
+      }
+    },
+    "shadows": [
+      {
+        "name": "panel-ambient",
+        "value": "0 18px 48px rgba(0, 0, 0, 0.18)",
+        "purpose": "Major grouped regions only."
+      },
+      {
+        "name": "active-navigation-lift",
+        "value": "0 10px 24px rgba(37, 99, 235, 0.22)",
+        "purpose": "Selected navigation or primary active context."
+      },
+      {
+        "name": "status-glow",
+        "value": "0 0 10px rgba(34, 197, 94, 0.5)",
+        "purpose": "Live or healthy status dots when paired with labels."
+      },
+      {
+        "name": "inset-track-line",
+        "value": "inset 0 0 0 1px rgba(255, 255, 255, 0.05)",
+        "purpose": "Circular stage indicators and contained progress surfaces."
+      }
+    ],
+    "motion": [
+      {
+        "name": "state-fast",
+        "value": "160ms ease-out",
+        "purpose": "Hover, focus, and selected-state feedback."
+      },
+      {
+        "name": "state-standard",
+        "value": "220ms ease-out",
+        "purpose": "Slightly larger reveal or panel feedback where Streamlit rerenders are stable."
+      },
+      {
+        "name": "reduced-motion",
+        "value": "prefers-reduced-motion: reduce",
+        "purpose": "Disable nonessential animation and keep state changes immediate."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "mobile",
+        "value": "760px"
+      },
+      {
+        "name": "tablet",
+        "value": "1100px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Decisive action button for starting, continuing, applying, or confirming operator actions.",
+      "html": "<button class=\"ds-btn-primary\">Continue Queue</button>",
+      "css": ".ds-btn-primary { min-height: 40px; padding: 10px 16px; border-radius: 10px; border: 1px solid rgba(96, 165, 250, 0.28); background: linear-gradient(180deg, rgba(37, 99, 235, 0.95), rgba(29, 78, 216, 0.95)); color: #edf3ff; font: 700 0.92rem/1.2 Source Sans Pro, system-ui, sans-serif; transition: border-color 160ms ease-out, background 160ms ease-out; } .ds-btn-primary:hover { border-color: rgba(96, 165, 250, 0.42); } .ds-btn-primary:focus-visible { outline: 3px solid #93c5fd; outline-offset: 2px; } .ds-btn-primary:active { transform: translateY(1px); }"
+    },
+    {
+      "name": "Secondary Button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "Quiet utility button for refresh, pagination, filters, and lower-risk controls.",
+      "html": "<button class=\"ds-btn-secondary\">Refresh Status</button>",
+      "css": ".ds-btn-secondary { min-height: 40px; padding: 10px 16px; border-radius: 10px; border: 1px solid rgba(148, 163, 184, 0.12); background: linear-gradient(180deg, rgba(19, 31, 50, 0.96), rgba(14, 22, 35, 0.96)); color: #edf3ff; font: 600 0.92rem/1.2 Source Sans Pro, system-ui, sans-serif; transition: border-color 160ms ease-out, color 160ms ease-out; } .ds-btn-secondary:hover { border-color: rgba(96, 165, 250, 0.22); color: #f8fafc; } .ds-btn-secondary:focus-visible { outline: 3px solid #93c5fd; outline-offset: 2px; } .ds-btn-secondary:disabled { color: #64748b; border-color: rgba(100, 116, 139, 0.16); }"
+    },
+    {
+      "name": "Status Badge",
+      "kind": "chip",
+      "refersTo": "status-badge",
+      "description": "Mandatory status pattern: icon, text, color, and shape together.",
+      "html": "<span class=\"ds-status-badge ds-status-processing\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M12 3a9 9 0 1 0 9 9\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/></svg>Processing</span>",
+      "css": ".ds-status-badge { display: inline-flex; align-items: center; gap: 7px; padding: 5px 10px; border-radius: 10px; border: 1px solid rgba(148, 163, 184, 0.12); font: 700 0.82rem/1 Source Sans Pro, system-ui, sans-serif; } .ds-status-badge svg { width: 14px; height: 14px; flex: 0 0 auto; } .ds-status-processing { color: #93c5fd; background: rgba(37, 99, 235, 0.16); border-color: rgba(59, 130, 246, 0.18); } .ds-status-badge:focus-visible { outline: 3px solid #93c5fd; outline-offset: 2px; }"
+    },
+    {
+      "name": "Module Readiness Card",
+      "kind": "card",
+      "refersTo": "panel",
+      "description": "Compact readiness summary for hook, main, and CTA module inventory.",
+      "html": "<section class=\"ds-module-card\"><div class=\"ds-module-head\"><h3>Serum</h3><span>Ready</span></div><div class=\"ds-module-counts\"><div><b>12</b><small>Hook</small></div><div><b>18</b><small>Main</small></div><div><b>7</b><small>CTA</small></div></div></section>",
+      "css": ".ds-module-card { border: 1px solid rgba(148, 163, 184, 0.12); border-radius: 8px; background: rgba(9, 15, 25, 0.28); color: #edf3ff; padding: 14px; min-width: 260px; font-family: Source Sans Pro, system-ui, sans-serif; } .ds-module-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; } .ds-module-head h3 { margin: 0; font-size: 1rem; line-height: 1.2; } .ds-module-head span { border-radius: 999px; padding: 4px 9px; color: #86efac; background: rgba(22, 163, 74, 0.14); border: 1px solid rgba(34, 197, 94, 0.18); font: 800 0.75rem/1 Source Sans Pro, system-ui, sans-serif; text-transform: uppercase; } .ds-module-counts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; } .ds-module-counts div { border-radius: 8px; background: rgba(15, 23, 42, 0.58); padding: 9px 7px; } .ds-module-counts b { display: block; color: #edf3ff; font-size: 1.35rem; line-height: 1; } .ds-module-counts small { display: block; color: #94a3b8; font-size: 0.72rem; text-transform: uppercase; margin-top: 5px; }"
+    },
+    {
+      "name": "Navigation Item",
+      "kind": "nav",
+      "refersTo": "nav-item-active",
+      "description": "Desktop rail item with icon container, text label, and clear selected state.",
+      "html": "<button class=\"ds-nav-item ds-nav-item-active\"><span class=\"ds-nav-icon\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M4 13h6V4H4v9Zm10 7h6V4h-6v16ZM4 20h6v-5H4v5Z\" fill=\"currentColor\"/></svg></span><span>Overview</span></button>",
+      "css": ".ds-nav-item { width: 100%; min-height: 44px; display: inline-flex; align-items: center; gap: 14px; padding: 14px 16px; border: 1px solid transparent; border-radius: 12px; background: transparent; color: #d7e3f7; font: 600 0.92rem/1.2 Source Sans Pro, system-ui, sans-serif; text-align: left; } .ds-nav-icon { width: 28px; height: 28px; border-radius: 9px; display: inline-flex; align-items: center; justify-content: center; background: rgba(148, 163, 184, 0.08); border: 1px solid rgba(148, 163, 184, 0.08); color: #dbeafe; } .ds-nav-icon svg { width: 16px; height: 16px; } .ds-nav-item-active { background: linear-gradient(180deg, rgba(30, 64, 124, 0.92), rgba(25, 52, 102, 0.92)); border-color: rgba(96, 165, 250, 0.16); box-shadow: 0 10px 24px rgba(37, 99, 235, 0.22); } .ds-nav-item:focus-visible { outline: 3px solid #93c5fd; outline-offset: 2px; }"
+    },
+    {
+      "name": "Input Field",
+      "kind": "input",
+      "refersTo": "input-field",
+      "description": "Dark Streamlit-compatible input surface for filters, paths, and search fields.",
+      "html": "<label class=\"ds-field\"><span>Output Directory</span><input value=\"D:\\output_clips\" /></label>",
+      "css": ".ds-field { display: grid; gap: 6px; color: #94a3b8; font: 700 0.82rem/1.2 Source Sans Pro, system-ui, sans-serif; } .ds-field input { min-height: 40px; border-radius: 10px; border: 1px solid rgba(148, 163, 184, 0.14); background: rgba(12, 20, 33, 0.72); color: #edf3ff; padding: 10px 12px; font: 500 0.92rem/1.2 Source Sans Pro, system-ui, sans-serif; } .ds-field input:focus-visible { outline: 3px solid #93c5fd; outline-offset: 2px; border-color: rgba(96, 165, 250, 0.42); }"
+    },
+    {
+      "name": "Progress Bar",
+      "kind": "custom",
+      "refersTo": "progress-track",
+      "description": "Compact progress pattern with a numeric label. Bars never appear without text.",
+      "html": "<div class=\"ds-progress\"><div class=\"ds-progress-track\"><div class=\"ds-progress-fill\" style=\"width: 68%\"></div></div><span>68%</span></div>",
+      "css": ".ds-progress { display: inline-flex; align-items: center; gap: 11px; min-width: 160px; color: #dbeafe; font: 600 0.86rem/1.2 Source Sans Pro, system-ui, sans-serif; } .ds-progress-track { width: 102px; height: 10px; border-radius: 999px; background: rgba(30, 41, 59, 0.9); overflow: hidden; } .ds-progress-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, #3b82f6, #60a5fa); }"
+    },
+    {
+      "name": "Transcript Box",
+      "kind": "custom",
+      "refersTo": "panel",
+      "description": "Readable transcript detail area with inline highlights for price and compliance issues.",
+      "html": "<div class=\"ds-transcript\">Host explains the serum benefit. <mark class=\"ds-price\">Rp99.000</mark> needs review near <mark class=\"ds-violation\">claim text</mark>.</div>",
+      "css": ".ds-transcript { max-height: 220px; overflow-y: auto; border: 1px solid rgba(148, 163, 184, 0.14); border-radius: 8px; padding: 13px; background: rgba(2, 8, 23, 0.22); color: #dbeafe; font: 400 0.86rem/1.55 Source Sans Pro, system-ui, sans-serif; } .ds-transcript mark { border-radius: 4px; padding: 1px 3px; } .ds-price { background: rgba(250, 204, 21, 0.28); color: #fef9c3; } .ds-violation { background: rgba(239, 68, 68, 0.30); color: #fee2e2; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "Production Control Room",
+    "overview": "This system is a calm, status-first operations interface for office operators and editors running a high-throughput local video clipping pipeline. The physical scene is a remote PC or office workstation during long PROYA livestream processing runs: the operator needs to see queue health, failures, reviews, and ready assets without feeling pushed into a noisy debug console.\n\nThe dashboard is a product surface, so design serves the task. Familiar Streamlit controls are refined into a dark, legible, control-room vocabulary: dense tables, compact badges, restrained panels, and direct queue controls. The mood is composed, trustworthy, and efficient.\n\nIt explicitly rejects the anti-references from PRODUCT.md: flashy SaaS marketing patterns, toy-like controls, excessive decoration, decorative gradients, hero-scale type inside operational screens, dense technical log walls as the primary experience, and status colors that require memorization.",
+    "keyCharacteristics": [
+      "Calm dark operational surfaces with clear tonal steps.",
+      "Status language that combines text, icon or shape, color, and hierarchy.",
+      "Compact tables for desktop review and record cards for mobile.",
+      "Restrained borders, limited shadows, and predictable controls.",
+      "Semantic color reserved for action, health, waiting, failure, and review."
+    ],
+    "rules": [
+      {
+        "name": "The Status Redundancy Rule",
+        "body": "Color never carries status alone. Every important state must include visible text plus icon, dot, progress shape, or badge shape.",
+        "section": "colors"
+      },
+      {
+        "name": "The Accent Budget Rule",
+        "body": "Blue, green, yellow, red, and violet are operational signals, not decoration. If a color does not explain state, selection, risk, or action, remove it.",
+        "section": "colors"
+      },
+      {
+        "name": "The Tinted Neutral Rule",
+        "body": "Avoid pure black and pure white in normal UI. Use the slate text and surface scale so long sessions remain readable.",
+        "section": "colors"
+      },
+      {
+        "name": "The Scan First Rule",
+        "body": "Numbers, status labels, and next actions get typographic priority over descriptive prose.",
+        "section": "typography"
+      },
+      {
+        "name": "The No Decorative Type Rule",
+        "body": "Do not introduce expressive display fonts, gradient text, or oversized hero typography inside this product UI.",
+        "section": "typography"
+      },
+      {
+        "name": "The Tonal Layer Rule",
+        "body": "Reach for a darker or lighter surface step and a border before adding a shadow.",
+        "section": "elevation"
+      },
+      {
+        "name": "The Shadow Restraint Rule",
+        "body": "If every panel casts a shadow, no panel is important. Shadows are reserved for hierarchy and state.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do surface the next operational decision first: running, waiting, needs review, failed, blocked, ready, or completed.",
+      "Do use status text, icon or dot, color, and badge shape together every time status is a primary cue.",
+      "Do keep the palette restrained: cool slate neutrals carry the surface, semantic colors carry meaning.",
+      "Do keep desktop density useful with compact tables, short labels, and stable spacing.",
+      "Do swap dense desktop tables for mobile record cards below 760px.",
+      "Do keep controls predictable: standard buttons, tabs, select boxes, inputs, and pagination.",
+      "Do provide visible focus states for buttons, filters, tabs, dropdowns, table actions, and navigation.",
+      "Do support WCAG 2.2 AA, reduced-motion preferences, color-blind-safe status indicators, readable chart labels/tooltips, and mobile touch targets around 44px."
+    ],
+    "donts": [
+      "Don't use flashy SaaS marketing patterns.",
+      "Don't use toy-like controls.",
+      "Don't use excessive decoration.",
+      "Don't use decorative gradients. Functional gradients are allowed only for surfaces, progress fills, and selected controls where they preserve readability.",
+      "Don't use hero-scale type inside operational screens.",
+      "Don't expose dense technical log walls as the primary experience.",
+      "Don't use status colors that require memorization.",
+      "Don't make the dashboard look like a generic analytics template, a developer debug panel, or a playful creator tool.",
+      "Don't add side-stripe borders thicker than 1px as accents on cards, rows, callouts, or alerts. Use full borders, background tints, icons, labels, or nothing.",
+      "Don't use gradient text, decorative glassmorphism, decorative motion, or display fonts in labels, buttons, tables, or data."
+    ]
+  }
+}

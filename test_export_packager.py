@@ -138,6 +138,63 @@ class ExportPackagerTest(unittest.TestCase):
                 if item["source_clip_key"] in original_destinations:
                     self.assertEqual(item["destination_path"], original_destinations[item["source_clip_key"]])
 
+    def test_legacy_cutoff_freezes_existing_folders_and_starts_next_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_legacy_batch(root, 1, 30)
+            write_legacy_batch(root, 2, 10)
+            write_source(
+                root,
+                "vod_new",
+                [{"clip_id": "clip_0100_v0_original", "score": 9.0}],
+            )
+
+            result = package_export_batches(root, cfg=make_cfg(), batch_size=15)
+
+            self.assertEqual(result["legacy_batch_folder_cutoff"], 2)
+            self.assertEqual(batch_counts(root), {"1": 30, "2": 10, "3": 1})
+            items = package_items(root)
+            self.assertEqual(items[0]["batch_folder"], "3")
+            manifest = package_manifest(root)
+            self.assertEqual(manifest["batch_size"], 15)
+            self.assertEqual(manifest["legacy_batch_folder_cutoff"], 2)
+
+    def test_post_cutoff_batches_can_be_topped_up_to_new_size(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_legacy_batch(root, 1, 30)
+            write_source(
+                root,
+                "vod_a",
+                [
+                    {"clip_id": f"clip_{index:04d}_v0_original", "score": 100 - index}
+                    for index in range(1, 11)
+                ],
+            )
+
+            first = package_export_batches(root, cfg=make_cfg(), batch_size=15)
+            self.assertEqual(first["legacy_batch_folder_cutoff"], 1)
+            self.assertEqual(batch_counts(root), {"1": 30, "2": 10})
+
+            write_source(
+                root,
+                "vod_b",
+                [
+                    {"clip_id": f"clip_{index:04d}_v0_original", "score": 100 - index}
+                    for index in range(101, 111)
+                ],
+            )
+
+            second = package_export_batches(root, cfg=make_cfg(), batch_size=15)
+
+            self.assertEqual(second["legacy_batch_folder_cutoff"], 1)
+            counts = batch_counts(root)
+            self.assertEqual(counts, {"1": 30, "2": 15, "3": 5})
+            self.assertLessEqual(
+                max(count for folder, count in counts.items() if int(folder) > 1),
+                15,
+            )
+
     def test_excludes_failed_compliance_blocked_and_review_tiers(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -256,7 +313,7 @@ class ExportPackagerTest(unittest.TestCase):
 def make_cfg(one_variant: bool = True):
     return SimpleNamespace(
         EXPORT_BATCH_DIR_NAME="export_batches",
-        EXPORT_BATCH_SIZE=30,
+        EXPORT_BATCH_SIZE=15,
         EXPORT_PACK_ONE_VARIANT_PER_CLIP=one_variant,
     )
 
@@ -307,8 +364,11 @@ def write_source(root: Path, source_name: str, specs: list[dict]) -> None:
 
 
 def package_items(root: Path) -> list[dict]:
-    payload = json.loads((root / "export_batches" / "_manifest.json").read_text(encoding="utf-8"))
-    return payload["items"]
+    return package_manifest(root)["items"]
+
+
+def package_manifest(root: Path) -> dict:
+    return json.loads((root / "export_batches" / "_manifest.json").read_text(encoding="utf-8"))
 
 
 def batch_counts(root: Path) -> dict[str, int]:
@@ -317,6 +377,15 @@ def batch_counts(root: Path) -> dict[str, int]:
         for folder in sorted((root / "export_batches").iterdir(), key=lambda path: path.name)
         if folder.is_dir()
     }
+
+
+def write_legacy_batch(root: Path, folder_number: int, count: int) -> None:
+    folder = root / "export_batches" / str(folder_number)
+    folder.mkdir(parents=True, exist_ok=True)
+    for index in range(1, count + 1):
+        (folder / f"legacy_{folder_number}_{index:03d}.mp4").write_bytes(
+            f"legacy|{folder_number}|{index}".encode("utf-8")
+        )
 
 
 if __name__ == "__main__":

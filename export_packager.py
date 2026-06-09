@@ -93,7 +93,16 @@ def package_export_batches(
     )
 
     existing_counts = _existing_batch_counts(batch_root, existing_items)
-    assignments = _assign_score_round_robin(candidates, existing_counts, size)
+    legacy_batch_folder_cutoff, cutoff_needs_persist = _resolve_legacy_batch_folder_cutoff(
+        manifest,
+        existing_counts,
+    )
+    assignments = _assign_score_round_robin(
+        candidates,
+        existing_counts,
+        size,
+        legacy_batch_folder_cutoff=legacy_batch_folder_cutoff,
+    )
     planned_destinations: set[str] = set()
     moved_items: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -151,19 +160,25 @@ def package_export_batches(
         _update_source_scores_summary(candidate.source_dir, candidate.clip_id, relative_destination, destination)
         moved_items.append(item_payload)
 
-    if moved_items and not dry_run:
+    should_write_manifest = moved_items or (
+        cutoff_needs_persist
+        and (batch_root.exists() or existing_items)
+    )
+    if should_write_manifest and not dry_run:
         manifest_items = existing_items + moved_items
-        updated_manifest = {
+        updated_manifest = dict(manifest)
+        updated_manifest.update({
             "schema_version": PACKAGER_SCHEMA_VERSION,
             "updated_at": now,
             "output_root": str(root.resolve()),
             "batch_root": str(batch_root.resolve()),
             "batch_size": size,
+            "legacy_batch_folder_cutoff": legacy_batch_folder_cutoff,
             "order": "score_round_robin",
             "append_only": True,
             "items": manifest_items,
             "counts_by_batch": _counts_by_batch(manifest_items, batch_root),
-        }
+        })
         _write_json_atomic(manifest_path, updated_manifest)
 
     return {
@@ -172,6 +187,7 @@ def package_export_batches(
         "batch_root": str(batch_root.resolve()),
         "manifest_path": str(manifest_path.resolve()),
         "batch_size": size,
+        "legacy_batch_folder_cutoff": legacy_batch_folder_cutoff,
         "dry_run": dry_run,
         "eligible_count": len(raw_candidates),
         "candidate_count_after_variant_filter": len(candidate_pool),
@@ -413,17 +429,32 @@ def _assign_score_round_robin(
     candidates: list[ExportCandidate],
     existing_counts: dict[int, int],
     batch_size: int,
+    legacy_batch_folder_cutoff: int = 0,
 ) -> list[tuple[ExportCandidate, int]]:
     if not candidates:
         return []
-    counts = Counter(existing_counts)
+    cutoff = max(0, int(legacy_batch_folder_cutoff or 0))
+    counts = Counter(
+        {
+            folder_number: count
+            for folder_number, count in existing_counts.items()
+            if folder_number > cutoff
+        }
+    )
     existing_total = sum(max(0, value) for value in counts.values())
-    max_existing_folder = max(counts.keys(), default=0)
-    required_folder_count = max(max_existing_folder, math.ceil((existing_total + len(candidates)) / batch_size))
-    for folder_number in range(1, required_folder_count + 1):
+    max_existing_folder = max(counts.keys(), default=cutoff)
+    required_folder_count = max(
+        max_existing_folder,
+        cutoff + math.ceil((existing_total + len(candidates)) / batch_size),
+    )
+    for folder_number in range(cutoff + 1, required_folder_count + 1):
         counts.setdefault(folder_number, 0)
 
-    available = [folder for folder in range(1, required_folder_count + 1) if counts[folder] < batch_size]
+    available = [
+        folder
+        for folder in range(cutoff + 1, required_folder_count + 1)
+        if counts[folder] < batch_size
+    ]
     assignments: list[tuple[ExportCandidate, int]] = []
     cursor = 0
     next_folder = required_folder_count + 1
@@ -582,6 +613,24 @@ def _existing_batch_counts(batch_root: Path, existing_items: list[dict[str, Any]
             folder_number = int(folder.name)
             counts[folder_number] = max(counts[folder_number], actual_count)
     return dict(counts)
+
+
+def _resolve_legacy_batch_folder_cutoff(
+    manifest: dict[str, Any],
+    existing_counts: dict[int, int],
+) -> tuple[int, bool]:
+    cutoff = _coerce_nonnegative_int(manifest.get("legacy_batch_folder_cutoff"))
+    if cutoff is not None:
+        return cutoff, False
+    return max(existing_counts.keys(), default=0), True
+
+
+def _coerce_nonnegative_int(value: Any) -> int | None:
+    try:
+        number = int(str(value))
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
 
 
 def _counts_by_batch(items: list[dict[str, Any]], batch_root: Path) -> dict[str, int]:

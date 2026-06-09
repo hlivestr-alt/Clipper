@@ -144,7 +144,7 @@ ARCHETYPE_SLOTS = [
         "zoom_scale": 1.65,
         "zoom_offset": -1.25,
         "speed": 1.0,
-        "grade": "eq=saturation=1.35:contrast=1.18",
+        "grade": "eq=saturation=1.35:contrast=1.18,unsharp=5:5:0.8:5:5:0.0",
         "crop": 0.07,
         "mirror": False,
         "start_offset": 0.30,
@@ -184,7 +184,7 @@ ARCHETYPE_SLOTS = [
         "zoom_scale": 1.30,
         "zoom_offset": 0.75,
         "speed": 1.08,
-        "grade": "colortemperature=temperature=7200,eq=saturation=1.15:contrast=1.08",
+        "grade": "colortemperature=temperature=7200,eq=saturation=1.15:contrast=1.08,unsharp=5:5:0.8:5:5:0.0",
         "crop": 0.05,
         "mirror": False,
         "start_offset": 0.55,
@@ -271,6 +271,7 @@ class VariantConfig:
     hook_layout_mode: str = "standard"
     subtitle_layout_mode: str = "standard"
     broll_intro_role: str = ""
+    cta_text: str = ""
 
     # Optional intro B-roll used behind the opening hook text
     broll_intro_enabled: bool = False
@@ -329,6 +330,7 @@ def apply_variant_to_cfg(base_cfg, variant: VariantConfig):
     patched._hook_layout_mode = variant.hook_layout_mode
     patched._subtitle_layout_mode = variant.subtitle_layout_mode
     patched._broll_intro_role = variant.broll_intro_role
+    patched._cta_text = variant.cta_text
     patched._broll_intro_enabled = variant.broll_intro_enabled
     patched._broll_intro_path = variant.broll_intro_path
     patched._broll_intro_duration = variant.broll_intro_duration

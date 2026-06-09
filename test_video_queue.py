@@ -1,7 +1,12 @@
 import json
+import sys
 import tempfile
+import threading
+import time
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import queue_control
 from video_queue import (
@@ -255,6 +260,273 @@ class VideoQueueSchedulingTests(unittest.TestCase):
             self.assertEqual(stage_state["last_clip_status"], "ok")
             self.assertEqual(persisted["videos"][video_key]["current_stage"], EDIT_STAGE)
 
+    def test_queue_ffmpeg_runs_export_batch_packaging_asynchronously(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            input_dir = temp_path / "input"
+            input_dir.mkdir()
+            video = input_dir / "a.mp4"
+            video.write_bytes(b"")
+
+            runner = VideoQueueRunner(
+                input_dir=str(input_dir),
+                state_path=str(temp_path / "state.json"),
+                max_retries=0,
+                max_inflight_videos=1,
+                poll_interval=0.5,
+                control_path=str(temp_path / "control.json"),
+            )
+
+            observed_kwargs = {}
+            observed_result = {}
+            started = threading.Event()
+            release = threading.Event()
+            finished = threading.Event()
+
+            def fake_run_pipeline(**kwargs):
+                observed_kwargs.update(kwargs)
+                import main
+
+                class Cfg:
+                    EXPORT_BATCHES_ENABLED = True
+                    EXPORT_BATCH_SIZE = 15
+                    EXPORT_BATCH_TIMEOUT_SECONDS = 30
+                    OUTPUT_DIR = str(temp_path / "output")
+
+                observed_result.update(main._package_export_batches_if_enabled(Cfg))
+
+            fake_export_packager = types.ModuleType("export_packager")
+
+            def fake_package_export_batches(output_root, cfg=None, batch_size=None):
+                started.set()
+                if not release.wait(timeout=5.0):
+                    raise RuntimeError("test timed out waiting for release")
+                finished.set()
+                return {
+                    "eligible_count": 3,
+                    "new_unique_count": 3,
+                    "packaged_count": 3,
+                    "duplicate_existing_count": 0,
+                    "duplicate_candidate_count": 0,
+                    "error_count": 0,
+                    "manifest_path": str(temp_path / "output" / "export_batches" / "_manifest.json"),
+                    "assignments": [
+                        {"batch_folder": "1"},
+                        {"batch_folder": "1"},
+                        {"batch_folder": "2"},
+                    ],
+                }
+
+            fake_export_packager.package_export_batches = fake_package_export_batches
+
+            with mock.patch.dict(sys.modules, {"export_packager": fake_export_packager}), \
+                    mock.patch("main.run_pipeline", side_effect=fake_run_pipeline):
+                start_time = time.perf_counter()
+                runner._stage_ffmpeg(str(video))
+                elapsed = time.perf_counter() - start_time
+
+                self.assertLess(elapsed, 1.0)
+                self.assertTrue(started.wait(timeout=1.0))
+                self.assertFalse(finished.is_set())
+                self.assertTrue(observed_result["async"])
+                self.assertNotIn("package_export_batches", observed_kwargs)
+                self.assertEqual(observed_kwargs["video_path"], str(video))
+            release.set()
+            self.assertTrue(finished.wait(timeout=2.0))
+
+    def test_ffmpeg_worker_starts_next_video_before_export_packaging_finishes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            input_dir = temp_path / "input"
+            input_dir.mkdir()
+            first_video = input_dir / "a.mp4"
+            second_video = input_dir / "b.mp4"
+            first_video.write_bytes(b"")
+            second_video.write_bytes(b"")
+
+            runner = VideoQueueRunner(
+                input_dir=str(input_dir),
+                state_path=str(temp_path / "state.json"),
+                max_retries=0,
+                max_inflight_videos=1,
+                max_clips=3,
+                poll_interval=0.5,
+                control_path=str(temp_path / "control.json"),
+            )
+            runner._sync_videos([first_video, second_video])
+            first_key = str(first_video.resolve())
+            second_key = str(second_video.resolve())
+
+            with runner.state_lock:
+                runner._mark_queue_running_locked()
+                for video_key in (first_key, second_key):
+                    entry = runner.state["videos"][video_key]
+                    entry["status"] = "queued"
+                    for stage in PRE_EDIT_STAGES:
+                        entry["stages"][stage]["status"] = "done"
+                    entry["stages"][EDIT_STAGE]["status"] = "pending"
+                runner._schedule_locked("unit-test")
+
+            started_videos = []
+            started_lock = threading.Lock()
+            second_started = threading.Event()
+            packaging_started = threading.Event()
+            release_packaging = threading.Event()
+            first_packaging_finished = threading.Event()
+            packaging_call_count = 0
+            packaging_call_lock = threading.Lock()
+
+            def fake_run_pipeline(**kwargs):
+                with started_lock:
+                    started_videos.append(Path(kwargs["video_path"]).name)
+                    if len(started_videos) == 2:
+                        second_started.set()
+                self.assertEqual(kwargs["max_clips"], 3)
+                import main
+
+                class Cfg:
+                    EXPORT_BATCHES_ENABLED = True
+                    EXPORT_BATCH_SIZE = 15
+                    EXPORT_BATCH_TIMEOUT_SECONDS = 30
+                    OUTPUT_DIR = str(temp_path / "output")
+
+                main._package_export_batches_if_enabled(Cfg)
+
+            fake_export_packager = types.ModuleType("export_packager")
+
+            def fake_package_export_batches(output_root, cfg=None, batch_size=None):
+                nonlocal packaging_call_count
+                with packaging_call_lock:
+                    packaging_call_count += 1
+                    call_number = packaging_call_count
+                packaging_started.set()
+                if call_number == 1:
+                    self.assertTrue(second_started.wait(timeout=2.0))
+                    self.assertTrue(release_packaging.wait(timeout=5.0))
+                    first_packaging_finished.set()
+                return {
+                    "eligible_count": 3,
+                    "new_unique_count": 3,
+                    "packaged_count": 3,
+                    "duplicate_existing_count": 0,
+                    "duplicate_candidate_count": 0,
+                    "error_count": 0,
+                    "assignments": [{"batch_folder": "1"}],
+                }
+
+            fake_export_packager.package_export_batches = fake_package_export_batches
+
+            try:
+                with mock.patch.dict(sys.modules, {"export_packager": fake_export_packager}), \
+                        mock.patch("main.run_pipeline", side_effect=fake_run_pipeline):
+                    runner._start_workers()
+                    self.assertTrue(packaging_started.wait(timeout=2.0))
+                    self.assertTrue(second_started.wait(timeout=2.0))
+                    self.assertFalse(first_packaging_finished.is_set())
+                    release_packaging.set()
+
+                    deadline = time.time() + 5.0
+                    while time.time() < deadline:
+                        with runner.state_lock:
+                            states = [
+                                runner.state["videos"][first_key]["status"],
+                                runner.state["videos"][second_key]["status"],
+                            ]
+                        if states == ["completed", "completed"]:
+                            break
+                        time.sleep(0.05)
+
+                    self.assertTrue(first_packaging_finished.wait(timeout=2.0))
+                    with runner.state_lock:
+                        self.assertEqual(runner.state["videos"][first_key]["status"], "completed")
+                        self.assertEqual(runner.state["videos"][second_key]["status"], "completed")
+                    self.assertEqual(started_videos, ["a.mp4", "b.mp4"])
+            finally:
+                release_packaging.set()
+                runner._stop_workers()
+
+    def test_run_job_clears_queue_markers_when_stage_starts_and_finishes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            input_dir = temp_path / "input"
+            input_dir.mkdir()
+            video = input_dir / "a.mp4"
+            video.write_bytes(b"")
+
+            runner = VideoQueueRunner(
+                input_dir=str(input_dir),
+                state_path=str(temp_path / "state.json"),
+                max_retries=0,
+                max_inflight_videos=1,
+                poll_interval=0.5,
+                control_path=str(temp_path / "control.json"),
+            )
+            runner._sync_videos([video])
+            runner._execute_stage = lambda _job: None
+            video_key = str(video.resolve())
+
+            with runner.state_lock:
+                entry = runner.state["videos"][video_key]
+                entry["status"] = "queued"
+                entry["stages"]["transcribe"]["status"] = "queued"
+                entry["stages"]["transcribe"]["queued"] = True
+                entry["stages"]["transcribe"]["queued_at"] = "2026-05-27T16:42:06+07:00"
+
+            runner._run_job("gpu-worker", StageJob(video_path=video_key, stage="transcribe"))
+
+            with runner.state_lock:
+                stage_state = runner.state["videos"][video_key]["stages"]["transcribe"]
+                self.assertEqual(stage_state["status"], "done")
+                self.assertFalse(stage_state["queued"])
+                self.assertIsNone(stage_state["queued_at"])
+                self.assertIsNone(runner.state["videos"][video_key]["current_stage"])
+
+    def test_retry_failure_requeues_stage_without_failed_or_finished_markers(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            input_dir = temp_path / "input"
+            input_dir.mkdir()
+            video = input_dir / "a.mp4"
+            video.write_bytes(b"")
+
+            runner = VideoQueueRunner(
+                input_dir=str(input_dir),
+                state_path=str(temp_path / "state.json"),
+                max_retries=1,
+                max_inflight_videos=1,
+                poll_interval=0.5,
+                control_path=str(temp_path / "control.json"),
+            )
+            runner._sync_videos([video])
+
+            def fail_stage(_job):
+                raise RuntimeError("boom")
+
+            runner._execute_stage = fail_stage
+            video_key = str(video.resolve())
+
+            with runner.state_lock:
+                entry = runner.state["videos"][video_key]
+                entry["status"] = "queued"
+                entry["stages"]["transcribe"]["status"] = "queued"
+                entry["stages"]["transcribe"]["queued"] = True
+                entry["stages"]["transcribe"]["queued_at"] = "2026-05-27T16:42:06+07:00"
+
+            runner._run_job("gpu-worker", StageJob(video_path=video_key, stage="transcribe"))
+
+            with runner.state_lock:
+                entry = runner.state["videos"][video_key]
+                stage_state = entry["stages"]["transcribe"]
+                self.assertEqual(entry["status"], "queued")
+                self.assertEqual(stage_state["status"], "queued")
+                self.assertTrue(stage_state["queued"])
+                self.assertIsNotNone(stage_state["queued_at"])
+                self.assertIsNone(stage_state["finished_at"])
+                self.assertIsNone(stage_state["duration_sec"])
+                self.assertIn("RuntimeError: boom", stage_state["last_error"])
+                self.assertIsNone(entry["current_stage"])
+                self.assertEqual(runner.queues["gpu"].qsize(), 1)
+
     def test_retry_failed_resets_failed_stage_and_downstream_only(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -394,6 +666,245 @@ class VideoQueueSchedulingTests(unittest.TestCase):
                 entry = runner.state["videos"][str(video.resolve())]
                 self.assertEqual(entry["stages"]["transcribe"]["status"], "pending")
                 self.assertFalse(entry["stages"]["transcribe"]["queued"])
+
+    def test_running_queue_clears_stale_paused_at(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            input_dir = temp_path / "input"
+            input_dir.mkdir()
+
+            runner = VideoQueueRunner(
+                input_dir=str(input_dir),
+                state_path=str(temp_path / "state.json"),
+                max_retries=0,
+                max_inflight_videos=1,
+                poll_interval=0.5,
+            )
+
+            with runner.state_lock:
+                runner.state["queue_status"] = "paused"
+                runner.state["paused_at"] = "2026-05-25T00:50:19+07:00"
+                runner._mark_queue_running_locked()
+                runner._save_state_locked()
+
+                self.assertEqual(runner.state["queue_status"], "running")
+                self.assertNotIn("paused_at", runner.state)
+                persisted = json.loads((temp_path / "state.json").read_text(encoding="utf-8"))
+                self.assertNotIn("paused_at", persisted)
+
+    def test_enqueue_records_queued_at_for_dashboard_stall_detection(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            input_dir = temp_path / "input"
+            input_dir.mkdir()
+            video = input_dir / "a.mp4"
+            video.write_bytes(b"")
+
+            runner = VideoQueueRunner(
+                input_dir=str(input_dir),
+                state_path=str(temp_path / "state.json"),
+                max_retries=0,
+                max_inflight_videos=1,
+                poll_interval=0.5,
+            )
+            runner._sync_videos([video])
+            runner._stage_output_current = lambda _entry, stage, _path: stage in PRE_EDIT_STAGES
+            video_key = str(video.resolve())
+
+            with runner.state_lock:
+                entry = runner.state["videos"][video_key]
+                for stage in PRE_EDIT_STAGES:
+                    entry["stages"][stage]["status"] = "done"
+
+                runner._enqueue_stage_locked(video_key, EDIT_STAGE, reason="unit-test")
+
+                stage_state = entry["stages"][EDIT_STAGE]
+                self.assertEqual(stage_state["status"], "queued")
+                self.assertTrue(stage_state["queued"])
+                self.assertIsNotNone(stage_state["queued_at"])
+
+    def test_interrupted_ffmpeg_refresh_clears_stale_current_stage_for_requeue(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            input_dir = temp_path / "input"
+            input_dir.mkdir()
+            video = input_dir / "a.mp4"
+            video.write_bytes(b"")
+
+            runner = VideoQueueRunner(
+                input_dir=str(input_dir),
+                state_path=str(temp_path / "state.json"),
+                max_retries=0,
+                max_inflight_videos=1,
+                poll_interval=0.5,
+                stable_seconds=0,
+                output_tag="_run_001",
+                working_tag="_run_001",
+            )
+            runner._sync_videos([video])
+            runner._stage_output_current = lambda _entry, stage, _path: stage in PRE_EDIT_STAGES
+            video_key = str(video.resolve())
+
+            with runner.state_lock:
+                entry = runner.state["videos"][video_key]
+                for stage in PRE_EDIT_STAGES:
+                    entry["stages"][stage]["status"] = "done"
+                entry["status"] = "queued"
+                entry["current_stage"] = EDIT_STAGE
+                entry["stages"][EDIT_STAGE]["status"] = "running"
+                entry["stages"][EDIT_STAGE]["queued"] = True
+                entry["stages"][EDIT_STAGE]["queued_at"] = "2026-05-27T16:41:00+07:00"
+                entry["stages"][EDIT_STAGE]["started_at"] = "2026-05-27T16:42:06+07:00"
+                entry["stages"][EDIT_STAGE]["active_clip_renders"] = 2
+                entry["stages"][EDIT_STAGE]["render_paused"] = True
+
+                runner._refresh_stage_status_from_disk(entry)
+                stage_state = entry["stages"][EDIT_STAGE]
+                self.assertIsNone(entry["current_stage"])
+                self.assertEqual(stage_state["status"], "pending")
+                self.assertFalse(stage_state["queued"])
+                self.assertIsNone(stage_state["queued_at"])
+                self.assertEqual(stage_state["active_clip_renders"], 0)
+                self.assertFalse(stage_state["render_paused"])
+
+                runner._schedule_locked("restart")
+
+                stage_state = entry["stages"][EDIT_STAGE]
+                self.assertIsNone(entry["current_stage"])
+                self.assertEqual(stage_state["status"], "queued")
+                self.assertTrue(stage_state["queued"])
+                self.assertEqual(runner.queues["ffmpeg"].qsize(), 1)
+
+    def test_paused_ffmpeg_resume_enqueues_as_queued_not_paused(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            input_dir = temp_path / "input"
+            input_dir.mkdir()
+            video = input_dir / "a.mp4"
+            video.write_bytes(b"")
+
+            runner = VideoQueueRunner(
+                input_dir=str(input_dir),
+                state_path=str(temp_path / "state.json"),
+                max_retries=0,
+                max_inflight_videos=1,
+                poll_interval=0.5,
+                stable_seconds=0,
+                output_tag="_run_001",
+                working_tag="_run_001",
+                control_path=str(temp_path / "control.json"),
+            )
+            runner._sync_videos([video])
+            video_key = str(video.resolve())
+
+            with runner.state_lock:
+                runner.state["queue_status"] = "running"
+                entry = runner.state["videos"][video_key]
+                for stage in PRE_EDIT_STAGES:
+                    entry["stages"][stage]["status"] = "done"
+                entry["status"] = "paused"
+                entry["current_stage"] = None
+                entry["stages"][EDIT_STAGE]["status"] = "paused"
+                entry["stages"][EDIT_STAGE]["queued"] = False
+                entry["stages"][EDIT_STAGE]["queued_at"] = None
+                entry["stages"][EDIT_STAGE]["render_paused"] = True
+
+                runner._schedule_locked("resume")
+
+                stage_state = entry["stages"][EDIT_STAGE]
+                self.assertEqual(entry["status"], "queued")
+                self.assertEqual(stage_state["status"], "queued")
+                self.assertTrue(stage_state["queued"])
+                self.assertIsNotNone(stage_state["queued_at"])
+                self.assertFalse(stage_state["render_paused"])
+                self.assertEqual(runner.queues["ffmpeg"].qsize(), 1)
+
+    def test_refresh_preserves_paused_video_while_queue_is_paused(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            input_dir = temp_path / "input"
+            input_dir.mkdir()
+            control_path = temp_path / "control.json"
+            video = input_dir / "a.mp4"
+            video.write_bytes(b"")
+
+            runner = VideoQueueRunner(
+                input_dir=str(input_dir),
+                state_path=str(temp_path / "state.json"),
+                max_retries=0,
+                max_inflight_videos=1,
+                poll_interval=0.5,
+                stable_seconds=0,
+                output_tag="_run_001",
+                working_tag="_run_001",
+                control_path=str(control_path),
+            )
+            runner._sync_videos([video])
+            queue_control.request_stop(control_path)
+            video_key = str(video.resolve())
+
+            with runner.state_lock:
+                runner.state["queue_status"] = "paused"
+                entry = runner.state["videos"][video_key]
+                for stage in PRE_EDIT_STAGES:
+                    entry["stages"][stage]["status"] = "done"
+                entry["status"] = "paused"
+                entry["current_stage"] = EDIT_STAGE
+                entry["stages"][EDIT_STAGE]["status"] = "paused"
+                entry["stages"][EDIT_STAGE]["queued"] = True
+                entry["stages"][EDIT_STAGE]["queued_at"] = "2026-05-27T16:41:00+07:00"
+
+                runner._refresh_stage_status_from_disk(entry)
+
+                stage_state = entry["stages"][EDIT_STAGE]
+                self.assertEqual(entry["status"], "paused")
+                self.assertIsNone(entry["current_stage"])
+                self.assertEqual(stage_state["status"], "paused")
+                self.assertFalse(stage_state["queued"])
+                self.assertIsNone(stage_state["queued_at"])
+
+    def test_pending_ffmpeg_with_stale_current_stage_requeues_on_restart(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            input_dir = temp_path / "input"
+            input_dir.mkdir()
+            video = input_dir / "a.mp4"
+            video.write_bytes(b"")
+
+            runner = VideoQueueRunner(
+                input_dir=str(input_dir),
+                state_path=str(temp_path / "state.json"),
+                max_retries=0,
+                max_inflight_videos=1,
+                poll_interval=0.5,
+                stable_seconds=0,
+                output_tag="_run_001",
+                working_tag="_run_001",
+            )
+            runner._sync_videos([video])
+            runner._stage_output_current = lambda _entry, stage, _path: stage in PRE_EDIT_STAGES
+            video_key = str(video.resolve())
+
+            with runner.state_lock:
+                entry = runner.state["videos"][video_key]
+                for stage in PRE_EDIT_STAGES:
+                    entry["stages"][stage]["status"] = "done"
+                entry["status"] = "queued"
+                entry["current_stage"] = EDIT_STAGE
+                entry["stages"][EDIT_STAGE]["status"] = "pending"
+                entry["stages"][EDIT_STAGE]["queued"] = False
+                entry["stages"][EDIT_STAGE]["attempts"] = 1
+                entry["stages"][EDIT_STAGE]["started_at"] = "2026-05-27T16:42:06+07:00"
+                entry["stages"][EDIT_STAGE]["last_progress_at"] = "2026-05-27T16:46:54+07:00"
+
+                runner._refresh_stage_status_from_disk(entry)
+                runner._schedule_locked("restart")
+
+                stage_state = entry["stages"][EDIT_STAGE]
+                self.assertIsNone(entry["current_stage"])
+                self.assertEqual(stage_state["status"], "queued")
+                self.assertTrue(stage_state["queued"])
+                self.assertEqual(runner.queues["ffmpeg"].qsize(), 1)
 
 
 if __name__ == "__main__":

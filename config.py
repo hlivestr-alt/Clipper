@@ -29,6 +29,8 @@ QUEUE_SCAN_INTERVAL_SECONDS = QUEUE_RESCAN_INTERVAL_SECONDS
 QUEUE_STABLE_SECONDS = 60.0
 QUEUE_RESTART_DELAY_SECONDS = 30
 QUEUE_BETWEEN_RUNS_DELAY_SECONDS = 10
+QUEUE_DASHBOARD_RUNNING_STALL_SECONDS = 2 * 60 * 60
+QUEUE_DASHBOARD_QUEUED_STALL_SECONDS = 24 * 60 * 60
 
 # ── Before/After Image Overlay ────────────────────────────────────────────────
 # Drop your before/after result photos into this folder.
@@ -37,6 +39,7 @@ QUEUE_BETWEEN_RUNS_DELAY_SECONDS = 10
 BEFORE_AFTER_DIR        = "assets/before_after"   # folder with your images
 BEFORE_AFTER_ENABLED    = True                    # set False to disable globally
 BEFORE_AFTER_START_T    = 0        # seconds — when image appears (after hook)
+BEFORE_AFTER_START_OFFSET = 3.0    # minimum seconds before proof overlay appears
 BEFORE_AFTER_DURATION   = 2.5        # seconds the image is shown
 BEFORE_AFTER_OPACITY    = 1.0       # 0.0 = invisible, 1.0 = fully opaque
 BEFORE_AFTER_FADE_IN    = 0.00       # seconds to fade in
@@ -320,11 +323,18 @@ HOOK_STROKE_W       = 5            # 4–6px thick for TikTok style
 HOOK_DURATION       = 2.5          # show hook title briefly at the start
 # Background is auto-height (fits text exactly + padding)
 
+# ── End-card CTA ──────────────────────────────────────────────────────────────
+CTA_ENDCARD_ENABLED = True
+CTA_ENDCARD_DURATION = 2.0
+CTA_ENDCARD_DEFAULT_TEXT = "CEK ETALASE SEKARANG"
+
 # ── Subtitles ─────────────────────────────────────────────────────────────────
 SUBTITLE_FONTSIZE   = 120           # 60–80 range
 SUBTITLE_STROKE     = "#000000"
 SUBTITLE_STROKE_W   = 3            # 2–4px
 SUBTITLE_Y_POS      = 0.80        # vertical position (fraction of frame height)
+SUBTITLE_SAFE_ZONE_TOP = 0.08
+SUBTITLE_SAFE_ZONE_BOTTOM = 0.15
 
 # PNG emoji overlays triggered by subtitle keywords.
 # Position is randomized per subtitle chunk at render time.
@@ -486,12 +496,14 @@ MIN_SPEECH_WORDS_PER_SECOND = 0.75
 MAX_CLIP_SEGMENT_GAP = 4.0
 # HOOK_DURATION = 0.0
 # HOST_FACE_ZOOM_ENABLED = False
-OUTPUT_FPS = 24
+DRAFT_MODE = False
+OUTPUT_FPS = 30
 OUTPUT_CODEC = "h264_nvenc"
-OUTPUT_PRESET = "p1"
+OUTPUT_NVENC_PRESET = "p1" if DRAFT_MODE else "p4"
+OUTPUT_PRESET = OUTPUT_NVENC_PRESET
 OUTPUT_CRF = 35
-OUTPUT_CQ = 35
-OUTPUT_AUDIO_BITRATE = "96k"
+OUTPUT_CQ = 35 if DRAFT_MODE else 26
+OUTPUT_AUDIO_BITRATE = "96k" if DRAFT_MODE else "128k"
 MAX_PARALLEL_CLIPS = 6
 EDIT_LOG_EVERY_N = 25
 EDIT_LOG_CLIP_PLAN = False
@@ -540,10 +552,10 @@ SCORER_SIMILARITY_FRAME_SAMPLE_RATE = 30
 SCORER_SIMILARITY_MAX_FRAMES = 24
 
 # Affiliate handoff packaging. Export-ready clips from all VOD output folders
-# are moved into numbered batch folders with at most 30 videos each.
+# are moved into numbered batch folders with at most 15 videos each.
 EXPORT_BATCHES_ENABLED = True
 EXPORT_BATCH_DIR_NAME = "export_batches"
-EXPORT_BATCH_SIZE = 30
+EXPORT_BATCH_SIZE = 15
 EXPORT_BATCH_ORDER = "score_round_robin"
 EXPORT_BATCH_APPEND_ONLY = True
 EXPORT_PACK_ONE_VARIANT_PER_CLIP = True
