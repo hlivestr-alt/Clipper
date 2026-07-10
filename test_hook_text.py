@@ -63,6 +63,20 @@ class HookTextTest(unittest.TestCase):
         self.assertNotEqual(payload["headline"], "GILA SIH FLEK HILANG TOTAL")
         self.assertIsNone(RISKY_HARD_SELL.search(" ".join(payload.values())), payload)
 
+    def test_configured_hook_types_stay_soft_claim_safe(self):
+        moment = {
+            "clip_id": "clip_0003",
+            "product": "Serum",
+            "hook": "STOP FLEK HITAM SEKARANG",
+            "reason": "flek hitam tampak lebih samar setelah rutin pakai serum",
+            "keyword_category": "pain_problem",
+            "clip_type": "demo",
+        }
+
+        for hook_type in ["pain", "result", "curiosity", "value", "product_focus"]:
+            payload = build_hook_payload(moment, hook_type=hook_type)
+            self.assertIsNone(RISKY_HARD_SELL.search(" ".join(payload.values())), (hook_type, payload))
+
 
 def _cfg():
     return SimpleNamespace(

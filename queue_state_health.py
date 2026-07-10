@@ -8,7 +8,7 @@ from typing import Any
 STAGES = ("transcribe", "llm", "yolo", "ffmpeg")
 PRE_EDIT_STAGES = STAGES[:-1]
 EDIT_STAGE = "ffmpeg"
-TERMINAL_VIDEO_STATUSES = {"completed", "failed"}
+TERMINAL_VIDEO_STATUSES = {"completed", "failed", "stopped"}
 DEFAULT_RUNNING_STALL_SECONDS = 2 * 60 * 60
 DEFAULT_QUEUED_STALL_SECONDS = 24 * 60 * 60
 SEVERITY_RANK = {"critical": 3, "warning": 2, "info": 1}
@@ -52,6 +52,23 @@ def coerce_nonnegative_int(value: Any) -> int:
 
 def video_key(video: dict[str, Any]) -> str:
     return str(video.get("path") or video.get("video_path") or video.get("name") or "")
+
+
+def video_run_tag(video: dict[str, Any]) -> str:
+    return str(video.get("working_tag") or video.get("output_tag") or "").strip()
+
+
+def infer_active_run_tag(videos: list[dict[str, Any]]) -> str:
+    tags = Counter(
+        tag
+        for video in videos
+        if _video_is_nonterminal(video)
+        for tag in [video_run_tag(video)]
+        if tag
+    )
+    if not tags:
+        return ""
+    return str(tags.most_common(1)[0][0])
 
 
 def stage_label(stage_key: str, stage_labels: dict[str, str] | None = None) -> str:
@@ -174,7 +191,7 @@ def video_attention_items(
         for stage_key in STAGES:
             stage_state = _stage_state(video, stage_key)
             queue_marker_since = parse_timestamp(stage_state.get("queued_at"))
-            if _stage_status(stage_state) != "done":
+            if _stage_status(stage_state) not in {"done", "skipped"}:
                 issues.append(
                     _make_issue(
                         kind="completed_with_open_stage",
@@ -375,11 +392,18 @@ def derive_queue_health(
     stage_labels: dict[str, str] | None = None,
     running_stall_seconds: float = DEFAULT_RUNNING_STALL_SECONDS,
     queued_stall_seconds: float = DEFAULT_QUEUED_STALL_SECONDS,
+    active_run_tag: str | None = None,
 ) -> dict[str, Any]:
     now = now or datetime.now().astimezone()
     queue_status = str(state.get("queue_status") or "unknown").strip().lower()
     raw_videos = state.get("videos") if isinstance(state.get("videos"), dict) else {}
-    videos = [video for video in raw_videos.values() if isinstance(video, dict)]
+    all_videos = [video for video in raw_videos.values() if isinstance(video, dict)]
+    active_run = (active_run_tag if active_run_tag is not None else infer_active_run_tag(all_videos)).strip()
+    if active_run:
+        videos = [video for video in all_videos if video_run_tag(video) == active_run]
+    else:
+        videos = all_videos
+    ignored_historical_video_count = max(0, len(all_videos) - len(videos))
 
     top_issues: list[dict[str, Any]] = []
     paused_at = parse_timestamp(state.get("paused_at"))
@@ -507,6 +531,8 @@ def derive_queue_health(
         "running_stage_count": running_stage_count,
         "queued_stage_count": queued_stage_count,
         "active_clip_renders": active_clip_renders,
+        "active_run_tag": active_run,
+        "ignored_historical_video_count": ignored_historical_video_count,
         "issue_counts": dict(issue_counts),
         "top_videos": top_video_issues[:8],
     }

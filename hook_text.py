@@ -288,7 +288,7 @@ def _infer_cta(moment: dict[str, Any], seed: str) -> str:
     return _stable_pick(DEFAULT_CTAS, seed + "|cta_default")
 
 
-def _build_headline(moment: dict[str, Any], problem: str, benefit: str, seed: str) -> str:
+def _build_headline(moment: dict[str, Any], problem: str, benefit: str, seed: str, hook_type: str = "auto") -> str:
     problem = _normalize(problem)
     benefit = _normalize(benefit)
     base_hook = _normalize(moment.get("hook"))
@@ -327,6 +327,38 @@ def _build_headline(moment: dict[str, Any], problem: str, benefit: str, seed: st
         headline_options.extend([
             f"{problem_phrase}? COBA STEP INI",
             f"BANTU RAWAT {problem_phrase}",
+        ])
+
+    hook_type = _normalize(hook_type).lower()
+    if hook_type == "pain":
+        headline_options.extend([
+            f"{problem_phrase}? COBA STEP INI",
+            f"BANTU RAWAT {problem_phrase}",
+            f"{problem_phrase}? CEK RUTIN INI",
+        ])
+    elif hook_type == "result":
+        headline_options.extend([
+            "HASIL PEMAKAIAN RUTIN",
+            f"RUTIN PAKAI, {benefit_phrase}",
+            f"KULIT {benefit_phrase}",
+        ])
+    elif hook_type == "curiosity":
+        headline_options.extend([
+            "INI YANG SERING TERLEWAT",
+            "COBA CEK STEP INI",
+            "DETAIL KECIL YANG PENTING",
+        ])
+    elif hook_type == "value":
+        headline_options.extend([
+            "STEP RUTIN TANPA RIBET",
+            "CARA PAKAI YANG PRAKTIS",
+            "RUTIN HARIAN LEBIH MUDAH",
+        ])
+    elif hook_type == "product_focus":
+        headline_options.extend([
+            "CEK PRODUK DI LIVE INI",
+            f"PAKAI {product}, KULIT TERAWAT" if product else "",
+            "PRODUKNYA DIPAKAI BEGINI",
         ])
 
     if clip_type in {"demo", "testimoni"}:
@@ -391,12 +423,12 @@ def _build_headline(moment: dict[str, Any], problem: str, benefit: str, seed: st
     return _stable_pick(headline_options, seed + "|headline")
 
 
-def build_hook_payload(moment: dict[str, Any]) -> dict[str, str]:
+def build_hook_payload(moment: dict[str, Any], hook_type: str = "auto") -> dict[str, str]:
     seed = _seed_from_moment(moment)
     context = _collect_context(moment)
     benefit = _infer_benefit(moment, context)
     problem = _infer_problem(moment, context)
-    headline = _build_headline(moment, problem, benefit, seed)
+    headline = _build_headline(moment, problem, benefit, seed, hook_type=hook_type)
     subtext = _infer_subtext(moment, context, seed)
     cta = _infer_cta(moment, seed)
 
@@ -407,9 +439,9 @@ def build_hook_payload(moment: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def ensure_hook_payload(moment: dict[str, Any]) -> dict[str, str]:
+def ensure_hook_payload(moment: dict[str, Any], hook_type: str = "auto") -> dict[str, str]:
     existing = moment.get("hook_overlay")
-    if isinstance(existing, dict):
+    if isinstance(existing, dict) and _normalize(hook_type).lower() in {"", "auto"}:
         headline = _normalize(existing.get("headline")).upper()
         subtext = _normalize(existing.get("subtext"))
         cta = _normalize(existing.get("cta")).upper()
@@ -420,8 +452,11 @@ def ensure_hook_payload(moment: dict[str, Any]) -> dict[str, str]:
                 "cta": cta,
             }
 
-    payload = build_hook_payload(moment)
-    moment["hook_overlay"] = payload
+    payload = build_hook_payload(moment, hook_type=hook_type)
+    if _normalize(hook_type).lower() in {"", "auto"}:
+        moment["hook_overlay"] = payload
+    else:
+        moment["_variant_hook_overlay"] = payload
     if not _normalize(moment.get("hook")):
         moment["hook"] = payload["headline"]
     return payload

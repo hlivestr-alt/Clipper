@@ -17,6 +17,12 @@ VISION_CACHE_SCHEMA_VERSION = 3
 _MODEL_CACHE = {}
 
 
+def _batch_items(items: list, batch_size: int):
+    batch_size = max(1, int(batch_size or 1))
+    for start in range(0, len(items), batch_size):
+        yield items[start:start + batch_size]
+
+
 # ── Training ──────────────────────────────────────────────────────────────────
 
 def train_model(cfg):
@@ -99,6 +105,60 @@ def _load_model(cfg):
     log.info(f"Loaded YOLO model: {cfg.YOLO_WEIGHTS}")
     log.info(f"Classes: {model.names}")
     return model
+
+
+def _resolve_yolo_predict_options(cfg) -> dict:
+    device = str(getattr(cfg, "YOLO_DEVICE", "cpu") or "cpu")
+    half = bool(getattr(cfg, "YOLO_HALF", False))
+
+    if device.lower() != "cpu":
+        try:
+            import torch
+
+            cuda_available = bool(torch.cuda.is_available())
+            cuda_count = int(torch.cuda.device_count()) if cuda_available else 0
+        except Exception as exc:
+            log.warning(
+                "Unable to inspect CUDA availability for YOLO device %r (%s); "
+                "falling back to CPU",
+                device,
+                exc,
+            )
+            cuda_available = False
+            cuda_count = 0
+
+        requested_devices = [part.strip() for part in device.split(",") if part.strip()]
+        numeric_devices = []
+        for part in requested_devices:
+            try:
+                numeric_devices.append(int(part))
+            except ValueError:
+                numeric_devices = []
+                break
+        requested_cuda_index_valid = (
+            bool(numeric_devices)
+            and cuda_available
+            and all(0 <= index < cuda_count for index in numeric_devices)
+        )
+
+        if not requested_cuda_index_valid:
+            log.warning(
+                "YOLO_DEVICE=%r requested CUDA, but torch sees %s CUDA device(s); "
+                "using CPU for this scan",
+                device,
+                cuda_count,
+            )
+            device = "cpu"
+
+    if device.lower() == "cpu" and half:
+        log.info("YOLO half precision disabled for CPU inference")
+        half = False
+
+    return {
+        "device": device,
+        "imgsz": getattr(cfg, "YOLO_IMGSZ", 640),
+        "half": half,
+    }
 
 
 def build_scan_ranges_from_moments(moments: list, cfg) -> list:
@@ -305,39 +365,41 @@ def scan_video_for_products(video_path: str, working_dir: str, cfg, scan_ranges:
     cap.release()
 
     if sampled_frames:
-        results = model.predict(
-            [sample["frame"] for sample in sampled_frames],
-            conf=cfg.YOLO_CONF_THRESHOLD,
-            verbose=False,
-            device=getattr(cfg, "YOLO_DEVICE", "cpu"),
-            imgsz=getattr(cfg, "YOLO_IMGSZ", 640),
-            half=getattr(cfg, "YOLO_HALF", False),
-        )
-        for sample, result in zip(sampled_frames, results):
-            if result.boxes is None:
-                continue
-            for box in result.boxes:
-                class_id = int(box.cls[0])
-                conf = float(box.conf[0])
-                xyxy = box.xyxy[0].tolist()
+        predict_options = _resolve_yolo_predict_options(cfg)
+        batch_size = int(getattr(cfg, "YOLO_BATCH_SIZE", 32) or 32)
+        for batch in _batch_items(sampled_frames, batch_size):
+            results = model.predict(
+                [sample["frame"] for sample in batch],
+                conf=cfg.YOLO_CONF_THRESHOLD,
+                verbose=False,
+                stream=True,
+                **predict_options,
+            )
+            for sample, result in zip(batch, results):
+                if result.boxes is None:
+                    continue
+                for box in result.boxes:
+                    class_id = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    xyxy = box.xyxy[0].tolist()
 
-                full_bbox = [
-                    xyxy[0] + roi_x1,
-                    xyxy[1] + roi_y1,
-                    xyxy[2] + roi_x1,
-                    xyxy[3] + roi_y1,
-                ]
+                    full_bbox = [
+                        xyxy[0] + roi_x1,
+                        xyxy[1] + roi_y1,
+                        xyxy[2] + roi_x1,
+                        xyxy[3] + roi_y1,
+                    ]
 
-                detections.append({
-                    "time": round(sample["timestamp"], 3),
-                    "frame": sample["frame_idx"],
-                    "class_id": class_id,
-                    "class_name": cfg.PRODUCT_CLASSES.get(class_id, f"class_{class_id}"),
-                    "confidence": round(conf, 3),
-                    "bbox": [round(v, 1) for v in full_bbox],
-                    "frame_w": frame_w,
-                    "frame_h": frame_h,
-                })
+                    detections.append({
+                        "time": round(sample["timestamp"], 3),
+                        "frame": sample["frame_idx"],
+                        "class_id": class_id,
+                        "class_name": cfg.PRODUCT_CLASSES.get(class_id, f"class_{class_id}"),
+                        "confidence": round(conf, 3),
+                        "bbox": [round(v, 1) for v in full_bbox],
+                        "frame_w": frame_w,
+                        "frame_h": frame_h,
+                    })
     log.info(f"Scan complete: {len(detections)} product detections across {scanned} frames")
 
     # Group into events (consecutive detections = one event)

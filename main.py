@@ -48,6 +48,11 @@ from pathlib import Path
 
 from stage_cache import stage_fingerprint, stage_fingerprint_matches, write_stage_fingerprint
 
+try:
+    sys.stdout.reconfigure(errors="replace")
+except Exception:
+    pass
+
 # ── Configure logging ─────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -184,7 +189,13 @@ def _process_clip_job(job: dict, video_path: str, transcript_words: list, produc
     job["clip_product_events"] = clip_product_events
 
     variant = job["moment"].get("_variant", None)
-    speed_ramp = getattr(variant, "speed_ramp", 1.0) if variant is not None else 1.0
+    visual_mode = str(getattr(variant, "visual_mode", "host") or "host") if variant is not None else "host"
+    broll_audio_visual = visual_mode == "broll_audio"
+    speed_ramp = (
+        1.0
+        if broll_audio_visual
+        else getattr(variant, "speed_ramp", 1.0) if variant is not None else 1.0
+    )
     _set_job_rendered_duration(job, speed_ramp)
 
     force_render_existing = bool(job.get("force_render_existing"))
@@ -214,7 +225,11 @@ def _process_clip_job(job: dict, video_path: str, transcript_words: list, produc
             }
 
     variant_baked = False
-    should_bake_variant = variant is not None and bool(getattr(cfg, "VARIANT_FFMPEG_BAKE", True))
+    should_bake_variant = (
+        variant is not None
+        and not broll_audio_visual
+        and bool(getattr(cfg, "VARIANT_FFMPEG_BAKE", True))
+    )
     if silence_plan.get("trimmed"):
         from silence_trimmer import cut_raw_clip_with_silence_plan
 
@@ -264,6 +279,10 @@ def _process_clip_job(job: dict, video_path: str, transcript_words: list, produc
             from variation_engine import apply_variant_to_cfg
             edit_cfg = apply_variant_to_cfg(cfg, variant)
             setattr(edit_cfg, "_variant_transforms_baked", variant_baked)
+            if broll_audio_visual:
+                setattr(edit_cfg, "_speed_ramp", 1.0)
+                setattr(edit_cfg, "_mirror", False)
+                setattr(edit_cfg, "_crop_x_offset", 0.0)
         except ImportError:
             edit_cfg = cfg
     else:
@@ -271,7 +290,7 @@ def _process_clip_job(job: dict, video_path: str, transcript_words: list, produc
 
     mirror = bool(getattr(variant, "mirror", False)) if variant is not None else False
     crop_x_offset = float(getattr(variant, "crop_x_offset", 0.0)) if variant is not None else 0.0
-    if mirror or abs(crop_x_offset) > 0.005:
+    if not broll_audio_visual and (mirror or abs(crop_x_offset) > 0.005):
         clip_product_events = _remap_events_for_spatial_variant(
             clip_product_events,
             mirror=mirror,
@@ -460,6 +479,7 @@ def _build_manifest_row(job: dict, product_event_count: int, status: str) -> dic
         "reason": moment.get("reason", ""),
         "product_events": product_event_count,
         "status": status,
+        "settings_revision": str(job.get("settings_revision") or "unknown"),
     }
     silence_plan = job.get("silence_trim_plan") or {}
     row["silence_trimmed"] = bool(silence_plan.get("trimmed", False))
@@ -477,12 +497,45 @@ def _build_manifest_row(job: dict, product_event_count: int, status: str) -> dic
         if job.get("compliance_json_path"):
             row["compliance_file"] = job["compliance_json_path"]
     variant = moment.get("_variant")
+    if variant is not None:
+        row.update({
+            "variant_profile_revision": str(getattr(variant, "profile_revision", "") or ""),
+            "variant_name": str(getattr(variant, "display_name", "") or ""),
+            "variant_id": str(getattr(variant, "variant_id", "") or ""),
+            "variant_index": int(getattr(variant, "variant_index", 0) or 0),
+            "hook_type": str(getattr(variant, "hook_type", "text") or "text"),
+            "visual_mode": str(getattr(variant, "visual_mode", "host") or "host"),
+            "font_id": str(getattr(variant, "font_id", "") or getattr(variant, "font_subtitle", "") or ""),
+            "subtitle_position": str(getattr(variant, "subtitle_position", "") or ""),
+            "subtitle_y_frac": float(getattr(variant, "subtitle_y_frac", getattr(variant, "subtitle_y_pos", 0.80)) or 0.80),
+            "color_grade": str(getattr(variant, "color_grade", "") or ""),
+            "bgm_mode": str(getattr(variant, "bgm_mode", "auto") or "auto"),
+            "sfx_enabled": bool(getattr(variant, "sfx_enabled", True)),
+            "zoom_intensity": str(getattr(variant, "zoom_intensity", "normal") or "normal"),
+            "product_zoom_enabled": bool(getattr(variant, "product_zoom_enabled", True)),
+            "subtitle_enabled": bool(getattr(variant, "subtitle_enabled", True)),
+            "letterbox_enabled": bool(getattr(variant, "letterbox_enabled", False)),
+            "letterbox_top_frac": float(getattr(variant, "letterbox_top_frac", 0.0) or 0.0),
+            "letterbox_bottom_frac": float(getattr(variant, "letterbox_bottom_frac", 0.0) or 0.0),
+        })
     broll_intro_path = str(getattr(variant, "broll_intro_path", "") or "") if variant is not None else ""
     if broll_intro_path:
         row["broll_intro"] = True
         row["broll_intro_file"] = broll_intro_path
         row["broll_intro_duration"] = float(getattr(variant, "broll_intro_duration", 0.0) or 0.0)
         row["broll_intro_product"] = str(getattr(variant, "broll_intro_product", "") or "")
+    transitional_hook_path = str(getattr(variant, "transitional_hook_path", "") or "") if variant is not None else ""
+    if transitional_hook_path:
+        row["transitional_hook"] = True
+        row["transitional_hook_file"] = transitional_hook_path
+    product_broll_render = moment.get("_product_broll_render")
+    if isinstance(product_broll_render, dict):
+        row["product_broll_visual"] = bool(product_broll_render.get("active", False))
+        row["product_broll_fallback"] = bool(product_broll_render.get("fallback", False))
+        row["product_broll_reason"] = str(product_broll_render.get("reason") or "")
+        row["product_broll_product"] = str(product_broll_render.get("product_key") or "")
+        row["product_broll_folder"] = str(product_broll_render.get("folder") or "")
+        row["product_broll_clip_count"] = int(product_broll_render.get("clip_count") or 0)
     return row
 
 
@@ -551,6 +604,37 @@ def _get_events_for_clip_indexed(index: dict, clip_start: float, clip_end: float
             ],
         })
     return clip_events
+
+
+def _attach_detected_product_context_to_moments(moments: list, product_events: list) -> int:
+    if not moments or not product_events:
+        return 0
+    try:
+        from product_broll import resolve_moment_product_key, resolve_product_events_key
+    except Exception as exc:
+        log.debug("Product B-roll resolver unavailable for detected product fallback: %s", exc)
+        return 0
+
+    event_index = _build_clip_event_index(product_events)
+    attached = 0
+    for moment in moments:
+        if not isinstance(moment, dict) or resolve_moment_product_key(moment):
+            continue
+        try:
+            start = float(moment.get("start", 0.0) or 0.0)
+            end = float(moment.get("end", start) or start)
+        except (TypeError, ValueError):
+            continue
+        product_key = resolve_product_events_key(_get_events_for_clip_indexed(event_index, start, end))
+        if not product_key:
+            continue
+        moment["_detected_product_key"] = product_key
+        moment["_detected_product_source"] = "yolo"
+        attached += 1
+
+    if attached:
+        log.info("Attached YOLO product fallback for %s moment(s) without text product category", attached)
+    return attached
 
 
 def _attach_precomputed_clip_contexts(jobs: list, transcript_words: list, product_events: list) -> None:
@@ -829,9 +913,13 @@ def run_module_assembly(
     module_assembly_limit: int | None = None,
     module_product_zoom: bool = False,
     progress_callback=None,
+    runtime_cfg=None,
 ) -> dict:
     """Standalone module-library assembly run that does not depend on one source video."""
-    import config as base_cfg
+    if runtime_cfg is None:
+        import config as base_cfg
+    else:
+        base_cfg = runtime_cfg
     from module_assembler import build_modular_assembly_jobs, render_modular_assemblies
     from module_extractor import PRODUCT_FOLDERS, canonical_product, read_library_index
 
@@ -1084,12 +1172,61 @@ def _render_state_path_for_manifest(manifest_path: Path) -> Path:
     return manifest_path.with_name("render_state.json")
 
 
+def _variation_profile_revision_for_render(cfg) -> str:
+    try:
+        from variation_profile import active_profile_revision
+
+        return active_profile_revision(cfg)
+    except Exception as exc:
+        log.warning("Could not read variation profile revision for render fingerprint: %s", exc)
+        return ""
+
+
+def _variation_profile_uses_product_broll(cfg) -> bool:
+    try:
+        from variation_profile import load_active_profile
+
+        profile = load_active_profile(cfg)
+    except Exception as exc:
+        log.warning("Could not inspect variation profile visual modes for render fingerprint: %s", exc)
+        return False
+    variants = profile.get("variants") if isinstance(profile, dict) else []
+    if not isinstance(variants, list):
+        return False
+    return any(
+        isinstance(variant, dict)
+        and str(variant.get("visual_mode") or "host").strip().casefold() == "broll_audio"
+        for variant in variants
+    )
+
+
+def _product_broll_asset_fingerprint_for_render(cfg) -> str:
+    if not _variation_profile_uses_product_broll(cfg):
+        return ""
+    try:
+        from product_broll import product_broll_asset_fingerprint
+
+        return product_broll_asset_fingerprint(cfg)
+    except Exception as exc:
+        log.warning("Could not fingerprint product B-roll assets for render: %s", exc)
+        return ""
+
+
+def _render_fingerprint_extra(cfg, max_clips: int | None, cut_only: bool) -> dict:
+    return {
+        "max_clips": max_clips,
+        "cut_only": cut_only,
+        "variation_profile_revision": _variation_profile_revision_for_render(cfg),
+        "product_broll_asset_fingerprint": _product_broll_asset_fingerprint_for_render(cfg),
+    }
+
+
 def _render_fingerprint(video_path: str, cfg, max_clips: int | None, cut_only: bool) -> dict:
     return stage_fingerprint(
         video_path,
         cfg,
         "ffmpeg",
-        extra={"max_clips": max_clips, "cut_only": cut_only},
+        extra=_render_fingerprint_extra(cfg, max_clips, cut_only),
     )
 
 
@@ -1578,9 +1715,17 @@ def _start_export_batch_packaging_thread(cfg) -> threading.Thread:
     return thread
 
 
-def _package_export_batches_if_enabled(cfg, progress_callback=None) -> dict:
+def _package_export_batches_if_enabled(
+    cfg,
+    progress_callback=None,
+    *,
+    max_clips: int | None = None,
+) -> dict:
     if not bool(getattr(cfg, "EXPORT_BATCHES_ENABLED", False)):
         return {}
+    if max_clips is not None and os.environ.get(EXPORT_BATCH_ASYNC_ENV) != "1":
+        log.info("Skipping export batch packaging for bounded --max-clips run")
+        return {"skipped": True, "reason": "max_clips_manual_run"}
     if os.environ.get(EXPORT_BATCH_ASYNC_ENV) == "1":
         if progress_callback is not None:
             _report(
@@ -1725,7 +1870,7 @@ def _remap_events_for_speed_ramp(events: list, speed_ramp: float) -> list:
     return remapped
 
 
-def run_pipeline(
+def _run_pipeline_impl(
     video_path: str,
     skip_transcribe: bool = False,
     skip_moments: bool = False,
@@ -1744,18 +1889,24 @@ def run_pipeline(
     working_tag: str | None = None,
     control_path: str | None = None,
     progress_callback=None,   # optional: fn(stage, pct, message, **payload)
+    runtime_cfg=None,
+    settings_overrides: dict | None = None,
 ):
     """
     Full pipeline orchestrator. All stages cache their results so you can
     safely re-run after a crash — it picks up where it left off.
     """
-    import config as base_cfg
+    if runtime_cfg is None:
+        import config as base_cfg
+    else:
+        base_cfg = runtime_cfg
 
     modular_requested = bool(render_modules or modular_only)
     runtime_overrides = {
         "MODULE_ASSEMBLY_ENABLED": modular_requested,
         "MODULE_PRODUCT_ZOOM_ENABLED": False,
     }
+    runtime_overrides.update(settings_overrides or {})
     if not modular_requested:
         runtime_overrides["MODULE_ASSEMBLY_RENDER_LIMIT"] = 0
     elif module_assembly_limit is not None:
@@ -2041,21 +2192,42 @@ def run_pipeline(
         log.info(f"Limiting to top {max_clips} clips (from {len(moments)} total)")
         moments = moments[:max_clips]
 
+    _attach_detected_product_context_to_moments(moments, product_events)
+
     log.info(f"Moments to process: {len(moments)}")
     _report(progress_callback, "moments", 60, f"Found {len(moments)} clip moments")
 
-    n_variants = getattr(cfg, "VARIANTS_PER_CLIP", 1)
-    if n_variants > 1:
-        try:
-            from variation_engine import expand_moments_with_variants
+    requested_variants = getattr(cfg, "VARIANTS_PER_CLIP", 1)
+    selection_mode = getattr(cfg, "VARIANT_SELECTION_MODE", "fallback")
+    try:
+        from variation_engine import expand_moments_with_variants, resolve_variant_plan
+        from variation_profile import has_active_profile
 
-            variant_seed = getattr(cfg, "VARIANT_SEED", 42)
+        variant_seed = getattr(cfg, "VARIANT_SEED", 42)
+        _profile_variants, effective_variants, _mode = resolve_variant_plan(
+            cfg,
+            n_variants=requested_variants,
+            selection_mode=selection_mode,
+            seed=variant_seed,
+        )
+        if effective_variants > 1 or has_active_profile(cfg):
             log.info("\n-- VARIATION ENGINE ------------------------------------------------------")
-            log.info(f"  Base moments: {len(moments)} | Variants per clip: {n_variants}")
-            moments = expand_moments_with_variants(moments, cfg, n_variants=n_variants, seed=variant_seed)
+            log.info(
+                "  Base moments: %s | Variants per clip: %s | Selection: %s",
+                len(moments),
+                effective_variants,
+                selection_mode,
+            )
+            moments = expand_moments_with_variants(
+                moments,
+                cfg,
+                n_variants=requested_variants,
+                seed=variant_seed,
+                selection_mode=selection_mode,
+            )
             log.info(f"  Total clip jobs after expansion: {len(moments)}")
-        except ImportError:
-            log.warning("variation_engine.py not found; skipping variations")
+    except ImportError:
+        log.warning("variation_engine.py not found; skipping variations")
 
     # ══════════════════════════════════════════════════════════════════════════
     # STAGE 4: CUT + EDIT CLIPS
@@ -2068,6 +2240,7 @@ def run_pipeline(
     manifest_path = Path(output_dir) / "manifest.json"
     render_state_path = _render_state_path_for_manifest(manifest_path)
     render_fingerprint = _render_fingerprint(video_path, cfg, max_clips, cut_only)
+    render_fingerprint_extra = _render_fingerprint_extra(cfg, max_clips, cut_only)
     render_state = _load_matching_render_state(render_state_path, render_fingerprint)
     force_render_existing = False
     existing_manifest = []
@@ -2077,7 +2250,7 @@ def run_pipeline(
             video_path,
             cfg,
             "ffmpeg",
-            extra={"max_clips": max_clips, "cut_only": cut_only},
+            extra=render_fingerprint_extra,
         )
         if force_render_existing and render_state:
             existing_manifest = _load_manifest_rows(manifest_path)
@@ -2089,6 +2262,12 @@ def run_pipeline(
             existing_manifest = _load_manifest_rows(manifest_path)
 
     jobs = [_build_clip_job(moment, i, output_dir, raw_dir) for i, moment in enumerate(moments)]
+    settings_revision = str(
+        getattr(cfg, "SETTINGS_REVISION", getattr(cfg, "_settings_revision", "unknown"))
+        or "unknown"
+    )
+    for job in jobs:
+        job["settings_revision"] = settings_revision
     if existing_manifest and not force_render_existing:
         reused = _reuse_existing_manifest_outputs_for_jobs(jobs, existing_manifest, Path(output_dir))
         if reused:
@@ -2210,7 +2389,7 @@ def run_pipeline(
         video_path,
         cfg,
         "ffmpeg",
-        extra={"max_clips": max_clips, "cut_only": cut_only},
+        extra=render_fingerprint_extra,
     )
     _write_render_state(
         render_state_path,
@@ -2235,7 +2414,11 @@ def run_pipeline(
     except Exception as exc:
         log.warning(f"Could not merge compliance fields into score summary: {exc}")
 
-    export_batch_result = _package_export_batches_if_enabled(cfg, progress_callback)
+    export_batch_result = _package_export_batches_if_enabled(
+        cfg,
+        progress_callback,
+        max_clips=max_clips,
+    )
 
     log.info("\n" + "=" * 70)
     log.info("PIPELINE COMPLETE")
@@ -2266,7 +2449,12 @@ def run_pipeline(
     if scores_summary_path:
         log.info(f"  Scores:         {scores_summary_path}")
     if export_batch_result:
-        if export_batch_result.get("async"):
+        if export_batch_result.get("skipped"):
+            log.info(
+                "  Export batches: skipped (%s)",
+                export_batch_result.get("reason", "not_applicable"),
+            )
+        elif export_batch_result.get("async"):
             log.info(
                 "  Export batches: background packaging started (%s)",
                 export_batch_result.get("thread_name"),
@@ -2316,6 +2504,107 @@ def run_pipeline(
         "module_extraction": module_stats or {},
         "modular_assembly": modular_result,
     }
+
+
+def _pipeline_service_executor(command, runtime_cfg, progress_callback):
+    return _run_pipeline_impl(
+        video_path=command.video_path,
+        skip_transcribe=command.skip_transcribe,
+        skip_moments=command.skip_moments,
+        skip_vision=command.skip_vision,
+        cut_only=command.cut_only,
+        max_clips=command.max_clips,
+        min_score=command.min_score,
+        force_rescore=command.force_rescore,
+        extract_modules_only=command.extract_modules_only,
+        force_modules=command.force_modules,
+        render_modules=command.render_modules,
+        modular_only=command.modular_only,
+        module_assembly_limit=command.module_assembly_limit,
+        module_product_zoom=command.module_product_zoom,
+        output_tag=command.output_tag,
+        working_tag=command.working_tag,
+        control_path=command.control_path,
+        progress_callback=progress_callback,
+        runtime_cfg=runtime_cfg,
+        settings_overrides=command.settings_overrides,
+    )
+
+
+def run_pipeline(
+    video_path: str,
+    skip_transcribe: bool = False,
+    skip_moments: bool = False,
+    skip_vision: bool = False,
+    cut_only: bool = False,
+    max_clips: int = None,
+    min_score: float = None,
+    force_rescore: bool = False,
+    extract_modules_only: bool = False,
+    force_modules: bool = False,
+    render_modules: bool = False,
+    modular_only: bool = False,
+    module_assembly_limit: int | None = None,
+    module_product_zoom: bool = False,
+    output_tag: str | None = None,
+    working_tag: str | None = None,
+    control_path: str | None = None,
+    progress_callback=None,
+    settings_overrides: dict | None = None,
+):
+    """Compatibility facade for the typed pipeline application service."""
+    if os.environ.get("CLIPPER_SERVICE_BOUNDARY", "service").casefold() == "legacy":
+        return _run_pipeline_impl(
+            video_path=video_path,
+            skip_transcribe=skip_transcribe,
+            skip_moments=skip_moments,
+            skip_vision=skip_vision,
+            cut_only=cut_only,
+            max_clips=max_clips,
+            min_score=min_score,
+            force_rescore=force_rescore,
+            extract_modules_only=extract_modules_only,
+            force_modules=force_modules,
+            render_modules=render_modules,
+            modular_only=modular_only,
+            module_assembly_limit=module_assembly_limit,
+            module_product_zoom=module_product_zoom,
+            output_tag=output_tag,
+            working_tag=working_tag,
+            control_path=control_path,
+            progress_callback=progress_callback,
+            settings_overrides=settings_overrides,
+        )
+
+    from clipper_app.application.events import LegacyCallbackEventSink
+    from clipper_app.bootstrap import build_pipeline_service
+    from clipper_app.contracts import PipelineRunCommand
+
+    command = PipelineRunCommand(
+        video_path=video_path,
+        skip_transcribe=skip_transcribe,
+        skip_moments=skip_moments,
+        skip_vision=skip_vision,
+        cut_only=cut_only,
+        max_clips=max_clips,
+        min_score=min_score,
+        force_rescore=force_rescore,
+        extract_modules_only=extract_modules_only,
+        force_modules=force_modules,
+        render_modules=render_modules,
+        modular_only=modular_only,
+        module_assembly_limit=module_assembly_limit,
+        module_product_zoom=module_product_zoom,
+        output_tag=output_tag,
+        working_tag=working_tag,
+        control_path=control_path,
+        settings_overrides=settings_overrides or {},
+    )
+    result = build_pipeline_service(_pipeline_service_executor).run(
+        command,
+        LegacyCallbackEventSink(progress_callback),
+    )
+    return result.model_dump()
 
 
 # ── Utility functions ──────────────────────────────────────────────────────────
@@ -2737,6 +3026,8 @@ def _validate_startup(
         errors.append(f"LM Studio is not responding at {getattr(cfg, 'LM_STUDIO_BASE_URL', '')}")
     if not skip_vision and not Path(getattr(cfg, "YOLO_WEIGHTS", "")).exists():
         errors.append(f"YOLO weights not found: {getattr(cfg, 'YOLO_WEIGHTS', '')}")
+    if not skip_vision:
+        _warn_if_yolo_cuda_unavailable(cfg)
     free_bytes = shutil.disk_usage(output_dir).free
     if free_bytes < 10 * 1024**3:
         errors.append(f"Output disk has less than 10GB free: {output_dir}")
@@ -2744,6 +3035,31 @@ def _validate_startup(
         message = "Startup validation failed:\n" + "\n".join(f"  - {item}" for item in errors)
         log.error(message)
         raise RuntimeError(message)
+
+
+
+
+def _warn_if_yolo_cuda_unavailable(cfg) -> None:
+    requested_device = str(getattr(cfg, "YOLO_DEVICE", "cpu") or "cpu").strip().lower()
+    if requested_device == "cpu":
+        return
+    try:
+        import torch
+    except Exception as exc:
+        log.warning(
+            "Could not import torch for YOLO CUDA startup check: %s. "
+            "YOLO may fail or run on CPU.",
+            exc,
+        )
+        return
+    if not torch.cuda.is_available():
+        log.warning(
+            "CUDA not available for YOLO - torch version: %s, cuda: %s. "
+            "YOLO will run on CPU which may crash on large videos. "
+            "Install CUDA-enabled PyTorch.",
+            getattr(torch, "__version__", "unknown"),
+            getattr(torch.version, "cuda", None),
+        )
 
 
 def _command_available(command: str) -> bool:
@@ -2981,6 +3297,11 @@ def main():
         help="Move export-ready clips into numbered affiliate batch folders without processing a video",
     )
     parser.add_argument(
+        "--cleanup-stale-queue",
+        action="store_true",
+        help="Reset stale queued/running queue stage markers using QUEUE_STUCK_THRESHOLD",
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default=None,
@@ -3059,6 +3380,16 @@ def main():
                 log.warning("  %s", error)
         return
 
+    if args.cleanup_stale_queue:
+        from video_queue import cleanup_stale_queue_state
+
+        result = cleanup_stale_queue_state()
+        log.info("Stale queue cleanup complete:")
+        log.info("  State:   %s", result.get("state_path"))
+        log.info("  Exists:  %s", result.get("exists"))
+        log.info("  Changed: %s", result.get("changed", 0))
+        return
+
     # ── Train YOLO ────────────────────────────────────────────────────────────
     if args.train_yolo:
         import config as cfg
@@ -3073,10 +3404,12 @@ def main():
         return
 
     if args.module_library_report:
-        import config as cfg
-        from module_report import build_module_library_report
+        from clipper_app.bootstrap import build_module_service
+        from clipper_app.contracts import ModuleReportCommand
 
-        report = build_module_library_report(cfg)
+        report = build_module_service().report(
+            ModuleReportCommand(include_library_report=True, include_review_queue=False)
+        ).payload["report"]
         log.info("Module library report written:")
         log.info("  JSON: %s", report.get("json_path"))
         log.info("  CSV:  %s", report.get("csv_path"))
@@ -3094,14 +3427,17 @@ def main():
         return
 
     if args.module_review_queue:
-        import config as cfg
-        from module_review import build_module_review_queue
+        from clipper_app.bootstrap import build_module_service
+        from clipper_app.contracts import ModuleReportCommand
 
-        report = build_module_review_queue(
-            cfg,
-            status=args.module_review_filter,
-            limit=args.module_review_limit,
-        )
+        report = build_module_service().report(
+            ModuleReportCommand(
+                include_library_report=False,
+                include_review_queue=True,
+                review_filter=args.module_review_filter,
+                review_limit=args.module_review_limit,
+            )
+        ).payload["review_queue"]
         log.info("Module review queue written:")
         log.info("  JSON: %s", report.get("json_path"))
         log.info("  CSV:  %s", report.get("csv_path"))
@@ -3114,16 +3450,15 @@ def main():
         if not args.module_review_status:
             print("Error: --module-review-set requires --module-review-status")
             sys.exit(1)
-        import config as cfg
-        from module_review import update_module_review
+        from clipper_app.bootstrap import build_module_service
+        from clipper_app.contracts import ModuleReviewCommand
 
-        result = update_module_review(
-            args.module_review_set,
-            args.module_review_status,
-            cfg,
+        result = build_module_service().review(ModuleReviewCommand(
+            identifier=args.module_review_set,
+            status=args.module_review_status,
             note=args.module_review_note,
             reviewer=args.module_reviewer,
-        )
+        )).payload
         log.info(
             "Module review updated: %s review_status=%s quality_status=%s reason=%s",
             result.get("module_id"),
@@ -3135,11 +3470,10 @@ def main():
         return
 
     if args.validate_modules_visual_only:
-        import config as cfg
-        from module_visual_validator import validate_module_library_visual
+        from clipper_app.bootstrap import build_module_service
+        from clipper_app.contracts import ModuleValidationCommand
 
-        result = validate_module_library_visual(
-            cfg,
+        result = build_module_service().validate(ModuleValidationCommand(
             product=args.module_visual_product,
             limit=args.module_visual_limit,
             visual_status=args.module_visual_status,
@@ -3147,7 +3481,7 @@ def main():
             approved_only=args.module_visual_approved_only,
             priority=args.module_visual_priority,
             force=args.force_module_visual,
-        )
+        )).payload
         log.info("Module visual validation complete:")
         log.info("  Index:   %s", result.get("index_path"))
         log.info("  Checked: %s", result.get("validated", 0))
@@ -3161,14 +3495,15 @@ def main():
 
     if args.assemble_modules:
         try:
-            assembly_kwargs = {
-                "assembly_date": args.date,
-                "module_assembly_limit": args.module_assembly_limit,
-                "module_product_zoom": args.module_product_zoom,
-            }
-            if args.product:
-                assembly_kwargs["product"] = args.product
-            run_module_assembly(**assembly_kwargs)
+            from clipper_app.bootstrap import build_module_service
+            from clipper_app.contracts import ModuleAssemblyCommand
+
+            build_module_service().assemble(ModuleAssemblyCommand(
+                assembly_date=args.date,
+                product=args.product,
+                module_assembly_limit=args.module_assembly_limit,
+                module_product_zoom=args.module_product_zoom,
+            ))
         except ValueError as exc:
             print(f"Error: {exc}")
             sys.exit(1)
@@ -3229,7 +3564,7 @@ def main():
 
     if not args.video:
         parser.print_help()
-        print("\nError: --video is required unless using --train-yolo, --test-lm-studio, --assemble-modules, --module-library-report, --module-review-queue, --module-review-set, --validate-modules-visual-only, --preview-ba, or --setup-sfx")
+        print("\nError: --video is required unless using --train-yolo, --test-lm-studio, --assemble-modules, --module-library-report, --module-review-queue, --module-review-set, --validate-modules-visual-only, --cleanup-stale-queue, --preview-ba, or --setup-sfx")
         print("       Use --package-export-batches to package existing export-ready clips without --video.")
         sys.exit(1)
 

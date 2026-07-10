@@ -11,7 +11,7 @@ import main
 class MainModuleIntegrationTests(unittest.TestCase):
     def test_modular_assembly_default_is_opt_in(self):
         self.assertFalse(cfg.MODULE_ASSEMBLY_ENABLED)
-        self.assertFalse(cfg.MODULE_VISUAL_VALIDATION_ENABLED)
+        self.assertFalse(cfg.MODULE_VALIDATE_ON_EXTRACT)
         self.assertFalse(cfg.MODULE_PRODUCT_ZOOM_ENABLED)
 
     def test_extract_modules_only_returns_before_rendering(self):
@@ -139,11 +139,11 @@ class MainModuleIntegrationTests(unittest.TestCase):
             mock.patch.object(main, "run_module_assembly", return_value={}) as assemble:
             main.main()
 
-        assemble.assert_called_once_with(
-            assembly_date="2026-04-16",
-            module_assembly_limit=2,
-            module_product_zoom=True,
-        )
+        assemble.assert_called_once()
+        self.assertEqual(assemble.call_args.kwargs["assembly_date"], "2026-04-16")
+        self.assertEqual(assemble.call_args.kwargs["module_assembly_limit"], 2)
+        self.assertTrue(assemble.call_args.kwargs["module_product_zoom"])
+        self.assertIsNotNone(assemble.call_args.kwargs["runtime_cfg"])
 
     def test_standalone_assembly_uses_dated_output_and_runtime_overrides(self):
         with tempfile.TemporaryDirectory() as tmp:

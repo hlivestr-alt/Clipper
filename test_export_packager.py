@@ -61,7 +61,7 @@ class ExportPackagerTest(unittest.TestCase):
             result = package_export_batches(root, cfg=make_cfg(), batch_size=30)
 
             self.assertEqual(result["packaged_count"], 1)
-            self.assertEqual(result["excluded_variant_count"], 1)
+            self.assertEqual(result["excluded_variant_count"], 0)
             items = package_items(root)
             self.assertEqual(len(items), 1)
             self.assertEqual(items[0]["clip_id"], "clip_0001_v0_original")
@@ -222,7 +222,7 @@ class ExportPackagerTest(unittest.TestCase):
             self.assertEqual(result["packaged_count"], 1)
             self.assertEqual(package_items(root)[0]["clip_id"], "clip_0001_v0_original")
 
-    def test_one_variant_per_base_clip_uses_stable_variant_rotation(self):
+    def test_one_variant_per_base_clip_keeps_best_variant_for_backwards_compat(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write_source(
@@ -238,27 +238,27 @@ class ExportPackagerTest(unittest.TestCase):
                 ],
             )
 
-            result = package_export_batches(root, cfg=make_cfg(), batch_size=30)
+            result = package_export_batches(root, cfg=make_cfg(one_variant=True), batch_size=30)
 
             self.assertEqual(result["packaged_count"], 1)
             self.assertEqual(result["excluded_variant_count"], 5)
             items = package_items(root)
             self.assertEqual(len(items), 1)
             self.assertEqual(items[0]["base_clip_id"], "clip_0018")
-            self.assertEqual(items[0]["clip_id"], "clip_0018_v4_host_focus_fast")
-            self.assertEqual(items[0]["selected_variant"], "v4_host_focus_fast")
+            self.assertEqual(items[0]["clip_id"], "clip_0018_v1_cream_soft")
+            self.assertEqual(items[0]["selected_variant"], "v1_cream_soft")
             self.assertEqual(
                 items[0]["excluded_variants"],
                 [
-                    "v0_original",
-                    "v1_cream_soft",
                     "v2_hot_pink",
                     "v3_result_overlay",
+                    "v4_host_focus_fast",
                     "v5_clean_commerce",
+                    "v0_original",
                 ],
             )
 
-    def test_one_variant_per_base_clip_does_not_collapse_to_v0(self):
+    def test_one_variant_per_base_clip_packs_one_variant_per_base(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             specs = []
@@ -276,16 +276,12 @@ class ExportPackagerTest(unittest.TestCase):
                 )
             write_source(root, "vod_a", specs)
 
-            result = package_export_batches(root, cfg=make_cfg(), batch_size=30)
+            result = package_export_batches(root, cfg=make_cfg(one_variant=True), batch_size=30)
 
             self.assertEqual(result["packaged_count"], 12)
-            selected_variants = {
-                item["selected_variant"]
-                for item in package_items(root)
-            }
-            self.assertGreater(len(selected_variants), 1)
-            self.assertIn("v0_original", selected_variants)
-            self.assertTrue(any(variant != "v0_original" for variant in selected_variants))
+            items = package_items(root)
+            self.assertEqual(len({item["base_clip_id"] for item in items}), 12)
+            self.assertTrue(all(item["selected_variant"] == "v0_original" for item in items))
 
     def test_one_variant_per_base_clip_can_be_disabled(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -309,8 +305,114 @@ class ExportPackagerTest(unittest.TestCase):
             self.assertEqual(result["excluded_variant_count"], 0)
             self.assertEqual(len(package_items(root)), 6)
 
+    def test_all_export_ready_variants_pack_into_different_folders_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_source(
+                root,
+                "vod_a",
+                [
+                    {"clip_id": "clip_0018_v0_original", "score": 9.0},
+                    {"clip_id": "clip_0018_v2_hot_pink", "score": 8.0},
+                    {"clip_id": "clip_0018_v4_host_focus_fast", "score": 7.0},
+                ],
+            )
 
-def make_cfg(one_variant: bool = True):
+            result = package_export_batches(root, cfg=make_cfg(), batch_size=15)
+
+            self.assertEqual(result["packaged_count"], 3)
+            folders = {item["clip_id"]: item["batch_folder"] for item in package_items(root)}
+            self.assertEqual(
+                set(folders),
+                {
+                    "clip_0018_v0_original",
+                    "clip_0018_v2_hot_pink",
+                    "clip_0018_v4_host_focus_fast",
+                },
+            )
+            self.assertEqual(len(set(folders.values())), 3)
+
+    def test_different_base_clips_can_share_a_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_source(
+                root,
+                "vod_a",
+                [
+                    {"clip_id": "clip_0018_v0_original", "score": 9.0},
+                    {"clip_id": "clip_0019_v0_original", "score": 8.0},
+                ],
+            )
+
+            result = package_export_batches(root, cfg=make_cfg(), batch_size=15)
+
+            self.assertEqual(result["packaged_count"], 2)
+            self.assertEqual(batch_counts(root), {"1": 2})
+
+    def test_same_base_variants_never_share_a_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_source(
+                root,
+                "vod_a",
+                [
+                    {"clip_id": "clip_0018_v0_original", "score": 9.0},
+                    {"clip_id": "clip_0018_v2_hot_pink", "score": 8.0},
+                    {"clip_id": "clip_0019_v0_original", "score": 7.0},
+                ],
+            )
+
+            result = package_export_batches(root, cfg=make_cfg(), batch_size=15)
+
+            self.assertEqual(result["packaged_count"], 3)
+            folders_by_base = base_folders(package_items(root))
+            self.assertEqual(len(folders_by_base["clip_0018"]), 2)
+            self.assertEqual(len(folders_by_base["clip_0019"]), 1)
+
+    def test_variant_aware_round_robin_still_balances_folder_sizes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            specs = []
+            for clip_number in range(1, 21):
+                base = f"clip_{clip_number:04d}"
+                specs.extend(
+                    [
+                        {"clip_id": f"{base}_v0_original", "score": 100 - clip_number},
+                        {"clip_id": f"{base}_v2_hot_pink", "score": 80 - clip_number},
+                    ]
+                )
+            write_source(root, "vod_a", specs)
+
+            result = package_export_batches(root, cfg=make_cfg(), batch_size=15)
+
+            self.assertEqual(result["packaged_count"], 40)
+            counts = batch_counts(root)
+            self.assertLessEqual(max(counts.values()) - min(counts.values()), 1)
+            for folders in base_folders(package_items(root)).values():
+                self.assertEqual(len(folders), 2)
+
+    def test_can_package_single_vod_output_folder_directly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_source(
+                root,
+                "vod_a",
+                [
+                    {"clip_id": "clip_0001_v0_original", "score": 9.0},
+                    {"clip_id": "clip_0002_v0_original", "score": 8.0},
+                ],
+            )
+            source_dir = root / "vod_a"
+
+            result = package_export_batches(source_dir, cfg=make_cfg(), batch_size=15)
+
+            self.assertEqual(result["eligible_count"], 2)
+            self.assertEqual(result["packaged_count"], 2)
+            self.assertEqual(batch_counts(source_dir), {"1": 2})
+            self.assertFalse((source_dir / "export_ready" / "v0" / "clip_0001_v0_original_score9.mp4").exists())
+
+
+def make_cfg(one_variant: bool = False):
     return SimpleNamespace(
         EXPORT_BATCH_DIR_NAME="export_batches",
         EXPORT_BATCH_SIZE=15,
@@ -377,6 +479,13 @@ def batch_counts(root: Path) -> dict[str, int]:
         for folder in sorted((root / "export_batches").iterdir(), key=lambda path: path.name)
         if folder.is_dir()
     }
+
+
+def base_folders(items: list[dict]) -> dict[str, set[str]]:
+    folders: dict[str, set[str]] = {}
+    for item in items:
+        folders.setdefault(item["base_clip_id"], set()).add(item["batch_folder"])
+    return folders
 
 
 def write_legacy_batch(root: Path, folder_number: int, count: int) -> None:

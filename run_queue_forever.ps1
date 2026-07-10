@@ -18,6 +18,14 @@ param(
     [switch]$ForceRescore,
     [switch]$ForceModules,
     [switch]$RetryFailed,
+    [ValidateSet("single_video", "folder_once", "folder_repeat")]
+    [string]$RunMode = "",
+    [ValidateSet("full", "clips_only", "modules_only", "raw_cuts_only")]
+    [string]$PipelineMode = "",
+    [ValidateSet("all", "original", "custom")]
+    [string]$VariantMode = "",
+    [int]$VariantCount = 0,
+    [string]$VideoPath = "",
     [switch]$DryRun
 )
 
@@ -91,6 +99,21 @@ if ($ForceModules) {
 }
 if ($RetryFailed) {
     $PythonArgs += "--retry-failed"
+}
+if (-not [string]::IsNullOrWhiteSpace($RunMode)) {
+    $PythonArgs += @("--run-mode", $RunMode)
+}
+if (-not [string]::IsNullOrWhiteSpace($PipelineMode)) {
+    $PythonArgs += @("--pipeline-mode", $PipelineMode)
+}
+if (-not [string]::IsNullOrWhiteSpace($VariantMode)) {
+    $PythonArgs += @("--variant-mode", $VariantMode)
+}
+if ($VariantCount -gt 0) {
+    $PythonArgs += @("--variant-count", "$VariantCount")
+}
+if (-not [string]::IsNullOrWhiteSpace($VideoPath)) {
+    $PythonArgs += @("--video-path", (Resolve-ProjectPath $VideoPath))
 }
 if ($DryRun) {
     $PythonArgs += "--dry-run"

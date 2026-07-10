@@ -1,0 +1,54 @@
+{
+  "name": "clipper-operations-app",
+  "version": "0.4.1",
+  "description": "Desktop shell for Clipper.",
+  "author": "Clipper",
+  "private": true,
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 5173",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 5173",
+    "desktop:dev": "pnpm build && electron .",
+    "desktop:test": "node --test electron/*.test.cjs",
+    "desktop:build": "pnpm build && pnpm desktop:test",
+    "desktop:portable": "pnpm desktop:build && node electron/build-portable.cjs"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "lucide-react": "^1.21.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-router-dom": "^7.18.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.2",
+    "@types/react-dom": "^19.0.2",
+    "electron": "^42.5.0",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "id.clipper.operations",
+    "productName": "Clipper",
+    "directories": {
+      "output": "dist-desktop"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/main.cjs",
+      "electron/preload.cjs",
+      "electron/runtime.cjs",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "portable"
+      ],
+      "artifactName": "Clipper-${version}-portable.${ext}"
+    },
+    "asar": true
+  }
+}

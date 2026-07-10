@@ -3866,32 +3866,39 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    import config as cfg
+    from clipper_app.application.settings import LegacyConfigProvider
 
+    settings_overrides = {}
     if args.force_rescore:
-        cfg.SCORER_FORCE_RESCORE = True
+        settings_overrides["SCORER_FORCE_RESCORE"] = True
     if args.enable_vision:
-        cfg.SCORER_VISION_ENABLED = True
+        settings_overrides["SCORER_VISION_ENABLED"] = True
     if args.vision_base_url:
-        cfg.SCORER_VISION_BASE_URL = args.vision_base_url
+        settings_overrides["SCORER_VISION_BASE_URL"] = args.vision_base_url
     if args.vision_model:
-        cfg.SCORER_VISION_MODEL = args.vision_model
+        settings_overrides["SCORER_VISION_MODEL"] = args.vision_model
     if args.vision_timeout is not None:
-        cfg.SCORER_VISION_TIMEOUT = args.vision_timeout
+        settings_overrides["SCORER_VISION_TIMEOUT"] = args.vision_timeout
+    provider = LegacyConfigProvider()
+    cfg = provider.runtime_view(provider.snapshot(settings_overrides))
 
     if args.validate_contact_sheet:
         if not args.output_dir:
             parser.error("--validate-contact-sheet requires --output-dir")
         validate_contact_sheet_scoring(args.output_dir, cfg=cfg, limit=args.validation_limit)
     elif args.output_dir:
-        scores = score_output_tree(
-            args.output_dir,
-            working_root=args.working_dir,
-            cfg=cfg,
+        from clipper_app.bootstrap import build_scoring_service
+        from clipper_app.contracts import ScoringCommand
+
+        scores = list(build_scoring_service().rescore(ScoringCommand(
+            output_dir=args.output_dir,
+            working_dir=args.working_dir,
             limit=args.limit,
             include_failed=args.include_failed,
+            force_rescore=args.force_rescore,
             flush_every=args.flush_every,
-        )
+            settings_overrides=settings_overrides,
+        )).scores)
         print(f"\nScored {len(scores)} clip(s)")
     else:
         if not args.clip or not args.transcript:

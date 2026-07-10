@@ -18,11 +18,14 @@ python main.py --video D:\VOD\livestream.mp4 --cut-only
 
 ```powershell
 python video_queue.py --input-dir D:\VOD --state-file working\video_queue_state.json --max-inflight-videos 1 --ffmpeg-max-parallel-clips 2
-streamlit run app.py
-.\run_dashboard.ps1
+.\run_new_app.ps1
 ```
 
-The dashboard is an operations and review surface for queue health, scores, compliance, module readiness, rendered clips, and queue controls.
+The FastAPI + React app is the production operations and review surface for queue health, scores, compliance, module readiness, rendered clips, queue controls, settings overrides, operational jobs, module review, and read visibility; see [docs/control_app.md](docs/control_app.md).
+The Windows Electron portable desktop wrapper is documented in [docs/desktop_app.md](docs/desktop_app.md).
+Historical Phase 2 read-only architecture notes remain in [docs/read_first_app.md](docs/read_first_app.md).
+
+Production commands and dashboard mutations share the typed application boundary documented in [docs/backend_boundary.md](docs/backend_boundary.md).
 
 ## Setup And Maintenance
 

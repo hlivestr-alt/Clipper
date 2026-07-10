@@ -64,7 +64,7 @@ def package_export_batches(
         for item in existing_items
         if item.get("content_md5_64k")
     }
-    one_variant_per_clip = bool(getattr(cfg, "EXPORT_PACK_ONE_VARIANT_PER_CLIP", True))
+    one_variant_per_clip = bool(getattr(cfg, "EXPORT_PACK_ONE_VARIANT_PER_CLIP", False))
 
     raw_candidates = _discover_export_ready_candidates(root, batch_root)
     candidate_pool = raw_candidates
@@ -100,6 +100,7 @@ def package_export_batches(
     assignments = _assign_score_round_robin(
         candidates,
         existing_counts,
+        existing_items,
         size,
         legacy_batch_folder_cutoff=legacy_batch_folder_cutoff,
     )
@@ -127,7 +128,7 @@ def package_export_batches(
             "base_clip_id": candidate.base_clip_id,
             "selected_variant": candidate.variant_id,
             "excluded_variants": list(candidate.excluded_variants or []),
-        "selection_reason": "stable_variant_rotation" if one_variant_per_clip else "all_variants_included",
+            "selection_reason": "best_variant_only" if one_variant_per_clip else "all_variants_included",
             "source_clip_key": candidate.source_clip_key,
             "base_clip_key": candidate.base_clip_key,
             "content_md5_64k": candidate.content_md5_64k,
@@ -210,7 +211,8 @@ def _discover_export_ready_candidates(root: Path, batch_root: Path) -> list[Expo
         return []
     candidates: list[ExportCandidate] = []
     excluded_names = {batch_root.name.casefold(), *TIER_DIRS}
-    for source_dir in sorted((item for item in root.iterdir() if item.is_dir()), key=lambda item: item.name.casefold()):
+    source_dirs = _source_dirs_for_packaging(root, excluded_names)
+    for source_dir in source_dirs:
         if source_dir.name.casefold() in excluded_names:
             continue
         manifest_rows = _load_source_manifest(source_dir)
@@ -236,6 +238,23 @@ def _discover_export_ready_candidates(root: Path, batch_root: Path) -> list[Expo
             if candidate is not None:
                 candidates.append(candidate)
     return candidates
+
+
+def _source_dirs_for_packaging(root: Path, excluded_names: set[str]) -> list[Path]:
+    if _looks_like_source_output_dir(root):
+        return [root]
+    return sorted(
+        (
+            item
+            for item in root.iterdir()
+            if item.is_dir() and item.name.casefold() not in excluded_names
+        ),
+        key=lambda item: item.name.casefold(),
+    )
+
+
+def _looks_like_source_output_dir(path: Path) -> bool:
+    return (path / "manifest.json").exists() or (path / "scores_summary.json").exists()
 
 
 def _candidate_from_score(
@@ -339,15 +358,17 @@ def _select_one_variant_per_base_clip(
             continue
         candidates_by_base.setdefault(candidate.base_clip_key, []).append(candidate)
     for base_key in sorted(candidates_by_base):
-        variants = sorted(candidates_by_base[base_key], key=_variant_sort_key)
+        variants = sorted(
+            candidates_by_base[base_key],
+            key=lambda candidate: (-candidate.total_score, _variant_sort_key(candidate)),
+        )
         if not variants:
             continue
-        selected_index = _stable_variant_index(base_key, len(variants))
-        chosen = variants[selected_index]
+        chosen = variants[0]
         chosen.excluded_variants = [
             candidate.variant_id
             for index, candidate in enumerate(variants)
-            if index != selected_index
+            if index != 0
         ]
         excluded_variant_count += max(0, len(variants) - 1)
         selected.append(chosen)
@@ -428,6 +449,7 @@ def _dedupe_candidates(
 def _assign_score_round_robin(
     candidates: list[ExportCandidate],
     existing_counts: dict[int, int],
+    existing_items: list[dict[str, Any]],
     batch_size: int,
     legacy_batch_folder_cutoff: int = 0,
 ) -> list[tuple[ExportCandidate, int]]:
@@ -450,6 +472,7 @@ def _assign_score_round_robin(
     for folder_number in range(cutoff + 1, required_folder_count + 1):
         counts.setdefault(folder_number, 0)
 
+    bases_by_folder = _existing_base_clip_keys_by_batch(existing_items, cutoff)
     available = [
         folder
         for folder in range(cutoff + 1, required_folder_count + 1)
@@ -459,21 +482,78 @@ def _assign_score_round_robin(
     cursor = 0
     next_folder = required_folder_count + 1
     for candidate in candidates:
-        if not available:
+        while True:
+            if not available:
+                available.append(next_folder)
+                counts[next_folder] = 0
+                next_folder += 1
+            cursor = cursor % len(available)
+            folder_number, cursor = _next_folder_for_candidate(
+                candidate,
+                available,
+                bases_by_folder,
+                cursor,
+                next_folder,
+            )
+            if folder_number != next_folder:
+                break
             available.append(next_folder)
             counts[next_folder] = 0
             next_folder += 1
-        cursor = cursor % len(available)
-        folder_number = available[cursor]
+
         assignments.append((candidate, folder_number))
         counts[folder_number] += 1
+        bases_by_folder.setdefault(folder_number, set()).add(candidate.base_clip_key)
         if counts[folder_number] >= batch_size:
-            available.pop(cursor)
+            available.remove(folder_number)
             if available:
                 cursor %= len(available)
         else:
             cursor += 1
     return assignments
+
+
+def _next_folder_for_candidate(
+    candidate: ExportCandidate,
+    available: list[int],
+    bases_by_folder: dict[int, set[str]],
+    cursor: int,
+    next_folder: int,
+) -> tuple[int, int]:
+    for offset in range(len(available)):
+        index = (cursor + offset) % len(available)
+        folder_number = available[index]
+        if candidate.base_clip_key not in bases_by_folder.get(folder_number, set()):
+            return folder_number, index
+    return next_folder, cursor
+
+
+def _existing_base_clip_keys_by_batch(
+    items: list[dict[str, Any]],
+    legacy_batch_folder_cutoff: int = 0,
+) -> dict[int, set[str]]:
+    keys_by_folder: dict[int, set[str]] = {}
+    cutoff = max(0, int(legacy_batch_folder_cutoff or 0))
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            folder_number = int(str(item.get("batch_folder") or ""))
+        except ValueError:
+            continue
+        if folder_number <= cutoff:
+            continue
+        base_key = str(item.get("base_clip_key") or "").strip()
+        if not base_key:
+            source = _normalize_source_vod(str(item.get("source_vod") or item.get("normalized_source_vod") or ""))
+            base_clip_id = str(item.get("base_clip_id") or "")
+            if not base_clip_id:
+                clip_id = str(item.get("clip_id") or "")
+                output_file = str(item.get("source_output_file") or item.get("destination_file") or "")
+                base_clip_id, _variant_id = _base_and_variant_ids(clip_id, None, output_file)
+            base_key = f"{source}:{_normalize_key(base_clip_id)}"
+        keys_by_folder.setdefault(folder_number, set()).add(base_key)
+    return keys_by_folder
 
 
 def _destination_for_candidate(

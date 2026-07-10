@@ -4,13 +4,13 @@
 # =============================================================================
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-OUTPUT_DIR         = "D:\output_clips"            # where finished clips go
+OUTPUT_DIR         = r"D:\output_clips"           # where finished clips go
 WORKING_DIR        = "working"                 # temp files (transcripts, raw cuts)
 YOLO_WEIGHTS       = "models/proya_best.pt"    # your trained YOLO weights
 YOLO_PRETRAIN      = "yolov8n.pt"              # base model for training
 DATASET_YAML       = "dataset/proya.yaml"      # YOLO dataset config
 LOGO_PATH          = None                      # disable watermark for max throughput
-RENDER_STYLE_VERSION = 5                       # bump when opening-hook/render styling changes
+RENDER_STYLE_VERSION = 6                       # bump when opening-hook/render styling changes
 
 # Queue runner defaults. The PowerShell launchers and video_queue.py read these
 # so routine queue tuning can live here instead of in long terminal commands.
@@ -18,10 +18,12 @@ QUEUE_INPUT_DIR = r"D:\VOD"
 QUEUE_STATE_FILE = WORKING_DIR + r"\video_queue_state.json"
 QUEUE_FOREVER_STATE_FILE = WORKING_DIR + r"\queue_forever_state.json"
 QUEUE_CONTROL_FILE = WORKING_DIR + r"\queue_control.json"
-QUEUE_START_RUN_NUMBER = 12
+QUEUE_START_RUN_NUMBER = 109
 QUEUE_MAX_RETRIES = 2
 QUEUE_MAX_INFLIGHT_VIDEOS = 1
 QUEUE_FFMPEG_MAX_PARALLEL_CLIPS = 4
+QUEUE_STAGE_ADMISSION_LIMIT = 3
+MAX_QUEUE_SIZE = 10
 QUEUE_YOLO_IN_SUBPROCESS = True
 QUEUE_POLL_INTERVAL = 2.0
 QUEUE_RESCAN_INTERVAL_SECONDS = 300.0
@@ -29,6 +31,7 @@ QUEUE_SCAN_INTERVAL_SECONDS = QUEUE_RESCAN_INTERVAL_SECONDS
 QUEUE_STABLE_SECONDS = 60.0
 QUEUE_RESTART_DELAY_SECONDS = 30
 QUEUE_BETWEEN_RUNS_DELAY_SECONDS = 10
+QUEUE_STUCK_THRESHOLD = 30 * 60
 QUEUE_DASHBOARD_RUNNING_STALL_SECONDS = 2 * 60 * 60
 QUEUE_DASHBOARD_QUEUED_STALL_SECONDS = 24 * 60 * 60
 
@@ -113,11 +116,9 @@ WORD_CORRECTIONS = {
     "sepilih"        : "spill",
     "etal-ase"       : "etalase",
     "menemuin"       : "nemenin",
-    "Etal-ase"       : "etalase",
     "developnya"     : "tap-tap lovenya",
     "disepilin"      : "di spill-in",
     "di skon"        : "diskon",
-    "Di skon"        : "diskon",
     "nge-sepilihnya" : "nge-spillnya",
     "Eta laksan"     : "etalase",
     "di skor"        : "diskon",
@@ -136,11 +137,9 @@ WORD_CORRECTIONS = {
     "etal asenya"    : "etalasenya",
     "Etal asen"      : "etalase",
     "kulitu"         : "kulit",
-    "etal asen"      : "etalase",
     "kotaan"         : "kotoran",
     "visi"           : "fisik",
     "teratasih"      : "teratasi",
-    "kulitu"         : "kulit",
     "Meniyan"        : "mendingan",
     "de tu"          : "dia itu",
     "debua"          : "debu",
@@ -155,7 +154,6 @@ WORD_CORRECTIONS = {
     "mencarakan"     : "mencerahkan",
     "targainya"      : "harganya",
     "Meningin"       : "mendingan",
-    "cekotin"        : "checkout",
     "Wartit"         : "worth it",
     "cekotin"        : "checkout",
     "sepel-sepel"    : "spill spill",
@@ -195,10 +193,8 @@ WORD_CORRECTIONS = {
     "benerbener"     : "bener bener",
     "meletelasin"    : "etalase",
     "kejanya"        : "wajahnya",
-    "etal asen"      : "etalase",
     "tuajanya"       : "wajahnya",
     "rebakas"        : "ada bekas",
-    "meletelasin"    : "etalase",
     "keringi"        : "kering",
     "telah senomor"  : "etalase nomor",
     "black"          : "flek",
@@ -206,11 +202,10 @@ WORD_CORRECTIONS = {
     "ethelosan"      : "etalase",
     "pembersi"       : "pembersih",
     "tablognya"      : "tap lovenya",
-    "atalse"         : "etalasae",
+    "atalse"         : "etalase",
     "bekasbekas"     : "bekas bekas",
     "kongkia"        : "ongkir",
     "etalose"        : "etalase",
-    "BENERBENER"     : "bener bener",
     "dari vatipus"   : "derivatives",
     "aldochronic"    : "Hyaluronic",
     "FLAGFLAG"       : "flek fleg",
@@ -231,7 +226,7 @@ WORD_CORRECTION_APPLY_TO_SUBTITLES = True
 
 # ── LM Studio ─────────────────────────────────────────────────────────────────
 # LM Studio → Local Server → must be running before you start the pipeline
-LM_STUDIO_BASE_URL = "http://localhost:1234/v1"
+LM_STUDIO_BASE_URL = "http://127.0.0.1:1234/v1"
 LM_STUDIO_API_KEY  = "lm-studio"               # LM Studio accepts any non-empty string
 LM_STUDIO_MOMENT_MODEL_ID = "qwen/qwen3.6-27b"
 LM_STUDIO_MODEL    = LM_STUDIO_MOMENT_MODEL_ID          # match the model name shown in LM Studio
@@ -270,6 +265,7 @@ YOLO_FRAME_SKIP     = 24                       # scan fewer frames for faster th
 YOLO_DEVICE         = "0"                      # use first NVIDIA GPU
 YOLO_IMGSZ          = 416                      # smaller input for faster inference
 YOLO_HALF           = True                     # fp16 inference on GPU
+YOLO_BATCH_SIZE     = 32                       # cap YOLO inference batches to avoid RAM spikes
 YOLO_SCAN_ONLY_MOMENTS   = True                # scan only candidate clip windows, not the full VOD
 YOLO_SCAN_PAD_BEFORE     = 3.0                 # extra seconds before each moment when scanning
 YOLO_SCAN_PAD_AFTER      = 3.0                 # extra seconds after each moment when scanning
@@ -290,13 +286,7 @@ ZOOM_DURATION  = 3.0    # total zoom window (ease-in + hold + ease-out)
 ZOOM_SCALE     = 1.45   # 1.45 = 45% zoom in — tight enough to see product clearly
 
 # ── Clip Detection ────────────────────────────────────────────────────────────
-CHUNK_DURATION     = 120          # seconds of transcript sent to LLM at once (3 min)
-CHUNK_OVERLAP      = 10           # overlap to avoid missing clips at chunk boundaries
-MIN_CLIP_DURATION  = 15           # seconds — ignore shorter moments
-MAX_CLIP_DURATION  = 60           # seconds — cap clip length
-MIN_SCORE          = 6.0          # LLM score threshold out of 10 (lower = more clips)
-PAD_START          = 1.5          # seconds to add before moment start
-PAD_END            = 2.0          # seconds to add after moment end
+# Effective selection defaults are defined in the quality-first section below.
 
 # ── Fonts ─────────────────────────────────────────────────────────────────────
 # ImageMagick font names. Run `convert -list font | grep -i name` to see what's
@@ -312,7 +302,7 @@ FONT_HOOK_FALLBACKS = ["assets/fonts/Montserrat-ExtraBold.ttf", "assets/fonts/An
 FONT_LABEL      = "assets/fonts/Montserrat-SemiBold.ttf"  # or "Poppins-Medium", "Arial-Bold"
 FONT_SUBTITLE   = "assets/fonts/Montserrat-ExtraBold.ttf"    # or "Arial-Bold"
 FONT_PRODUCT    = "assets/fonts/PlayfairDisplay-Italic-VariableFont_wght.ttf"  # for zoom caption
-SUBTITLE_FONT_RANDOMIZE = True
+SUBTITLE_FONT_RANDOMIZE = False
 SUBTITLE_FONT_DIR = "assets/fonts/subtitle"
 
 # ── Hook / Title overlay ──────────────────────────────────────────────────────
@@ -433,10 +423,6 @@ ZOOM_CAPTION_BRAND_FONTSIZE = 0    # ← brand line ("PROYA 5X VITAMIN C") — i
 ZOOM_CAPTION_Y_POS          = 0.10  # top-center caption vertical position as fraction of frame height
 
 # ── Output Video ──────────────────────────────────────────────────────────────
-OUTPUT_FPS     = 30
-OUTPUT_CODEC   = "libx264"
-OUTPUT_CRF     = 23               # lower = better quality, bigger file
-OUTPUT_PRESET  = "fast"           # ultrafast/fast/medium
 
 # ── SFX (Sound Effects) ───────────────────────────────────────────────────────
 # Drop audio files (.wav / .mp3) into the folders below.
@@ -526,7 +512,6 @@ SCORER_FRAME_SAMPLE_RATE = 10
 SCORER_MIN_SCORE_TO_EXPORT = 0.0
 SCORER_WEIGHTS = {"content": 0.466667, "quality": 0.2, "engagement": 0.333333}
 SCORER_HOST_FOCUS_WEIGHT = 0.0
-SCORER_HOOK_WEIGHT = 0.0
 SCORER_APPLY_CAPS = True
 SCORER_CACHE_ENABLED = True
 SCORER_FORCE_RESCORE = False
@@ -556,9 +541,7 @@ SCORER_SIMILARITY_MAX_FRAMES = 24
 EXPORT_BATCHES_ENABLED = True
 EXPORT_BATCH_DIR_NAME = "export_batches"
 EXPORT_BATCH_SIZE = 15
-EXPORT_BATCH_ORDER = "score_round_robin"
-EXPORT_BATCH_APPEND_ONLY = True
-EXPORT_PACK_ONE_VARIANT_PER_CLIP = True
+EXPORT_PACK_ONE_VARIANT_PER_CLIP = False
 
 # Pre-subtitle advertising compliance checks for Indonesian skincare claims.
 COMPLIANCE_ENABLED = True
@@ -570,7 +553,7 @@ COMPLIANCE_LM_TIMEOUT = 60
 # Extraction is transcript-only in v1; product zoom remains a documented
 # placeholder for future YOLO-backed modular rendering.
 MODULE_LIBRARY_DIR = r"D:\proya_modules"
-MODULE_EXTRACTION_ENABLED = True
+MODULE_EXTRACTION_ENABLED = False
 MODULE_DURATION_STRICT = False
 MODULE_HOOK_MIN_DURATION = 4.0
 MODULE_HOOK_MAX_DURATION = 8.0
@@ -594,7 +577,6 @@ MODULE_OUTPUT_LOCK_TIMEOUT = 30.0
 MODULE_EXTRACT_FFMPEG_TIMEOUT = 300
 MODULE_DEDUPE_IOU_THRESHOLD = 0.5
 MODULE_PRODUCT_ZOOM_ENABLED = False
-MODULE_VISUAL_VALIDATION_ENABLED = False
 # Runs YOLO during module extraction; keep opt-in so routine extraction does not contend for CUDA.
 MODULE_VALIDATE_ON_EXTRACT = False
 MODULE_VISUAL_VALIDATION_MIN_CONFIDENCE = 0.55
@@ -654,3 +636,15 @@ BROLL_INTRO_PRODUCT_ALIASES = {
     "Skin Cream": ["skin cream", "cream", "moisturizer", "moisturiser", "krim"],
     "Toner": ["toner"],
 }
+
+# Full-clip product B-roll visual replacement.
+# Each supported product has a child folder under this root.
+PRODUCT_BROLL_DIR = "assets/product_broll"
+PRODUCT_BROLL_CROSSFADE_SECONDS = 0.3
+PRODUCT_BROLL_VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi"}
+
+# Optional transitional hook pre-roll variants.
+# Drop viral hook videos into assets/transitional_hooks/. When a variant uses
+# Hook type "Transitional Hook", one full video is prepended before the clip.
+TRANSITIONAL_HOOK_ENABLED = True
+TRANSITIONAL_HOOK_DIR = "assets/transitional_hooks"

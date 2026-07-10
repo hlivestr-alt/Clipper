@@ -216,6 +216,48 @@ class QueueStateHealthTests(unittest.TestCase):
         self.assertEqual(health["failed_stage_count"], 1)
         self.assertIn("failed_stage_nonterminal", health["issue_counts"])
 
+    def test_active_redo_run_ignores_historical_waiting_entries(self):
+        now = datetime(2026, 5, 28, 12, 0, tzinfo=timezone.utc)
+        state = {
+            "queue_status": "running",
+            "videos": {
+                "D:/VOD/old.mp4": {
+                    "name": "old.mp4",
+                    "path": "D:/VOD/old.mp4",
+                    "status": "queued",
+                    "created_at": (now - timedelta(days=40)).isoformat(timespec="seconds"),
+                    "stages": {
+                        "transcribe": {"status": "done", "finished_at": (now - timedelta(days=40)).isoformat(timespec="seconds")},
+                        "llm": {"status": "done", "finished_at": (now - timedelta(days=39)).isoformat(timespec="seconds")},
+                        "yolo": {"status": "done", "finished_at": (now - timedelta(days=38)).isoformat(timespec="seconds")},
+                        "ffmpeg": {"status": "pending", "queued": False, "queued_at": None},
+                    },
+                },
+                "D:/VOD/current.mp4": {
+                    "name": "current.mp4",
+                    "path": "D:/VOD/current.mp4",
+                    "working_tag": "_run_139",
+                    "output_tag": "_run_139",
+                    "status": "running",
+                    "current_stage": "llm",
+                    "created_at": (now - timedelta(minutes=5)).isoformat(timespec="seconds"),
+                    "stages": {
+                        "transcribe": {"status": "done", "finished_at": (now - timedelta(minutes=4)).isoformat(timespec="seconds")},
+                        "llm": {"status": "running", "started_at": (now - timedelta(minutes=1)).isoformat(timespec="seconds")},
+                        "yolo": {"status": "pending"},
+                        "ffmpeg": {"status": "pending", "queued": False, "queued_at": None},
+                    },
+                },
+            },
+        }
+
+        health = qh.derive_queue_health(state, now=now)
+
+        self.assertEqual(health["status"], "ok")
+        self.assertEqual(health["active_run_tag"], "_run_139")
+        self.assertEqual(health["ignored_historical_video_count"], 1)
+        self.assertNotIn("ready_not_enqueued", health["issue_counts"])
+
 
 if __name__ == "__main__":
     unittest.main()

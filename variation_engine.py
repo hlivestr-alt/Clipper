@@ -35,6 +35,7 @@ from typing import Any
 log = logging.getLogger("proya.variation")
 
 _BROLL_VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi"}
+_TRANSITIONAL_HOOK_VIDEO_EXTS = _BROLL_VIDEO_EXTS
 
 
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -109,7 +110,7 @@ ARCHETYPE_SLOTS = [
         "mirror": False,
         "start_offset": 0.0,
         "end_offset": 0.0,
-        "before_after_mode": "standard",
+        "before_after_mode": "fullscreen",
         "hook_layout": "standard",
         "subtitle_layout": "standard",
         "broll_role": "",
@@ -129,7 +130,7 @@ ARCHETYPE_SLOTS = [
         "mirror": False,
         "start_offset": -0.40,
         "end_offset": -0.40,
-        "before_after_mode": "minimal",
+        "before_after_mode": "fullscreen",
         "hook_layout": "center_stack",
         "subtitle_layout": "top",
         "broll_role": "primary",
@@ -149,7 +150,7 @@ ARCHETYPE_SLOTS = [
         "mirror": False,
         "start_offset": 0.30,
         "end_offset": 0.30,
-        "before_after_mode": "compact",
+        "before_after_mode": "fullscreen",
         "hook_layout": "top_heavy",
         "subtitle_layout": "bottom",
         "broll_role": "",
@@ -169,7 +170,7 @@ ARCHETYPE_SLOTS = [
         "mirror": True,
         "start_offset": -0.25,
         "end_offset": -0.25,
-        "before_after_mode": "hero",
+        "before_after_mode": "fullscreen",
         "hook_layout": "left_punch",
         "subtitle_layout": "mid",
         "broll_role": "secondary",
@@ -189,7 +190,7 @@ ARCHETYPE_SLOTS = [
         "mirror": False,
         "start_offset": 0.55,
         "end_offset": 0.55,
-        "before_after_mode": "standard",
+        "before_after_mode": "fullscreen",
         "hook_layout": "right_label",
         "subtitle_layout": "low",
         "broll_role": "secondary",
@@ -209,7 +210,7 @@ ARCHETYPE_SLOTS = [
         "mirror": False,
         "start_offset": -0.10,
         "end_offset": -0.10,
-        "before_after_mode": "clean",
+        "before_after_mode": "fullscreen",
         "hook_layout": "clean_banner",
         "subtitle_layout": "low",
         "broll_role": "optional",
@@ -240,11 +241,15 @@ class VariantConfig:
 
     # Subtitles
     font_subtitle: str = ""
+    subtitle_base_color: str = "#FFFFFF"
     karaoke_active_color: str = ""
     karaoke_inactive_opacity: float = 1.0
     subtitle_stroke: str = "#000000"
     subtitle_stroke_w: int = 3
     subtitle_y_pos: float = 0.80
+    subtitle_y_frac: float = 0.80
+    subtitle_size: str = "medium"
+    subtitle_font_size: int = 0
 
     # Hook
     hook_color: str = "white"
@@ -267,7 +272,7 @@ class VariantConfig:
     crop_x_offset: float = 0.0
 
     # Render layout modes interpreted by ffmpeg_editor.
-    before_after_variant_mode: str = "standard"
+    before_after_variant_mode: str = "fullscreen"
     hook_layout_mode: str = "standard"
     subtitle_layout_mode: str = "standard"
     broll_intro_role: str = ""
@@ -278,6 +283,36 @@ class VariantConfig:
     broll_intro_path: str = ""
     broll_intro_duration: float = 0.0
     broll_intro_product: str = ""
+
+    # Optional pre-roll hook video that plays before the clip begins
+    transitional_hook_enabled: bool = False
+    transitional_hook_path: str = ""
+
+    # Profile-driven metadata and render switches.
+    profile_revision: str = ""
+    display_name: str = ""
+    hook_type: str = "text"
+    visual_mode: str = "host"
+    font_id: str = ""
+    font_color: str = "#FFFFFF"
+    highlight_color: str = "#FFD600"
+    subtitle_position: str = "bottom"
+    color_grade: str = "original"
+    bgm_mode: str = "auto"
+    bgm_path: str = ""
+    sfx_enabled: bool = True
+    zoom_intensity: str = "normal"
+    product_zoom_enabled: bool = True
+    subtitle_enabled: bool = True
+    letterbox_enabled: bool = False
+    letterbox_top_frac: float = 0.0
+    letterbox_bottom_frac: float = 0.0
+    letterbox_hook_enabled: bool = False
+    letterbox_hook_font_id: str = ""
+    letterbox_hook_font_color: str = "#FFFFFF"
+    letterbox_hook_font_size: int = 72
+    letterbox_hook_x_frac: float = 0.5
+    letterbox_hook_y_frac: float = 0.5
 
 
 def apply_variant_to_cfg(base_cfg, variant: VariantConfig):
@@ -306,12 +341,18 @@ def apply_variant_to_cfg(base_cfg, variant: VariantConfig):
     # Apply overrides
     if variant.font_subtitle:
         patched.FONT_SUBTITLE = variant.font_subtitle
+        patched.SUBTITLE_FONT_RANDOMIZE = False
+    patched.SUBTITLE_BASE_COLOR = variant.subtitle_base_color
     if variant.karaoke_active_color:
         patched.KARAOKE_ACTIVE_COLOR = variant.karaoke_active_color
+    if variant.highlight_color:
+        patched.HOOK_ACCENT_COLOR = variant.highlight_color
     patched.KARAOKE_INACTIVE_OPACITY = variant.karaoke_inactive_opacity
     patched.SUBTITLE_STROKE = variant.subtitle_stroke
     patched.SUBTITLE_STROKE_W = variant.subtitle_stroke_w
     patched.SUBTITLE_Y_POS = variant.subtitle_y_pos
+    if variant.subtitle_font_size > 0:
+        patched.SUBTITLE_FONTSIZE = int(variant.subtitle_font_size)
     patched.HOOK_COLOR = variant.hook_color
     patched.HOOK_STROKE_COLOR = variant.hook_stroke_color
     patched.HOOK_STROKE_W = variant.hook_stroke_w
@@ -326,7 +367,9 @@ def apply_variant_to_cfg(base_cfg, variant: VariantConfig):
     patched._variant_id = variant.variant_id
     patched._variant_index = variant.variant_index
     patched._variant_archetype = variant.archetype
-    patched._before_after_variant_mode = variant.before_after_variant_mode
+    patched._before_after_variant_mode = (
+        "fullscreen" if variant.before_after_variant_mode != "fullscreen" else variant.before_after_variant_mode
+    )
     patched._hook_layout_mode = variant.hook_layout_mode
     patched._subtitle_layout_mode = variant.subtitle_layout_mode
     patched._broll_intro_role = variant.broll_intro_role
@@ -335,6 +378,52 @@ def apply_variant_to_cfg(base_cfg, variant: VariantConfig):
     patched._broll_intro_path = variant.broll_intro_path
     patched._broll_intro_duration = variant.broll_intro_duration
     patched._broll_intro_product = variant.broll_intro_product
+    patched._transitional_hook_enabled = variant.transitional_hook_enabled
+    patched._transitional_hook_path = variant.transitional_hook_path
+    patched._variant_profile_revision = variant.profile_revision
+    patched._variant_display_name = variant.display_name
+    patched._hook_type = variant.hook_type
+    patched._visual_mode = variant.visual_mode
+    patched._variant_visual_mode = variant.visual_mode
+    patched._variant_font_id = variant.font_id
+    patched._variant_font_color = variant.font_color
+    patched._variant_highlight_color = variant.highlight_color
+    patched._variant_subtitle_position = variant.subtitle_position
+    patched._variant_subtitle_y_frac = variant.subtitle_y_frac
+    patched._variant_subtitle_size = variant.subtitle_size
+    patched._variant_subtitle_font_size = variant.subtitle_font_size
+    patched._variant_color_grade = variant.color_grade
+    patched._variant_bgm_mode = variant.bgm_mode
+    patched._variant_bgm_path = variant.bgm_path
+    patched._variant_sfx_enabled = variant.sfx_enabled
+    patched._variant_zoom_intensity = variant.zoom_intensity
+    patched._variant_product_zoom_enabled = variant.product_zoom_enabled
+    patched._variant_subtitle_enabled = variant.subtitle_enabled
+    patched._letterbox_enabled = variant.letterbox_enabled
+    patched._letterbox_top_frac = variant.letterbox_top_frac
+    patched._letterbox_bottom_frac = variant.letterbox_bottom_frac
+    patched.LETTERBOX_TOP_FRAC = variant.letterbox_top_frac
+    patched.LETTERBOX_BOTTOM_FRAC = variant.letterbox_bottom_frac
+    patched._letterbox_hook_enabled = variant.letterbox_hook_enabled
+    patched._letterbox_hook_font_id = variant.letterbox_hook_font_id
+    patched._letterbox_hook_font_color = variant.letterbox_hook_font_color
+    patched._letterbox_hook_font_size = variant.letterbox_hook_font_size
+    patched._letterbox_hook_x_frac = variant.letterbox_hook_x_frac
+    patched._letterbox_hook_y_frac = variant.letterbox_hook_y_frac
+    patched._hook_format = variant.hook_type
+    patched._variation_profile_driven = bool(variant.profile_revision)
+    patched._product_zoom_enabled = bool(variant.product_zoom_enabled)
+    patched._subtitle_enabled = bool(variant.subtitle_enabled)
+    patched._zoom_disabled = variant.zoom_intensity == "none"
+    patched.SFX_ENABLED = bool(getattr(base_cfg, "SFX_ENABLED", True)) and bool(variant.sfx_enabled)
+    if variant.bgm_mode == "none":
+        patched.BGM_ENABLED = False
+    elif variant.bgm_mode == "selected" and variant.bgm_path:
+        patched.BGM_ENABLED = bool(getattr(base_cfg, "BGM_ENABLED", True))
+        if patched.BGM_ENABLED:
+            patched._bgm_path = variant.bgm_path
+    else:
+        patched.BGM_ENABLED = bool(getattr(base_cfg, "BGM_ENABLED", True))
 
     return patched
 
@@ -446,12 +535,246 @@ def _archetype_slot(index: int, rng: random.Random) -> dict[str, Any]:
         "mirror": rng.random() < 0.30,
         "start_offset": rng.choice([-0.45, -0.25, 0.25, 0.45]),
         "end_offset": rng.choice([-0.45, -0.25, 0.25, 0.45]),
-        "before_after_mode": rng.choice(["standard", "compact", "clean", "hero"]),
+        "before_after_mode": "fullscreen",
         "hook_layout": rng.choice(["standard", "top_heavy", "left_punch", "right_label", "clean_banner"]),
         "subtitle_layout": rng.choice(["top", "mid", "bottom", "low"]),
         "broll_role": rng.choice(["", "optional"]),
         "hook_duration_mult": rng.choice([0.85, 0.95, 1.0, 1.1]),
     }
+
+
+def _slug(text: str, fallback: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", str(text or "").lower()).strip("_")
+    return slug[:48] or fallback
+
+
+def _profile_color_grade_filter(name: str) -> str:
+    return {
+        "original": "",
+        "warm": "colortemperature=temperature=7500",
+        "cool": "colortemperature=temperature=5000",
+        "vivid": "eq=saturation=1.35:contrast=1.08",
+        "desaturated": "eq=saturation=0.65:contrast=1.02",
+        "cinematic": "eq=saturation=0.85:contrast=1.15:brightness=-0.02",
+    }.get(str(name or "original"), "")
+
+
+def _profile_subtitle_y(position: str, base_cfg) -> float:
+    if position == "top":
+        return 0.34
+    if position == "center":
+        return 0.58
+    if position == "bottom":
+        return 0.84
+    return float(getattr(base_cfg, "SUBTITLE_Y_POS", 0.80))
+
+
+def _clamp_profile_float(value: Any, lo: float, hi: float, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(lo, min(hi, parsed))
+
+
+def _profile_zoom_scale(intensity: str, base_cfg) -> float:
+    if intensity == "none":
+        return 1.0
+    if intensity == "subtle":
+        return 1.22
+    if intensity == "strong":
+        return 1.65
+    return float(getattr(base_cfg, "ZOOM_SCALE", 1.45))
+
+
+def _profile_hook_layout(hook_type: str, slot_mode: str) -> str:
+    return {
+        "none": slot_mode or "standard",
+        "text": slot_mode or "standard",
+        "before_after_image": "clean_banner",
+        "text_before_after_image": "top_heavy",
+        "b_roll": "clean_banner",
+        "text_b_roll": "center_stack",
+        "transitional_hook": slot_mode or "standard",
+    }.get(str(hook_type or "text"), slot_mode or "standard")
+
+
+def _profile_variants(base_cfg, seed: int | None = None) -> list[VariantConfig] | None:
+    try:
+        from variation_profile import SUBTITLE_SIZE_PIXELS, load_active_profile
+    except Exception:
+        return None
+
+    if not hasattr(base_cfg, "WORKING_DIR"):
+        return None
+
+    try:
+        profile = load_active_profile(base_cfg)
+    except Exception as exc:
+        log.warning("Ignoring invalid variation profile; using legacy variants: %s", exc)
+        return None
+
+    hook_dur_base = getattr(base_cfg, "HOOK_DURATION", 0.0)
+    variants: list[VariantConfig] = []
+    profile_revision = str(profile.get("revision") or "")
+    raw_variants = profile.get("variants") or []
+    for index, raw in enumerate(raw_variants):
+        if not isinstance(raw, dict):
+            continue
+        hook_type = str(raw.get("hook_type") or "text")
+        visual_mode = str(raw.get("visual_mode") or "host")
+        subtitle_position = str(raw.get("subtitle_position") or "bottom")
+        color_grade = str(raw.get("color_grade") or "original")
+        zoom_intensity = str(raw.get("zoom_intensity") or "normal")
+        before_after_mode = str(raw.get("before_after_mode") or "fullscreen")
+        if before_after_mode != "fullscreen":
+            before_after_mode = "fullscreen"
+        mirror_enabled = bool(raw.get("mirror_enabled", False))
+        product_zoom_enabled = bool(raw.get("product_zoom_enabled", True))
+        subtitle_enabled = bool(raw.get("subtitle_enabled", True))
+        subtitle_size = str(raw.get("subtitle_size") or "medium").strip().casefold()
+        if subtitle_size not in SUBTITLE_SIZE_PIXELS:
+            subtitle_size = "medium"
+        subtitle_font_size = int(SUBTITLE_SIZE_PIXELS[subtitle_size])
+        subtitle_y_frac = _clamp_profile_float(
+            raw.get("subtitle_y_frac"),
+            0.08,
+            0.92,
+            _profile_subtitle_y(subtitle_position, base_cfg),
+        )
+        letterbox_enabled = bool(raw.get("letterbox_enabled", False))
+        letterbox_default = 0.20 if letterbox_enabled else 0.0
+        letterbox_top_frac = _clamp_profile_float(raw.get("letterbox_top_frac"), 0.0, 0.40, letterbox_default)
+        letterbox_bottom_frac = _clamp_profile_float(raw.get("letterbox_bottom_frac"), 0.0, 0.40, letterbox_default)
+        font_color = str(raw.get("font_color") or "#FFFFFF")
+        highlight_color = str(raw.get("highlight_color") or "#FFD600")
+        display_name = str(raw.get("name") or f"Variant {index + 1}")
+        hook_duration = 0.0 if hook_type in {"none", "transitional_hook"} else float(hook_dur_base or 0.0)
+        variant_slug = _slug(display_name, f"variant_{index}")
+
+        variants.append(
+            VariantConfig(
+                variant_id=f"v{index}_{variant_slug}",
+                variant_index=index,
+                archetype=variant_slug,
+                start_offset_seconds=0.0,
+                end_offset_seconds=0.0,
+                mirror=mirror_enabled,
+                font_subtitle=str(raw.get("font_id") or getattr(base_cfg, "FONT_SUBTITLE", "")),
+                subtitle_base_color=font_color,
+                karaoke_active_color=highlight_color,
+                karaoke_inactive_opacity=float(getattr(base_cfg, "KARAOKE_INACTIVE_OPACITY", 1.0)),
+                subtitle_stroke=str(getattr(base_cfg, "SUBTITLE_STROKE", "#000000")),
+                subtitle_stroke_w=int(getattr(base_cfg, "SUBTITLE_STROKE_W", 3)),
+                subtitle_y_pos=subtitle_y_frac,
+                subtitle_y_frac=subtitle_y_frac,
+                subtitle_size=subtitle_size,
+                subtitle_font_size=subtitle_font_size,
+                hook_color=font_color,
+                hook_stroke_color=str(getattr(base_cfg, "HOOK_STROKE_COLOR", "black")),
+                hook_stroke_w=int(getattr(base_cfg, "HOOK_STROKE_W", 5)),
+                hook_fontsize_mult=1.0,
+                hook_duration=hook_duration,
+                zoom_scale=_profile_zoom_scale(zoom_intensity, base_cfg),
+                zoom_trigger_offset=0.0,
+                speed_ramp=1.0,
+                color_grade_filter=_profile_color_grade_filter(color_grade),
+                crop_x_offset=0.0,
+                before_after_variant_mode=before_after_mode,
+                hook_layout_mode=_profile_hook_layout(hook_type, "standard"),
+                subtitle_layout_mode=subtitle_position,
+                broll_intro_role=(
+                    "primary"
+                    if hook_type in {"b_roll", "text_b_roll"}
+                    else ""
+                ),
+                profile_revision=profile_revision,
+                display_name=display_name,
+                hook_type=hook_type,
+                visual_mode=visual_mode,
+                font_id=str(raw.get("font_id") or ""),
+                font_color=font_color,
+                highlight_color=highlight_color,
+                subtitle_position=subtitle_position,
+                color_grade=color_grade,
+                bgm_mode=str(raw.get("bgm_mode") or "auto"),
+                bgm_path=str(raw.get("bgm_path") or ""),
+                sfx_enabled=bool(raw.get("sfx_enabled", True)),
+                zoom_intensity=zoom_intensity,
+                product_zoom_enabled=product_zoom_enabled,
+                subtitle_enabled=subtitle_enabled,
+                letterbox_enabled=letterbox_enabled,
+                letterbox_top_frac=letterbox_top_frac,
+                letterbox_bottom_frac=letterbox_bottom_frac,
+                letterbox_hook_enabled=bool(raw.get("letterbox_hook_enabled", False)),
+                letterbox_hook_font_id=str(raw.get("letterbox_hook_font_id") or raw.get("font_id") or ""),
+                letterbox_hook_font_color=str(raw.get("letterbox_hook_font_color") or "#FFFFFF"),
+                letterbox_hook_font_size=int(_clamp_profile_float(raw.get("letterbox_hook_font_size"), 24, 160, 72)),
+                letterbox_hook_x_frac=_clamp_profile_float(raw.get("letterbox_hook_x_frac"), 0.0, 1.0, 0.5),
+                letterbox_hook_y_frac=_clamp_profile_float(raw.get("letterbox_hook_y_frac"), 0.0, 1.0, 0.5),
+            )
+        )
+
+    if variants:
+        log.info("Loaded %s variation profile variant(s) revision=%s", len(variants), profile_revision[:12])
+        return variants
+    return None
+
+
+def resolve_variant_plan(
+    base_cfg,
+    n_variants: int | None = None,
+    selection_mode: str | None = None,
+    seed: int = 42,
+) -> tuple[list[VariantConfig] | None, int, str]:
+    """Resolve profile/config/launcher precedence without mutating config."""
+    mode = str(
+        selection_mode
+        or getattr(base_cfg, "VARIANT_SELECTION_MODE", "fallback")
+        or "fallback"
+    ).strip().casefold()
+    if mode not in {"original", "all", "custom", "fallback"}:
+        mode = "fallback"
+
+    requested = n_variants
+    if mode == "fallback" and hasattr(base_cfg, "VARIANTS_PER_CLIP"):
+        requested = getattr(base_cfg, "VARIANTS_PER_CLIP", 1)
+    elif requested is None:
+        requested = getattr(base_cfg, "VARIANTS_PER_CLIP", 1)
+    requested = max(1, min(6, int(requested or 1)))
+
+    try:
+        from variation_profile import has_active_profile
+        saved_profile = has_active_profile(base_cfg)
+    except Exception:
+        saved_profile = False
+
+    profile_cfg = base_cfg
+    if not saved_profile:
+        fallback_count = 1 if mode == "original" else requested
+
+        class ProfileDefaultsCfg:
+            def __getattr__(self, name):
+                if name == "VARIANTS_PER_CLIP":
+                    return fallback_count
+                return getattr(base_cfg, name)
+
+        profile_cfg = ProfileDefaultsCfg()
+
+    profile_variants = _profile_variants(profile_cfg, seed=seed)
+    if profile_variants:
+        if mode == "original":
+            selected = profile_variants[:1]
+        elif mode == "custom":
+            selected = profile_variants[:requested]
+        elif not saved_profile:
+            selected = profile_variants[:requested]
+        else:
+            selected = profile_variants
+        return selected, len(selected), mode
+
+    count = 1 if mode == "original" else requested
+    return None, count, mode
 
 
 def _discover_broll_intro_assets(base_cfg) -> list[Path]:
@@ -475,7 +798,8 @@ def _discover_broll_intro_assets(base_cfg) -> list[Path]:
 
 
 def _normalize_broll_product(text: str) -> str:
-    normalized = re.sub(r"[^\w\s]", " ", str(text).lower(), flags=re.UNICODE)
+    normalized = re.sub(r"[_-]+", " ", str(text).lower(), flags=re.UNICODE)
+    normalized = re.sub(r"[^\w\s]", " ", normalized, flags=re.UNICODE)
     return " ".join(tok for tok in normalized.split() if tok)
 
 
@@ -519,6 +843,54 @@ def _broll_intro_has_assets(base_cfg) -> bool:
     return any(_discover_broll_intro_assets_by_product(base_cfg).values())
 
 
+def _discover_transitional_hook_assets(base_cfg) -> list[Path]:
+    if not getattr(base_cfg, "TRANSITIONAL_HOOK_ENABLED", True):
+        return []
+
+    hook_dir = Path(getattr(base_cfg, "TRANSITIONAL_HOOK_DIR", "assets/transitional_hooks"))
+    if not hook_dir.exists():
+        return []
+
+    exts = getattr(base_cfg, "TRANSITIONAL_HOOK_VIDEO_EXTS", _TRANSITIONAL_HOOK_VIDEO_EXTS)
+    exts = {str(ext).lower() for ext in exts}
+    try:
+        return sorted(
+            p for p in hook_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in exts
+        )
+    except OSError as exc:
+        log.warning(f"Could not read transitional hook folder {hook_dir}: {exc}")
+        return []
+
+
+def _clear_transitional_hook_variant(variant: VariantConfig) -> None:
+    variant.transitional_hook_enabled = False
+    variant.transitional_hook_path = ""
+
+
+def _assign_transitional_hook_variants_for_moment(
+    variants: list[VariantConfig],
+    base_cfg,
+    seed: int,
+    base_clip_id: str,
+) -> None:
+    for variant in variants:
+        _clear_transitional_hook_variant(variant)
+
+    assets = _discover_transitional_hook_assets(base_cfg)
+    if not assets:
+        return
+
+    for variant in variants:
+        if getattr(variant, "visual_mode", "host") == "broll_audio":
+            continue
+        if getattr(variant, "hook_type", "") != "transitional_hook":
+            continue
+        picker = random.Random(f"{seed}|{base_clip_id}|{variant.variant_id}|transitional_hook")
+        variant.transitional_hook_enabled = True
+        variant.transitional_hook_path = str(picker.choice(assets))
+
+
 def _broll_intro_rate_bounds(base_cfg) -> tuple[float, float]:
     def _rate(name: str, default: float) -> float:
         try:
@@ -546,7 +918,10 @@ def _broll_intro_candidate_indices(
     variants: list[VariantConfig],
     base_cfg,
 ) -> list[int]:
-    candidate_indices = list(range(len(variants)))
+    candidate_indices = [
+        idx for idx, variant in enumerate(variants)
+        if getattr(variant, "visual_mode", "host") != "broll_audio"
+    ]
     if not getattr(base_cfg, "BROLL_INTRO_APPLY_TO_ORIGINAL", False):
         candidate_indices = [idx for idx in candidate_indices if idx != 0]
     return candidate_indices
@@ -644,6 +1019,11 @@ def generate_variants(base_cfg, n_variants: int, seed: int | None = None) -> lis
         duration_mult = float(slot.get("hook_duration_mult") or 1.0)
         is_original = i == 0
 
+        subtitle_y = (
+            getattr(base_cfg, "SUBTITLE_Y_POS", 0.80)
+            if slot["subtitle_y"] is None else float(slot["subtitle_y"])
+        )
+
         vc = VariantConfig(
             variant_id=slot["variant_id"],
             variant_index=i,
@@ -660,10 +1040,8 @@ def generate_variants(base_cfg, n_variants: int, seed: int | None = None) -> lis
             ),
             subtitle_stroke=stroke_c,
             subtitle_stroke_w=stroke_w,
-            subtitle_y_pos=(
-                getattr(base_cfg, "SUBTITLE_Y_POS", 0.80)
-                if slot["subtitle_y"] is None else float(slot["subtitle_y"])
-            ),
+            subtitle_y_pos=subtitle_y,
+            subtitle_y_frac=subtitle_y,
             hook_color=hook_col,
             hook_stroke_color=hook_stroke_c,
             hook_stroke_w=hook_stroke_w,
@@ -677,7 +1055,7 @@ def generate_variants(base_cfg, n_variants: int, seed: int | None = None) -> lis
             speed_ramp=float(slot["speed"]),
             color_grade_filter=str(slot["grade"] or ""),
             crop_x_offset=float(slot["crop"]),
-            before_after_variant_mode=str(slot["before_after_mode"] or "standard"),
+                before_after_variant_mode="fullscreen",
             hook_layout_mode=str(slot["hook_layout"] or "standard"),
             subtitle_layout_mode=str(slot["subtitle_layout"] or "standard"),
             broll_intro_role=str(slot["broll_role"] or ""),
@@ -744,6 +1122,28 @@ def _moment_search_text(moment: dict) -> str:
     return " ".join(str(part or "") for part in parts)
 
 
+def _resolve_detected_broll_product_key(moment: dict, product_assets: dict[str, list[Path]]) -> str:
+    detected_text = str(
+        moment.get("_detected_product_key")
+        or moment.get("detected_product_key")
+        or moment.get("_detected_product")
+        or moment.get("detected_product")
+        or ""
+    )
+    detected_norm = _normalize_broll_product(detected_text)
+    if not detected_norm:
+        return ""
+    for key in sorted(product_assets, key=len, reverse=True):
+        key_norm = _normalize_broll_product(key)
+        if (
+            detected_norm == key_norm
+            or _contains_normalized_phrase(detected_norm, key_norm)
+            or _contains_normalized_phrase(key_norm, detected_norm)
+        ):
+            return key
+    return ""
+
+
 def _resolve_broll_product_key(
     moment: dict,
     base_cfg,
@@ -773,6 +1173,10 @@ def _resolve_broll_product_key(
     for key, phrase, _phrase_norm in _iter_broll_alias_phrases(aliases):
         if _contains_normalized_phrase(search_text, phrase):
             return key
+
+    detected_key = _resolve_detected_broll_product_key(moment, product_assets)
+    if detected_key:
+        return detected_key
 
     return ""
 
@@ -827,6 +1231,28 @@ def _assign_broll_intro_variants_for_moment(
         _clear_broll_intro_variant(variant)
 
     if not variants or not _broll_intro_has_assets(base_cfg):
+        return
+
+    profile_indices = [
+        idx for idx, variant in enumerate(variants)
+        if getattr(variant, "profile_revision", "")
+    ]
+    if profile_indices:
+        intro_duration = _broll_intro_duration(base_cfg)
+        for idx in profile_indices:
+            variant = variants[idx]
+            if getattr(variant, "visual_mode", "host") == "broll_audio":
+                continue
+            if getattr(variant, "hook_type", "") not in {"b_roll", "text_b_roll"}:
+                continue
+            _enable_broll_intro_variant(variant, intro_duration)
+            _assign_broll_intro_for_moment(
+                variant,
+                moment,
+                base_cfg,
+                seed,
+                base_clip_id,
+            )
         return
 
     candidate_indices = _broll_intro_candidate_indices(variants, base_cfg)
@@ -917,6 +1343,7 @@ def expand_moments_with_variants(
     base_cfg,
     n_variants: int | None = None,
     seed: int = 42,
+    selection_mode: str | None = None,
 ) -> list[dict]:
     """
     Expand the moments list so each moment appears N times â€” once per variant.
@@ -931,18 +1358,42 @@ def expand_moments_with_variants(
         Expanded list with (len(moments) * n_variants) entries.
         Each entry has a "_variant" key containing the VariantConfig.
     """
-    if n_variants is None:
-        n_variants = getattr(base_cfg, "VARIANTS_PER_CLIP", 4)
+    profile_variants, n_variants, _mode = resolve_variant_plan(
+        base_cfg,
+        n_variants=n_variants,
+        selection_mode=selection_mode,
+        seed=seed,
+    )
+    variants = profile_variants or []
 
     if n_variants <= 1:
         # No expansion â€” just tag every moment as v0_original
+        if not variants:
+            variants = [VariantConfig(variant_id="v0_original", variant_index=0)]
         for m in moments:
-            m["_variant"] = VariantConfig(variant_id="v0_original", variant_index=0)
+            base_clip_id = str(m.get("clip_id", "clip_unknown"))
+            moment_variants = [copy.deepcopy(variants[0])]
+            _assign_broll_intro_variants_for_moment(
+                moment_variants,
+                m,
+                base_cfg,
+                seed,
+                base_clip_id,
+            )
+            _assign_transitional_hook_variants_for_moment(
+                moment_variants,
+                base_cfg,
+                seed,
+                base_clip_id,
+            )
+            m["_variant"] = moment_variants[0]
         return moments
 
-    variants = generate_variants(base_cfg, n_variants, seed=seed)
+    if not variants:
+        variants = generate_variants(base_cfg, n_variants, seed=seed)
     expanded = []
     broll_jobs = 0
+    transitional_hook_jobs = 0
 
     for moment in moments:
         base_clip_id = str(moment.get("clip_id", "clip_unknown"))
@@ -954,7 +1405,14 @@ def expand_moments_with_variants(
             seed,
             base_clip_id,
         )
+        _assign_transitional_hook_variants_for_moment(
+            moment_variants,
+            base_cfg,
+            seed,
+            base_clip_id,
+        )
         broll_jobs += sum(1 for vc in moment_variants if vc.broll_intro_enabled)
+        transitional_hook_jobs += sum(1 for vc in moment_variants if vc.transitional_hook_enabled)
 
         for variant_for_moment in moment_variants:
             m = _apply_variant_timeline_offsets(moment, variant_for_moment)
@@ -971,6 +1429,8 @@ def expand_moments_with_variants(
         log.info(f"B-roll intro selected for {broll_jobs}/{len(expanded)} expanded clip jobs")
     elif getattr(base_cfg, "BROLL_INTRO_ENABLED", True):
         log.debug("No matching B-roll intro assets found; variants render without intro pre-roll")
+    if transitional_hook_jobs:
+        log.info(f"Transitional hook selected for {transitional_hook_jobs}/{len(expanded)} expanded clip jobs")
     return expanded
 
 

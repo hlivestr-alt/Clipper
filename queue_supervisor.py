@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -16,12 +17,13 @@ try:
     from video_queue import STAGES, TERMINAL_VIDEO_STATUSES, VIDEO_EXTS
 except Exception:
     STAGES = ("transcribe", "llm", "yolo", "ffmpeg")
-    TERMINAL_VIDEO_STATUSES = {"completed", "failed"}
+    TERMINAL_VIDEO_STATUSES = {"completed", "failed", "stopped"}
     VIDEO_EXTS = {".mp4", ".mkv", ".mov"}
 
 
 SUPERVISOR_SCHEMA_VERSION = 1
 PAUSED_EXIT_CODE = 10
+STOPPED_EXIT_CODE = 11
 TERMINAL_STAGE_STATUSES = {"done", "failed", "skipped"}
 NON_TERMINAL_STAGE_STATUSES = {"pending", "queued", "running", "paused"}
 
@@ -115,8 +117,9 @@ def queue_run_terminal(
     input_dir: str | Path,
     run_tag: str,
     stable_seconds: float,
+    snapshot_videos: list[Path] | None = None,
 ) -> RunTerminalSummary:
-    stable_videos = discover_stable_videos(input_dir, stable_seconds)
+    stable_videos = snapshot_videos if snapshot_videos is not None else discover_stable_videos(input_dir, stable_seconds)
     summary = RunTerminalSummary(
         is_terminal=False,
         run_tag=run_tag,
@@ -150,7 +153,7 @@ def queue_run_terminal(
             continue
 
         status = str(entry.get("status") or "").lower()
-        if status == "completed":
+        if status in {"completed", "stopped"}:
             summary.completed += 1
         elif status == "failed":
             summary.failed += 1
@@ -191,6 +194,10 @@ def queue_run_terminal(
 
 
 def build_queue_command(args, run_tag: str) -> list[str]:
+    run_mode = _arg_value(args.run_mode)
+    pipeline_mode = _arg_value(args.pipeline_mode)
+    variant_mode = _arg_value(args.variant_mode)
+    stage_admission_limit = getattr(args, "stage_admission_limit", 3)
     command = [
         args.python_exe,
         str(Path(__file__).resolve().with_name("video_queue.py")),
@@ -204,6 +211,8 @@ def build_queue_command(args, run_tag: str) -> list[str]:
         str(args.max_inflight_videos),
         "--ffmpeg-max-parallel-clips",
         str(args.ffmpeg_max_parallel_clips),
+        "--stage-admission-limit",
+        str(stage_admission_limit),
         "--poll-interval",
         str(args.poll_interval),
         "--redo-tag",
@@ -214,7 +223,19 @@ def build_queue_command(args, run_tag: str) -> list[str]:
         str(args.stable_seconds),
         "--scan-interval",
         str(args.scan_interval),
+        "--run-mode",
+        str(run_mode),
+        "--pipeline-mode",
+        str(pipeline_mode),
+        "--variant-mode",
+        str(variant_mode),
+        "--variant-count",
+        str(args.variant_count),
     ]
+    if getattr(args, "settings_snapshot_file", None):
+        command.extend(["--settings-snapshot-file", str(args.settings_snapshot_file)])
+    if run_mode in {"folder_once", "single_video"}:
+        command.append("--scan-once")
     if args.max_clips:
         command.extend(["--max-clips", str(args.max_clips)])
     if args.min_score is not None:
@@ -225,16 +246,59 @@ def build_queue_command(args, run_tag: str) -> list[str]:
         command.append("--force-modules")
     if args.retry_failed:
         command.append("--retry-failed")
+    if args.video_path:
+        command.extend(["--video-path", str(args.video_path)])
     return command
+
+
+def _arg_value(value: Any) -> Any:
+    return getattr(value, "value", value)
+
+
+def _launch_snapshot_videos(args) -> list[Path] | None:
+    run_mode = str(_arg_value(args.run_mode))
+    if run_mode == "single_video":
+        return [Path(str(args.video_path)).resolve()] if args.video_path else []
+    if run_mode == "folder_once":
+        return discover_stable_videos(args.input_dir, args.stable_seconds)
+    return None
+
+
+def _one_shot_start_should_advance_run(args, run_mode: str, run_number: int) -> bool:
+    if run_mode == "folder_repeat":
+        return False
+    control = queue_control.read_control_state(args.control_file)
+    if control.get("requested_action") != queue_control.RUN_ACTION:
+        return False
+    if str(control.get("status") or "").lower() != "start_requested":
+        return False
+
+    supervisor_state = load_json(args.forever_state_file)
+    try:
+        saved_run_number = int(supervisor_state.get("current_run_number") or 0)
+    except (TypeError, ValueError):
+        saved_run_number = 0
+    if saved_run_number < int(run_number):
+        return False
+
+    status = str(supervisor_state.get("status") or "").lower()
+    if status in {"completed", "stopped", "failed"}:
+        return True
+    summary = supervisor_state.get("queue_summary")
+    return isinstance(summary, dict) and bool(summary.get("is_terminal"))
 
 
 def wait_for_continue(control_file: str | Path, sleep_seconds: float) -> None:
     while queue_control.pause_requested(control_file):
-        time.sleep(max(1.0, sleep_seconds))
+        time.sleep(max(1.0, min(float(sleep_seconds), 2.0)))
 
 
 def run_supervisor(args) -> int:
     run_number = load_run_number(args.forever_state_file, args.start_run_number)
+    run_mode = str(_arg_value(args.run_mode))
+    if _one_shot_start_should_advance_run(args, run_mode, run_number):
+        run_number += 1
+    launch_snapshot_videos = _launch_snapshot_videos(args)
     print("PROYA queue supervisor is active.")
     print(f"Input: {args.input_dir}")
     print(f"Queue state: {args.state_file}")
@@ -243,8 +307,29 @@ def run_supervisor(args) -> int:
 
     while True:
         run_tag = format_run_tag(run_number)
+        snapshot_videos = launch_snapshot_videos
+        if queue_control.stop_requested(args.control_file):
+            summary = queue_run_terminal(args.state_file, args.input_dir, run_tag, args.stable_seconds, snapshot_videos)
+            write_supervisor_state(
+                args.forever_state_file,
+                run_number,
+                run_tag,
+                "stopped",
+                last_exit_code=STOPPED_EXIT_CODE,
+                queue_summary=summary,
+            )
+            queue_control.update_control_status(
+                args.control_file,
+                "stopped",
+                current_run_number=run_number,
+                current_run_tag=run_tag,
+                queue_summary=asdict(summary),
+            )
+            print(f"Run {run_tag} is stopped.")
+            return 0
+
         if queue_control.pause_requested(args.control_file):
-            summary = queue_run_terminal(args.state_file, args.input_dir, run_tag, args.stable_seconds)
+            summary = queue_run_terminal(args.state_file, args.input_dir, run_tag, args.stable_seconds, snapshot_videos)
             write_supervisor_state(
                 args.forever_state_file,
                 run_number,
@@ -264,9 +349,28 @@ def run_supervisor(args) -> int:
             wait_for_continue(args.control_file, args.scan_interval)
             continue
 
-        before = queue_run_terminal(args.state_file, args.input_dir, run_tag, args.stable_seconds)
+        before = queue_run_terminal(args.state_file, args.input_dir, run_tag, args.stable_seconds, snapshot_videos)
+        if before.paused:
+            before.paused = False
+            before.reason = "Queue state was paused; launching queue process to resume because requested action is run."
         if before.is_terminal:
             print(f"Run {run_tag} is terminal ({before.reason}). Advancing.")
+            if run_mode != "folder_repeat":
+                write_supervisor_state(
+                    args.forever_state_file,
+                    run_number,
+                    run_tag,
+                    "completed",
+                    queue_summary=before,
+                )
+                queue_control.update_control_status(
+                    args.control_file,
+                    "completed",
+                    current_run_number=run_number,
+                    current_run_tag=run_tag,
+                    queue_summary=asdict(before),
+                )
+                return 0
             run_number += 1
             write_supervisor_state(
                 args.forever_state_file,
@@ -277,6 +381,23 @@ def run_supervisor(args) -> int:
             )
             time.sleep(max(0.0, args.between_runs_delay_seconds))
             continue
+        if before.video_count == 0 and run_mode != "folder_repeat":
+            print(f"Run {run_tag} has no launch-scope VOD files. Exiting.")
+            write_supervisor_state(
+                args.forever_state_file,
+                run_number,
+                run_tag,
+                "completed",
+                queue_summary=before,
+            )
+            queue_control.update_control_status(
+                args.control_file,
+                "completed",
+                current_run_number=run_number,
+                current_run_tag=run_tag,
+                queue_summary=asdict(before),
+            )
+            return 0
 
         queue_control.update_control_status(
             args.control_file,
@@ -301,10 +422,27 @@ def run_supervisor(args) -> int:
 
         completed = subprocess.run(command, cwd=str(Path(__file__).resolve().parent), check=False)
         exit_code = completed.returncode
-        after = queue_run_terminal(args.state_file, args.input_dir, run_tag, args.stable_seconds)
+        after = queue_run_terminal(args.state_file, args.input_dir, run_tag, args.stable_seconds, snapshot_videos)
 
         if after.is_terminal:
             print(f"Finished run {run_tag} ({after.reason}).")
+            if run_mode != "folder_repeat":
+                write_supervisor_state(
+                    args.forever_state_file,
+                    run_number,
+                    run_tag,
+                    "completed",
+                    last_exit_code=exit_code,
+                    queue_summary=after,
+                )
+                queue_control.update_control_status(
+                    args.control_file,
+                    "completed",
+                    current_run_number=run_number,
+                    current_run_tag=run_tag,
+                    queue_summary=asdict(after),
+                )
+                return exit_code
             write_supervisor_state(
                 args.forever_state_file,
                 run_number + 1,
@@ -323,6 +461,25 @@ def run_supervisor(args) -> int:
             run_number += 1
             time.sleep(max(0.0, args.between_runs_delay_seconds))
             continue
+
+        if exit_code == STOPPED_EXIT_CODE or queue_control.stop_requested(args.control_file):
+            print(f"Run {run_tag} stopped ({after.reason}).")
+            write_supervisor_state(
+                args.forever_state_file,
+                run_number,
+                run_tag,
+                "stopped",
+                last_exit_code=exit_code,
+                queue_summary=after,
+            )
+            queue_control.update_control_status(
+                args.control_file,
+                "stopped",
+                current_run_number=run_number,
+                current_run_tag=run_tag,
+                queue_summary=asdict(after),
+            )
+            return 0
 
         if exit_code == PAUSED_EXIT_CODE or queue_control.pause_requested(args.control_file) or after.paused:
             print(f"Run {run_tag} paused ({after.reason}).")
@@ -367,7 +524,17 @@ def run_supervisor(args) -> int:
 
 
 def parse_args(argv: list[str] | None = None):
-    import config as cfg
+    from clipper_app.application.settings import LegacyConfigProvider
+
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--settings-snapshot-file", default=None)
+    known, _ = pre_parser.parse_known_args(argv)
+    provider = LegacyConfigProvider()
+    snapshot = (
+        provider.snapshot_from_file(known.settings_snapshot_file)
+        if known.settings_snapshot_file else provider.snapshot()
+    )
+    cfg = provider.runtime_view(snapshot)
 
     working_dir = getattr(cfg, "WORKING_DIR", "working")
     parser = argparse.ArgumentParser(description="Supervise resumable PROYA queue runs")
@@ -396,11 +563,16 @@ def parse_args(argv: list[str] | None = None):
         type=int,
         default=getattr(cfg, "QUEUE_FFMPEG_MAX_PARALLEL_CLIPS", 2),
     )
+    parser.add_argument(
+        "--stage-admission-limit",
+        type=int,
+        default=getattr(cfg, "QUEUE_STAGE_ADMISSION_LIMIT", 3),
+    )
     parser.add_argument("--poll-interval", type=float, default=getattr(cfg, "QUEUE_POLL_INTERVAL", 2.0))
     parser.add_argument(
         "--scan-interval",
         type=float,
-        default=getattr(cfg, "QUEUE_SCAN_INTERVAL_SECONDS", 10.0),
+        default=getattr(cfg, "QUEUE_RESCAN_INTERVAL_SECONDS", 300.0),
     )
     parser.add_argument(
         "--stable-seconds",
@@ -424,12 +596,41 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--force-modules", action="store_true")
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--run-mode",
+        choices=["single_video", "folder_once", "folder_repeat"],
+        default="folder_repeat",
+    )
+    parser.add_argument(
+        "--pipeline-mode",
+        choices=["full", "clips_only", "modules_only", "raw_cuts_only"],
+        default="full",
+    )
+    parser.add_argument(
+        "--variant-mode",
+        choices=["all", "original", "custom"],
+        default="all",
+    )
+    parser.add_argument("--variant-count", type=int, default=1)
+    parser.add_argument("--video-path", default=None)
+    parser.add_argument("--settings-snapshot-file", default=known.settings_snapshot_file)
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    return run_supervisor(args)
+    if os.environ.get("CLIPPER_SERVICE_BOUNDARY", "service").casefold() == "legacy":
+        return run_supervisor(args)
+
+    from clipper_app.bootstrap import build_queue_supervisor_service
+    from clipper_app.contracts import QueueSupervisorCommand
+
+    command = QueueSupervisorCommand(**vars(args))
+    return build_queue_supervisor_service(_run_supervisor_command).run(command).exit_code
+
+
+def _run_supervisor_command(command) -> int:
+    return run_supervisor(argparse.Namespace(**command.model_dump(mode="json")))
 
 
 if __name__ == "__main__":

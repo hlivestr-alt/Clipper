@@ -1269,17 +1269,19 @@ def main() -> int:
     parser.add_argument("--no-lm", action="store_true", help="Use keyword fallback only")
     args = parser.parse_args()
 
-    import config as cfg  # type: ignore
-
     if args.output_dir:
-        result = scan_output_dir(
-            args.output_dir,
+        from clipper_app.bootstrap import build_compliance_service
+        from clipper_app.contracts import ComplianceScanCommand
+
+        result = build_compliance_service().scan(ComplianceScanCommand(
+            output_dir=args.output_dir,
             working_dir=args.working_dir or None,
-            cfg=cfg,
             force=True,
-        )
+        )).model_dump()
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
+
+    import config as cfg  # type: ignore
 
     transcript: str | Path
     if args.transcript:
