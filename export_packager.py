@@ -6,20 +6,26 @@ import math
 import os
 import re
 import shutil
+import threading
+import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
+from clipper_app.path_safety import UnsafePathError, resolve_within_root
 
 PACKAGER_SCHEMA_VERSION = 1
+EXPORT_STATUS_SCHEMA_VERSION = 1
 HASH_BYTES = 64 * 1024
 TIER_DIRS = {"export_ready", "review_needed", "rejected"}
 ROTATION_STRATEGY = "vod_clip_variant_rotation"
 SCORE_ROUND_ROBIN_STRATEGY = "score_round_robin_all_variants"
 ROTATION_LAYOUT_VERSION = 1
 DEFAULT_VARIANT_COUNT = 6
+_EXPORT_STATUS_LOCK = threading.RLock()
 
 
 @dataclass
@@ -53,16 +59,103 @@ def package_export_batches(
     cfg=None,
     batch_size: int | None = None,
     dry_run: bool = False,
+    *,
+    trigger: str = "direct",
+) -> dict[str, Any]:
+    """Package export-ready clips and persist a compact operational snapshot."""
+    if cfg is None:
+        import config as cfg  # type: ignore
+
+    root = Path(output_root).resolve(strict=False)
+    batch_dir_name = str(getattr(cfg, "EXPORT_BATCH_DIR_NAME", "export_batches") or "export_batches")
+    batch_root = resolve_within_root(root, batch_dir_name)
+    status_path = resolve_within_root(batch_root, "_status.json")
+    operation_id = uuid4().hex
+    started_at_ns = time.time_ns()
+    started_at = datetime.now(timezone.utc).astimezone().isoformat(timespec="microseconds")
+    previous = _load_export_status(status_path)
+    base_status = {
+        "schema_version": EXPORT_STATUS_SCHEMA_VERSION,
+        "operation_id": operation_id,
+        "trigger": str(trigger or "direct"),
+        "status": "running",
+        "started_at": started_at,
+        "started_at_ns": started_at_ns,
+        "updated_at": started_at,
+        "finished_at": None,
+        "output_root": str(root),
+        "batch_root": str(batch_root),
+        "batch_size": max(1, int(batch_size or getattr(cfg, "EXPORT_BATCH_SIZE", 30) or 30)),
+        "allocation_strategy": _export_batch_strategy(cfg),
+        "eligible_count": None,
+        "actionable_count": None,
+        "packaged_count": 0,
+        "pending_count": None,
+        "packaged_total": _nonnegative_int(previous.get("packaged_total")),
+        "error_count": 0,
+        "errors": [],
+        "dry_run": bool(dry_run),
+    }
+    _write_export_status(status_path, base_status)
+    try:
+        result = _package_export_batches_impl(
+            output_root,
+            cfg=cfg,
+            batch_size=batch_size,
+            dry_run=dry_run,
+        )
+    except Exception as exc:
+        finished_at = datetime.now(timezone.utc).astimezone().isoformat(timespec="microseconds")
+        _write_export_status(
+            status_path,
+            {
+                **base_status,
+                "status": "failed",
+                "updated_at": finished_at,
+                "finished_at": finished_at,
+                "error_count": 1,
+                "errors": [str(exc)],
+            },
+        )
+        raise
+
+    finished_at = datetime.now(timezone.utc).astimezone().isoformat(timespec="microseconds")
+    error_count = _nonnegative_int(result.get("error_count")) or 0
+    final_status = "preflight" if dry_run else ("completed_with_errors" if error_count else "completed")
+    snapshot = {
+        **base_status,
+        "status": final_status,
+        "updated_at": finished_at,
+        "finished_at": finished_at,
+        "batch_size": _nonnegative_int(result.get("batch_size")) or base_status["batch_size"],
+        "allocation_strategy": str(result.get("allocation_strategy") or base_status["allocation_strategy"]),
+        "eligible_count": _nonnegative_int(result.get("eligible_count")) or 0,
+        "actionable_count": _nonnegative_int(result.get("actionable_count")) or 0,
+        "packaged_count": 0 if dry_run else (_nonnegative_int(result.get("packaged_count")) or 0),
+        "pending_count": _nonnegative_int(result.get("pending_count")) or 0,
+        "packaged_total": _nonnegative_int(result.get("packaged_total")) or 0,
+        "error_count": error_count,
+        "errors": [str(item) for item in result.get("errors", []) if item],
+    }
+    _write_export_status(status_path, snapshot)
+    return {**result, "status_path": str(status_path), "trigger": snapshot["trigger"]}
+
+
+def _package_export_batches_impl(
+    output_root: str | Path,
+    cfg=None,
+    batch_size: int | None = None,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Move export-ready clips into numbered affiliate batch folders."""
     if cfg is None:
         import config as cfg  # type: ignore
 
-    root = Path(output_root)
+    root = Path(output_root).resolve(strict=False)
     size = max(1, int(batch_size or getattr(cfg, "EXPORT_BATCH_SIZE", 30) or 30))
     batch_dir_name = str(getattr(cfg, "EXPORT_BATCH_DIR_NAME", "export_batches") or "export_batches")
-    batch_root = root / batch_dir_name
-    manifest_path = batch_root / "_manifest.json"
+    batch_root = resolve_within_root(root, batch_dir_name)
+    manifest_path = resolve_within_root(batch_root, "_manifest.json")
     manifest = _load_packager_manifest(manifest_path)
     existing_items = [item for item in manifest.get("items", []) if isinstance(item, dict)]
     existing_source_keys = {
@@ -158,10 +251,8 @@ def package_export_batches(
     planned_destinations: set[str] = set()
     moved_items: list[dict[str, Any]] = []
     errors: list[str] = []
+    move_plans: list[tuple[ExportCandidate, Path, Path, str, dict[str, Any]]] = []
     now = _now_iso()
-
-    if assignments and not dry_run:
-        batch_root.mkdir(parents=True, exist_ok=True)
 
     for candidate, batch_number in assignments:
         destination = _destination_for_candidate(
@@ -170,7 +261,16 @@ def package_export_batches(
             planned_destinations,
         )
         planned_destinations.add(str(destination.resolve()).casefold())
-        source_path_before = candidate.source_path
+        try:
+            source_dir = resolve_within_root(root, candidate.source_dir, kind="dir")
+            export_ready_root = resolve_within_root(source_dir, "export_ready", kind="dir")
+            source_path_before = resolve_within_root(export_ready_root, candidate.source_path, kind="file")
+            destination = resolve_within_root(batch_root, destination)
+            resolve_within_root(source_dir, "manifest.json")
+            resolve_within_root(source_dir, "scores_summary.json")
+        except (OSError, UnsafePathError) as exc:
+            errors.append(f"unsafe export assignment for {candidate.clip_id}: {exc}")
+            continue
         relative_destination = _relative_path(destination, candidate.source_dir)
         item_payload = {
             "source_vod": candidate.source_vod,
@@ -206,11 +306,23 @@ def package_export_batches(
         if dry_run:
             moved_items.append(item_payload)
             continue
+        move_plans.append((candidate, source_path_before, destination, relative_destination, item_payload))
+
+    # The full move set is canonicalized before creating batch folders or
+    # moving the first clip, preventing a late malicious row from causing a
+    # partially applied package operation.
+    if move_plans:
+        batch_root.mkdir(parents=True, exist_ok=True)
+
+    for candidate, source_path_before, destination, relative_destination, item_payload in move_plans:
         try:
+            source_dir = resolve_within_root(root, candidate.source_dir, kind="dir")
+            export_ready_root = resolve_within_root(source_dir, "export_ready", kind="dir")
+            source_path_before = resolve_within_root(export_ready_root, source_path_before, kind="file")
+            destination = resolve_within_root(batch_root, destination)
             destination.parent.mkdir(parents=True, exist_ok=True)
-            if not source_path_before.exists():
-                errors.append(f"missing source before move: {source_path_before}")
-                continue
+            source_path_before = resolve_within_root(export_ready_root, source_path_before, kind="file")
+            destination = resolve_within_root(batch_root, destination)
             shutil.move(str(source_path_before), str(destination))
         except Exception as exc:
             errors.append(f"{source_path_before} -> {destination}: {exc}")
@@ -220,10 +332,11 @@ def package_export_batches(
         _update_source_scores_summary(candidate.source_dir, candidate.clip_id, relative_destination, destination)
         moved_items.append(item_payload)
 
-    should_write_manifest = moved_items or (
-        cutoff_needs_persist
-        and (batch_root.exists() or existing_items)
+    has_existing_batches = bool(existing_items) or manifest_path.exists() or (
+        batch_root.exists()
+        and any(path.is_dir() and path.name.isdigit() for path in batch_root.iterdir())
     )
+    should_write_manifest = moved_items or (cutoff_needs_persist and has_existing_batches)
     if should_write_manifest and not dry_run:
         manifest_items = existing_items + moved_items
         updated_manifest = dict(manifest)
@@ -242,6 +355,7 @@ def package_export_batches(
         })
         if rotation_layout is not None:
             updated_manifest["rotation_layout"] = rotation_layout
+        manifest_path = resolve_within_root(batch_root, manifest_path)
         _write_json_atomic(manifest_path, updated_manifest)
 
     return {
@@ -255,7 +369,14 @@ def package_export_batches(
         "eligible_count": len(raw_candidates),
         "candidate_count_after_variant_filter": len(candidate_pool),
         "new_unique_count": len(candidates),
+        "actionable_count": len(candidates),
         "packaged_count": len(moved_items),
+        "pending_count": (
+            len(candidates)
+            if dry_run
+            else max(0, len(candidates) - len(moved_items))
+        ),
+        "packaged_total": len(existing_items) + (0 if dry_run else len(moved_items)),
         "allocation_strategy": strategy,
         "one_variant_per_clip": variant_stats["one_variant_per_clip"],
         "excluded_variant_count": variant_stats["excluded_variant_count"],
@@ -279,6 +400,10 @@ def _discover_export_ready_candidates(root: Path, batch_root: Path) -> list[Expo
     for source_dir in source_dirs:
         if source_dir.name.casefold() in excluded_names:
             continue
+        try:
+            source_dir = resolve_within_root(root, source_dir, kind="dir")
+        except (OSError, UnsafePathError):
+            continue
         manifest_rows = _load_source_manifest(source_dir)
         manifest_by_clip = {
             str(row.get("clip_id") or ""): row
@@ -288,6 +413,12 @@ def _discover_export_ready_candidates(root: Path, batch_root: Path) -> list[Expo
         scores = _load_score_clips(source_dir)
         seen_clip_ids: set[str] = set()
         for score in scores:
+            score_clip_id = str(score.get("clip_id") or "")
+            if score_clip_id:
+                # A persisted score row is authoritative for its clip. If its
+                # clip_path is inconsistent or unsafe, do not fall back to a
+                # less-specific manifest row and accidentally authorize it.
+                seen_clip_ids.add(score_clip_id)
             candidate = _candidate_from_score(source_dir, score, manifest_by_clip)
             if candidate is not None:
                 candidates.append(candidate)
@@ -334,8 +465,6 @@ def _candidate_from_score(
         return None
     output_file = str(score.get("output_file") or manifest_row.get("output_file") or "")
     clip_path = str(score.get("clip_path") or "")
-    if not _is_export_ready_path(source_dir, output_file, clip_path):
-        return None
     source_path = _resolve_clip_path(source_dir, output_file, clip_path)
     if source_path is None or not source_path.exists() or not source_path.is_file():
         return None
@@ -356,7 +485,7 @@ def _candidate_from_manifest_row(source_dir: Path, row: dict[str, Any]) -> Expor
         return None
     clip_id = str(row.get("clip_id") or "")
     output_file = str(row.get("output_file") or "")
-    if not clip_id or not _is_export_ready_path(source_dir, output_file, ""):
+    if not clip_id:
         return None
     source_path = _resolve_clip_path(source_dir, output_file, "")
     if source_path is None or not source_path.exists() or not source_path.is_file():
@@ -870,7 +999,10 @@ def _update_source_manifest(
     relative_destination: str,
     item_payload: dict[str, Any],
 ) -> None:
-    manifest_path = source_dir / "manifest.json"
+    try:
+        manifest_path = resolve_within_root(source_dir, "manifest.json", kind="file")
+    except (OSError, UnsafePathError):
+        return
     rows = _load_source_manifest(source_dir)
     if not rows:
         return
@@ -885,6 +1017,7 @@ def _update_source_manifest(
         row["export_packaged_at"] = item_payload["packaged_at"]
         changed = True
     if changed:
+        manifest_path = resolve_within_root(source_dir, manifest_path, kind="file")
         _write_json_atomic(manifest_path, rows)
 
 
@@ -894,8 +1027,9 @@ def _update_source_scores_summary(
     relative_destination: str,
     destination: Path,
 ) -> None:
-    summary_path = source_dir / "scores_summary.json"
-    if not summary_path.exists():
+    try:
+        summary_path = resolve_within_root(source_dir, "scores_summary.json", kind="file")
+    except (OSError, UnsafePathError):
         return
     try:
         payload = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -920,6 +1054,7 @@ def _update_source_scores_summary(
         if isinstance(group, dict):
             changed = _update_group_record(group, clip_id, relative_destination, destination_text, output_dir_text) or changed
     if changed:
+        summary_path = resolve_within_root(source_dir, summary_path, kind="file")
         _write_json_atomic(summary_path, payload)
 
 
@@ -1013,8 +1148,9 @@ def _load_packager_manifest(path: Path) -> dict[str, Any]:
 
 
 def _load_source_manifest(source_dir: Path) -> list[dict[str, Any]]:
-    manifest_path = source_dir / "manifest.json"
-    if not manifest_path.exists():
+    try:
+        manifest_path = resolve_within_root(source_dir, "manifest.json", kind="file")
+    except (OSError, UnsafePathError):
         return []
     try:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1024,8 +1160,9 @@ def _load_source_manifest(source_dir: Path) -> list[dict[str, Any]]:
 
 
 def _load_score_clips(source_dir: Path) -> list[dict[str, Any]]:
-    summary_path = source_dir / "scores_summary.json"
-    if not summary_path.exists():
+    try:
+        summary_path = resolve_within_root(source_dir, "scores_summary.json", kind="file")
+    except (OSError, UnsafePathError):
         return []
     try:
         payload = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -1036,37 +1173,36 @@ def _load_score_clips(source_dir: Path) -> list[dict[str, Any]]:
 
 
 def _resolve_clip_path(source_dir: Path, output_file: str, clip_path: str) -> Path | None:
-    candidates: list[Path] = []
-    if clip_path:
-        candidates.append(Path(clip_path))
-    if output_file:
-        output_candidate = Path(output_file)
-        candidates.append(output_candidate if output_candidate.is_absolute() else source_dir / output_candidate)
-    for candidate in candidates:
-        try:
-            if candidate.exists() and candidate.is_file():
-                return candidate
-        except OSError:
-            continue
-    return candidates[0] if candidates else None
+    export_root = (source_dir / "export_ready").resolve(strict=False)
+
+    def resolve_value(value: str) -> Path | None:
+        if not value:
+            return None
+        raw = Path(value)
+        candidate = raw if raw.is_absolute() else source_dir / raw
+        return resolve_within_root(export_root, candidate)
+
+    try:
+        output_candidate = resolve_value(output_file)
+        clip_candidate = resolve_value(clip_path)
+    except (OSError, UnsafePathError):
+        return None
+
+    # Persisted score paths must agree with their output_file. In particular,
+    # a valid textual output_file cannot authorize an unrelated absolute path.
+    if output_candidate is not None and clip_candidate is not None and output_candidate != clip_candidate:
+        return None
+    candidate = clip_candidate or output_candidate
+    if candidate is None:
+        return None
+    try:
+        return resolve_within_root(export_root, candidate, kind="file")
+    except (OSError, UnsafePathError):
+        return None
 
 
 def _is_export_ready_path(source_dir: Path, output_file: str, clip_path: str) -> bool:
-    normalized_output = str(output_file or "").replace("\\", "/").lstrip("./")
-    if normalized_output.split("/", 1)[0].casefold() == "export_ready":
-        return True
-    for raw_path in (clip_path, output_file):
-        if not raw_path:
-            continue
-        path = Path(str(raw_path))
-        if not path.is_absolute():
-            path = source_dir / path
-        try:
-            path.resolve().relative_to((source_dir / "export_ready").resolve())
-            return True
-        except (OSError, ValueError):
-            continue
-    return False
+    return _resolve_clip_path(source_dir, output_file, clip_path) is not None
 
 
 def _is_blocked_or_failed(item: dict[str, Any]) -> bool:
@@ -1150,10 +1286,54 @@ def _relative_path(path: Path, root: Path) -> str:
             return path.resolve().as_posix()
 
 
+def _nonnegative_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+def _load_export_status(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_export_status(path: Path, payload: dict[str, Any]) -> bool:
+    """Atomically write the newest operation status without stale overwrite."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    root = path.parent.resolve(strict=False)
+    path = resolve_within_root(root, path)
+    operation_id = str(payload.get("operation_id") or uuid4().hex)
+    started_at_ns = _nonnegative_int(payload.get("started_at_ns")) or 0
+    with _EXPORT_STATUS_LOCK:
+        current = _load_export_status(path)
+        current_operation = str(current.get("operation_id") or "")
+        current_started_at_ns = _nonnegative_int(current.get("started_at_ns")) or 0
+        if current_started_at_ns > started_at_ns:
+            return False
+        if current_started_at_ns == started_at_ns and current_operation not in {"", operation_id}:
+            return False
+        tmp = resolve_within_root(root, path.with_name(f"{path.name}.{operation_id}.tmp"))
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp = resolve_within_root(root, tmp, kind="file")
+        os.replace(tmp, path)
+    return True
+
+
 def _write_json_atomic(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    root = path.parent.resolve(strict=False)
+    path = resolve_within_root(root, path)
+    tmp = resolve_within_root(root, path.with_suffix(path.suffix + ".tmp"))
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = resolve_within_root(root, tmp, kind="file")
+    path = resolve_within_root(root, path)
     os.replace(tmp, path)
 
 

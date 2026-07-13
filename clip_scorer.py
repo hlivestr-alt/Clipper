@@ -6,9 +6,11 @@ import copy
 import json
 import logging
 import math
+import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from collections import Counter
 from datetime import datetime, timezone
@@ -16,6 +18,7 @@ from bisect import bisect_left, bisect_right
 from pathlib import Path
 from typing import Any
 
+from clipper_app.path_safety import UnsafePathError, resolve_within_root
 from utils import _parse_json_object, lm_studio_openai_chat_kwargs
 
 log = logging.getLogger("proya.clip_scorer")
@@ -244,10 +247,27 @@ def write_score_artifacts(
         except Exception:
             cfg = None
 
-    root = Path(output_dir)
+    root = Path(output_dir).resolve(strict=False)
+    safe_scores: list[dict[str, Any]] = []
+    for score in scores:
+        if not isinstance(score, dict) or score.get("export_batch_path"):
+            continue
+        try:
+            clip_path = resolve_within_root(
+                root,
+                str(score.get("clip_path") or ""),
+                kind="file",
+            )
+        except (OSError, UnsafePathError) as exc:
+            log.warning("Skipping score with unsafe clip path in %s: %s", root, exc)
+            continue
+        safe_score = _public_score(score)
+        safe_score["clip_path"] = str(clip_path)
+        safe_scores.append(safe_score)
+
     root.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
-    valid_scores = [_public_score(score) for score in scores if isinstance(score, dict)]
+    valid_scores = safe_scores
     valid_groups = (
         [_public_group(group) for group in groups if isinstance(group, dict)]
         if groups is not None
@@ -279,7 +299,7 @@ def write_score_artifacts(
             "groups": _build_score_groups_from_flat_scores(parent_scores),
         }
         path = parent / "scores.json"
-        _write_json_atomic(path, payload)
+        _write_json_atomic(path, payload, declared_root=root)
         local_files.append(str(path.resolve()))
 
     ranked = sorted(
@@ -316,7 +336,7 @@ def write_score_artifacts(
             if report_path:
                 summary_payload["scores_report_path"] = report_path
 
-    _write_json_atomic(summary_path, summary_payload)
+    _write_json_atomic(summary_path, summary_payload, declared_root=root)
 
     return {
         "summary_path": str(summary_path.resolve()),
@@ -742,8 +762,8 @@ def score_output_folder(
     if cfg is None:
         import config as cfg  # type: ignore
 
-    folder = Path(output_dir)
-    manifest_path = folder / "manifest.json"
+    folder = Path(output_dir).resolve(strict=False)
+    manifest_path = resolve_within_root(folder, "manifest.json")
     if not manifest_path.exists():
         raise FileNotFoundError(f"No manifest.json found in {folder}")
 
@@ -762,8 +782,16 @@ def score_output_folder(
         status = str(row.get("status") or "")
         if status == "failed" and not include_failed:
             continue
-        clip_path = folder / str(row.get("output_file", "")).replace("\\", "/")
-        if not clip_path.exists():
+        if row.get("export_batch_path"):
+            continue
+        try:
+            clip_path = resolve_within_root(
+                folder,
+                str(row.get("output_file") or ""),
+                kind="file",
+            )
+        except (OSError, UnsafePathError) as exc:
+            log.warning("Skipping manifest row with unsafe output path in %s: %s", folder, exc)
             continue
 
         transcript_input = _get_clip_words_from_index(
@@ -816,7 +844,7 @@ def score_output_folder(
                 cfg=cfg,
                 finalize=False,
             )
-            _write_json_atomic(manifest_path, manifest)
+            _write_json_atomic(manifest_path, manifest, declared_root=folder)
             print(
                 f"  flushed {len(partial_groups)} base group(s), "
                 f"{len(partial_scores)} variant score(s) -> {folder / 'scores_summary.json'}"
@@ -843,7 +871,7 @@ def score_output_folder(
     if scores:
         artifacts = write_score_artifacts(scores, folder, groups=groups, optimization_stats=stats, cfg=cfg)
         _apply_tier_move_stats_to_manifest(manifest, artifacts.get("tier_move", {}))
-        _write_json_atomic(manifest_path, manifest)
+        _write_json_atomic(manifest_path, manifest, declared_root=folder)
     return scores
 
 
@@ -859,7 +887,7 @@ def score_output_tree(
     if cfg is None:
         import config as cfg  # type: ignore
 
-    root = Path(output_root)
+    root = Path(output_root).resolve(strict=False)
     if (root / "manifest.json").exists():
         working_dir = working_root
         return score_output_folder(
@@ -872,7 +900,11 @@ def score_output_tree(
         )
 
     all_scores: list[dict[str, Any]] = []
-    for folder in sorted((item for item in root.iterdir() if item.is_dir()), key=lambda item: item.name.casefold()):
+    for item in sorted((item for item in root.iterdir() if item.is_dir()), key=lambda item: item.name.casefold()):
+        try:
+            folder = resolve_within_root(root, item, kind="dir")
+        except (OSError, UnsafePathError):
+            continue
         if not (folder / "manifest.json").exists():
             continue
         if limit is not None and len(all_scores) >= limit:
@@ -2512,7 +2544,7 @@ def _write_host_focus_debug_artifacts(
             cv2.LINE_AA,
         )
         thumbnail_path = output_dir / f"{safe_id}_focus_frame_{idx:02d}.jpg"
-        cv2.imwrite(str(thumbnail_path), thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+        _write_cv2_image_atomic(cv2, thumbnail_path, thumb, declared_root=output_dir, quality=88)
         thumbs.append(thumb)
         breakdown.append(
             {
@@ -2536,8 +2568,8 @@ def _write_host_focus_debug_artifacts(
             row_thumbs.append(blank.copy())
         grid_rows.append(np.hstack(row_thumbs))
     sheet = np.vstack(grid_rows)
-    cv2.imwrite(str(image_path), sheet, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
-    _write_json_atomic(json_path, breakdown)
+    _write_cv2_image_atomic(cv2, image_path, sheet, declared_root=output_dir, quality=88)
+    _write_json_atomic(json_path, breakdown, declared_root=output_dir)
     return {
         "contact_sheet_path": str(image_path.resolve()),
         "breakdown_path": str(json_path.resolve()),
@@ -3398,7 +3430,11 @@ def write_scores_report(scores: list[dict[str, Any]], output_dir: str | Path, cf
             f"- rejected (< {review_threshold:.1f}): {tier_counts['rejected']}",
         ]
     )
-    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _write_text_atomic(
+        report_path,
+        "\n".join(lines) + "\n",
+        declared_root=root,
+    )
     return report_path
 
 
@@ -3418,17 +3454,46 @@ def _move_scored_clips_by_tier(scores: list[dict[str, Any]], output_dir: Path, c
     if not enabled:
         return stats
 
+    output_dir = output_dir.resolve(strict=False)
     export_threshold = float(getattr(cfg, "SCORER_EXPORT_READY_THRESHOLD", 7.0) or 7.0)
     review_threshold = float(getattr(cfg, "SCORER_REVIEW_THRESHOLD", 5.0) or 5.0)
+    plans: list[dict[str, Any]] = []
     for score in scores:
-        if not isinstance(score, dict):
+        if not isinstance(score, dict) or score.get("export_batch_path"):
             continue
-        source = Path(str(score.get("clip_path") or ""))
-        tier = _score_tier(score.get("total_score"), export_threshold, review_threshold)
-        relative = _relative_clip_output_path(score, source, output_dir)
-        destination = output_dir / tier / relative
-        relative_destination = _relative_to_root(destination, output_dir)
         try:
+            source = resolve_within_root(output_dir, str(score.get("clip_path") or ""))
+            tier = _score_tier(score.get("total_score"), export_threshold, review_threshold)
+            relative = _relative_clip_output_path(score, source, output_dir)
+            destination = resolve_within_root(output_dir, output_dir / tier / relative)
+            relative_destination = destination.relative_to(output_dir).as_posix()
+            source_exists = source.exists() and source.is_file()
+            destination_exists = destination.exists() and destination.is_file()
+            if not source_exists and not destination_exists:
+                continue
+            plans.append(
+                {
+                    "score": score,
+                    "source": source,
+                    "destination": destination,
+                    "relative_destination": relative_destination,
+                    "tier": tier,
+                }
+            )
+        except (OSError, UnsafePathError) as exc:
+            stats["errors"].append(f"{score.get('clip_path')}: {exc}")
+
+    # Every persisted source and computed destination is canonicalized before
+    # the first directory creation, unlink, or move.
+    for plan in plans:
+        score = plan["score"]
+        source = plan["source"]
+        destination = plan["destination"]
+        relative_destination = plan["relative_destination"]
+        tier = plan["tier"]
+        try:
+            source = resolve_within_root(output_dir, source)
+            destination = resolve_within_root(output_dir, destination)
             source_exists = source.exists() and source.is_file()
             destination_exists = destination.exists() and destination.is_file()
             if not source_exists and not destination_exists:
@@ -3442,7 +3507,10 @@ def _move_scored_clips_by_tier(scores: list[dict[str, Any]], output_dir: Path, c
                     same_file = False
             if not same_file and source_exists:
                 if destination_exists:
+                    destination = resolve_within_root(output_dir, destination, kind="file")
                     destination.unlink()
+                source = resolve_within_root(output_dir, source, kind="file")
+                destination = resolve_within_root(output_dir, destination)
                 shutil.move(str(source), str(destination))
                 stats["moved"] += 1
             else:
@@ -3470,17 +3538,9 @@ def _move_scored_clips_by_tier(scores: list[dict[str, Any]], output_dir: Path, c
 def _relative_clip_output_path(score: dict[str, Any], source: Path, output_dir: Path) -> Path:
     output_file = str(score.get("output_file") or "").replace("\\", "/").strip()
     if output_file:
-        path = Path(output_file)
-        if path.is_absolute():
-            try:
-                path = path.resolve().relative_to(output_dir.resolve())
-            except ValueError:
-                path = Path(path.name)
+        path = resolve_within_root(output_dir, output_file).relative_to(output_dir.resolve())
         return _strip_tier_prefix(path)
-    try:
-        return _strip_tier_prefix(source.resolve().relative_to(output_dir.resolve()))
-    except ValueError:
-        return Path(source.name)
+    return _strip_tier_prefix(resolve_within_root(output_dir, source).relative_to(output_dir.resolve()))
 
 
 def _strip_tier_prefix(path: Path) -> Path:
@@ -3626,10 +3686,65 @@ def _clip_mtime_ns(clip_path: Path) -> int | None:
         return None
 
 
-def _write_json_atomic(path: Path, payload: Any) -> None:
-    temp_path = path.with_suffix(path.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(path)
+def _write_json_atomic(path: Path, payload: Any, *, declared_root: str | Path) -> None:
+    _write_bytes_atomic(
+        path,
+        json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
+        declared_root=declared_root,
+    )
+
+
+def _write_text_atomic(path: Path, payload: str, *, declared_root: str | Path) -> None:
+    _write_bytes_atomic(path, payload.encode("utf-8"), declared_root=declared_root)
+
+
+def _write_bytes_atomic(path: Path, payload: bytes, *, declared_root: str | Path) -> None:
+    root = Path(declared_root).resolve(strict=False)
+    target = resolve_within_root(root, path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target = resolve_within_root(root, target)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_file.write(payload)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+            temp_path = Path(temp_file.name)
+        temp_path = resolve_within_root(root, temp_path, kind="file")
+        target = resolve_within_root(root, target)
+        os.replace(temp_path, target)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            try:
+                safe_temp = resolve_within_root(root, temp_path, kind="file")
+                safe_temp.unlink()
+            except (OSError, UnsafePathError):
+                pass
+
+
+def _write_cv2_image_atomic(
+    cv2_module,
+    path: Path,
+    image,
+    *,
+    declared_root: str | Path,
+    quality: int,
+) -> None:
+    ok, encoded = cv2_module.imencode(
+        path.suffix or ".jpg",
+        image,
+        [int(cv2_module.IMWRITE_JPEG_QUALITY), int(quality)],
+    )
+    if not ok:
+        raise RuntimeError(f"Could not encode image for {path}")
+    _write_bytes_atomic(path, encoded.tobytes(), declared_root=declared_root)
 
 
 def validate_contact_sheet_scoring(
@@ -3641,11 +3756,18 @@ def validate_contact_sheet_scoring(
     if cfg is None:
         import config as cfg  # type: ignore
 
-    folder = Path(output_dir)
+    folder = Path(output_dir).resolve(strict=False)
     if not folder.exists():
         raise FileNotFoundError(f"Output directory not found: {folder}")
 
-    clip_paths = _contact_sheet_validation_clip_paths(folder, limit)
+    configured_output_root = Path(getattr(cfg, "OUTPUT_DIR", folder) or folder)
+    if not configured_output_root.is_absolute():
+        configured_output_root = Path.cwd() / configured_output_root
+    clip_paths = _contact_sheet_validation_clip_paths(
+        folder,
+        limit,
+        allowed_output_root=configured_output_root,
+    )
     if not clip_paths:
         raise FileNotFoundError(f"No rendered .mp4 clips found for validation in {folder}")
 
@@ -3720,7 +3842,7 @@ def validate_contact_sheet_scoring(
         "rows": rows,
     }
     report_path = folder / "contact_sheet_validation.json"
-    _write_json_atomic(report_path, report)
+    _write_json_atomic(report_path, report, declared_root=folder)
     report["report_path"] = str(report_path.resolve())
     print(f"Validation report: {report_path.resolve()}")
     print(
@@ -3740,10 +3862,53 @@ def validate_contact_sheet_scoring(
     return report
 
 
-def _contact_sheet_validation_clip_paths(folder: Path, limit: int) -> list[Path]:
+def _contact_sheet_validation_clip_paths(
+    folder: Path,
+    limit: int,
+    *,
+    allowed_output_root: str | Path | None = None,
+) -> list[Path]:
+    folder = folder.resolve(strict=False)
     limit = max(1, int(limit or 10))
     seen: set[str] = set()
     paths: list[Path] = []
+    allowed_roots = [folder]
+    if allowed_output_root is not None:
+        configured_root = Path(allowed_output_root)
+        if not configured_root.is_absolute():
+            configured_root = Path.cwd() / configured_root
+        configured_root = configured_root.resolve(strict=False)
+        if configured_root not in allowed_roots:
+            allowed_roots.append(configured_root)
+
+    safe_files_by_name: dict[str, list[Path]] | None = None
+
+    def resolve_allowed(candidate: Path, *, kind: str | None = None) -> Path | None:
+        for root in allowed_roots:
+            try:
+                return resolve_within_root(root, candidate, kind=kind)  # type: ignore[arg-type]
+            except (OSError, UnsafePathError):
+                continue
+        return None
+
+    def safe_run_files() -> dict[str, list[Path]]:
+        nonlocal safe_files_by_name
+        if safe_files_by_name is not None:
+            return safe_files_by_name
+        safe_files_by_name = {}
+        for current_root, directory_names, file_names in os.walk(folder, followlinks=False):
+            current = Path(current_root)
+            safe_directory = resolve_allowed(current, kind="dir")
+            if safe_directory is None or safe_directory != current.resolve(strict=False):
+                directory_names[:] = []
+                continue
+            for name in file_names:
+                if Path(name).suffix.casefold() != ".mp4":
+                    continue
+                candidate = resolve_allowed(current / name, kind="file")
+                if candidate is not None:
+                    safe_files_by_name.setdefault(candidate.name.casefold(), []).append(candidate)
+        return safe_files_by_name
 
     def add_path(value: Any) -> None:
         if len(paths) >= limit:
@@ -3751,26 +3916,25 @@ def _contact_sheet_validation_clip_paths(folder: Path, limit: int) -> list[Path]
         text = str(value or "").strip()
         if not text:
             return
-        candidate = Path(text)
-        if not candidate.is_absolute():
-            candidate = folder / text.replace("\\", "/")
-        if not candidate.exists() and candidate.name:
-            matches = list(folder.rglob(candidate.name))
-            if matches:
-                candidate = matches[0]
-        if not candidate.exists() or not candidate.is_file() or candidate.suffix.lower() != ".mp4":
+        raw_candidate = Path(text)
+        candidate = raw_candidate if raw_candidate.is_absolute() else folder / text.replace("\\", "/")
+        candidate = resolve_allowed(candidate, kind="file")
+        if candidate is None and raw_candidate.name:
+            matches = safe_run_files().get(raw_candidate.name.casefold(), [])
+            candidate = matches[0] if matches else None
+        if candidate is None or candidate.suffix.casefold() != ".mp4":
             return
-        try:
-            key = str(candidate.resolve()).casefold()
-        except OSError:
-            key = str(candidate).casefold()
+        key = str(candidate).casefold()
         if key in seen:
             return
         seen.add(key)
         paths.append(candidate)
 
-    summary_path = folder / "scores_summary.json"
-    if summary_path.exists():
+    try:
+        summary_path = resolve_within_root(folder, "scores_summary.json", kind="file")
+    except (OSError, UnsafePathError):
+        summary_path = None
+    if summary_path is not None:
         try:
             payload = json.loads(summary_path.read_text(encoding="utf-8"))
         except Exception:
@@ -3790,8 +3954,11 @@ def _contact_sheet_validation_clip_paths(folder: Path, limit: int) -> list[Path]
                     if len(paths) >= limit:
                         break
 
-    manifest_path = folder / "manifest.json"
-    if manifest_path.exists() and len(paths) < limit:
+    try:
+        manifest_path = resolve_within_root(folder, "manifest.json", kind="file")
+    except (OSError, UnsafePathError):
+        manifest_path = None
+    if manifest_path is not None and len(paths) < limit:
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except Exception:
@@ -3804,7 +3971,8 @@ def _contact_sheet_validation_clip_paths(folder: Path, limit: int) -> list[Path]
                         break
 
     if len(paths) < limit:
-        for path in sorted(folder.rglob("*.mp4"), key=lambda item: str(item).casefold()):
+        safe_files = [path for matches in safe_run_files().values() for path in matches]
+        for path in sorted(safe_files, key=lambda item: str(item).casefold()):
             add_path(path)
             if len(paths) >= limit:
                 break

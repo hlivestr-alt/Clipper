@@ -61,15 +61,19 @@ import {
   ComplianceViolationRow,
   ControlJob,
   ControlJobPage,
+  ControlJobResultPreview,
   ControlJobSummary,
   DashboardSummary,
   DesktopRuntimeStatus,
   getJson,
   LogTail,
+  ModuleDetail,
   ModuleLibraryPage,
   ModuleLibraryRow,
   ModuleReadiness,
   ModuleReadinessRow,
+  OverviewData,
+  OverviewTopClip,
   query,
   QueueDetail,
   QueueLaunchConfig,
@@ -92,7 +96,10 @@ import {
   VariationVariant
 } from "./api";
 import { boundedJsonPreview } from "./boundedJsonPreview";
-import { usePolling } from "./usePolling";
+import { buildExportOverview } from "./exportOverview";
+import { invalidateApiPrefix } from "./queryClient";
+import { useApiQuery } from "./useApiQuery";
+import { useDebouncedValue } from "./useDebouncedValue";
 
 type BadgeKind = "good" | "bad" | "warn" | "info" | "neutral";
 type ActionMessage = { kind: BadgeKind; text: string };
@@ -130,7 +137,7 @@ const mainNav: NavItem[] = [
   { label: "Review", path: "/review/clips", match: "/review", icon: Video, detail: "Clip quality, variants, and policy review" },
   { label: "Variants", path: "/variants", match: "/variants", icon: SlidersHorizontal, detail: "Global variant profiles and previews" },
   { label: "Modules", path: "/modules", match: "/modules", icon: Library, detail: "Reusable hook, main, and CTA inventory" },
-  { label: "Deliveries", path: "/deliveries", match: "/deliveries", icon: PackageCheck, detail: "Export readiness and batch packaging" }
+  { label: "Deliveries", path: "/deliveries", match: "/deliveries", icon: PackageCheck, detail: "Automatic batching and recovery" }
 ];
 
 const secondaryNav: NavItem[] = [
@@ -485,15 +492,6 @@ type ComplianceOverview = {
   rate: number;
 };
 
-type ExportOverview = {
-  ready: number;
-  packaged: number;
-  pending: number;
-  batchSize: number;
-  progress: number;
-  source: string;
-};
-
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   if (value && typeof value === "object" && !Array.isArray(value)) {
     return value as Record<string, unknown>;
@@ -637,25 +635,6 @@ function buildComplianceOverview(data: ComplianceIndexPage | undefined, scoreRow
   return { scanned, passed, blocked, rate };
 }
 
-function buildExportOverview(jobs: ControlJobSummary[], readyFallback: number): ExportOverview {
-  const latest = [...jobs]
-    .filter((job) => job.operation === "export_batches")
-    .sort((left, right) => {
-      const leftDate = parseDateValue(left.updated_at)?.getTime() ?? 0;
-      const rightDate = parseDateValue(right.updated_at)?.getTime() ?? 0;
-      return rightDate - leftDate;
-    })[0];
-  const payload = asRecord(latest?.result_summary);
-  const ready = Math.max(0, Math.round(recordNumber(payload, "eligible_count") ?? readyFallback));
-  const packaged = Math.max(0, Math.round(recordNumber(payload, "packaged_count") ?? 0));
-  const batchSize = Math.max(0, Math.round(recordNumber(payload, "batch_size") ?? 0));
-  const pending = Math.max(0, ready - packaged);
-  const progress = ready > 0 ? Math.round((packaged / ready) * 100) : 0;
-  const dryRun = Boolean(payload?.dry_run);
-  const source = latest ? `${latest.status}${dryRun ? " dry run" : ""}` : "No batch run yet";
-  return { ready, packaged, pending, batchSize, progress, source };
-}
-
 function usePageInfo(): NavItem {
   const location = useLocation();
   return (
@@ -702,15 +681,27 @@ async function submitMutation(
   }
 }
 
-function AppShell({
-  summary,
-  system,
-  children
-}: {
-  summary?: DashboardSummary;
-  system?: SystemStats;
-  children: ReactNode;
-}) {
+function refreshJobQueries(): void {
+  void invalidateApiPrefix("/api/control/jobs");
+}
+
+function dashboardPollingInterval(summary?: DashboardSummary): number {
+  const status = String(summary?.queue_status ?? "").toLowerCase();
+  return ["running", "active", "starting", "paused", "stopping"].some((value) => status.includes(value))
+    ? 2_000
+    : 15_000;
+}
+
+function jobPollingInterval(page?: ControlJobPage): number {
+  const activeCount = page?.active_count ?? page?.jobs.filter((job) => ["queued", "running"].includes(job.status)).length ?? 0;
+  return activeCount > 0 ? 2_000 : 15_000;
+}
+
+function AppShell({ children }: { children: ReactNode }) {
+  const dashboard = useApiQuery<DashboardSummary>("/api/dashboard", dashboardPollingInterval, true);
+  const systemQuery = useApiQuery<SystemStats>("/api/system", 15_000, true);
+  const summary = dashboard.envelope?.data;
+  const system = systemQuery.envelope?.data;
   const page = usePageInfo();
   const location = useLocation();
   const topbarDetail = page.path === "/overview" ? dashboardDateText() : page.detail;
@@ -1045,8 +1036,9 @@ function ConfirmDialog({
   );
 }
 
-function JobTray({ jobs }: { jobs?: ControlJobPage }) {
-  const visible = (jobs?.jobs ?? [])
+function JobTray() {
+  const jobs = useApiQuery<ControlJobPage>("/api/control/jobs?limit=12", jobPollingInterval, true);
+  const visible = (jobs.envelope?.data.jobs ?? [])
     .filter((job) => ["queued", "running", "failed", "rejected"].includes(job.status))
     .slice(0, 3);
   if (visible.length === 0) {
@@ -1259,16 +1251,14 @@ function SegmentedControl<T extends string>({
 }
 
 function RunLauncher({
-  refreshJobs,
   onQueueRefresh,
   surface = "standard"
 }: {
-  refreshJobs: () => void;
   onQueueRefresh?: () => void;
   surface?: "standard" | "operations";
 }) {
-  const queue = usePolling("queue", () => getJson<QueueDetail>("/api/queue"), 2000, true);
-  const vods = usePolling("run-launcher-vods", () => getJson<QueueVodList>("/api/queue/vods"), 8000, true);
+  const queue = useApiQuery<QueueDetail>("/api/queue", (data) => isQueueActive(data) ? 2_000 : 15_000, true);
+  const vods = useApiQuery<QueueVodList>("/api/queue/vods", 8_000, true);
   const [runMode, setRunMode] = useState<QueueRunMode>("folder_repeat");
   const [pipelineMode, setPipelineMode] = useState<QueuePipelineMode>("full");
   const [variantMode, setVariantMode] = useState<QueueVariantMode>("all");
@@ -1333,7 +1323,7 @@ function RunLauncher({
         launch_config: draftConfig
       }),
       setMessage,
-      refreshJobs,
+      refreshJobQueries,
       [refreshAll]
     );
   }
@@ -1342,7 +1332,7 @@ function RunLauncher({
     void submitMutation(
       () => sendJson<ControlJob>("POST", "/api/control/queue", { action: "stop" }),
       setMessage,
-      refreshJobs,
+      refreshJobQueries,
       [refreshAll]
     );
   }
@@ -1351,7 +1341,7 @@ function RunLauncher({
     void submitMutation(
       () => sendJson<ControlJob>("POST", "/api/control/queue", { action: "pause" }),
       setMessage,
-      refreshJobs,
+      refreshJobQueries,
       [refreshAll]
     );
   }
@@ -1360,7 +1350,7 @@ function RunLauncher({
     void submitMutation(
       () => sendJson<ControlJob>("POST", "/api/control/queue", { action: "continue" }),
       setMessage,
-      refreshJobs,
+      refreshJobQueries,
       [refreshAll]
     );
   }
@@ -1602,25 +1592,11 @@ function RunLauncher({
   );
 }
 
-function OperationsPage({
-  summary,
-  system,
-  jobs,
-  loading,
-  error,
-  warnings,
-  refresh,
-  refreshJobs
-}: {
-  summary?: DashboardSummary;
-  system?: SystemStats;
-  jobs?: ControlJobPage;
-  loading: boolean;
-  error?: string;
-  warnings?: string[];
-  refresh: () => void;
-  refreshJobs: () => void;
-}) {
+function OperationsPage() {
+  const dashboard = useApiQuery<DashboardSummary>("/api/dashboard", dashboardPollingInterval, true);
+  const jobsQuery = useApiQuery<ControlJobPage>("/api/control/jobs?limit=12", jobPollingInterval, true);
+  const summary = dashboard.envelope?.data;
+  const jobs = jobsQuery.envelope?.data;
   const rows = summary?.rows ?? [];
   const queuedVideos = rows.filter(isQueuedVideo);
   const queuedRows = queuedVideos.slice(0, 6);
@@ -1632,10 +1608,10 @@ function OperationsPage({
 
   return (
     <section className="page-stack operations-page">
-      {loading && <SkeletonLines count={4} />}
-      {error && <StateBlock kind="bad" title="Dashboard read failed" detail={error} />}
-      <StateBlock kind="warn" warnings={warnings} />
-      <RunLauncher refreshJobs={refreshJobs} onQueueRefresh={refresh} surface="operations" />
+      {dashboard.loading && <SkeletonLines count={4} />}
+      {dashboard.error && <StateBlock kind="bad" title="Dashboard read failed" detail={dashboard.error} />}
+      <StateBlock kind="warn" warnings={dashboard.envelope?.warnings} />
+      <RunLauncher onQueueRefresh={dashboard.refresh} surface="operations" />
 
       <article className="operation-panel pipeline-progress-panel">
         <h2>Pipeline Progress</h2>
@@ -1742,15 +1718,15 @@ function OperationsPage({
   );
 }
 
-function QueuePage({ refreshJobs }: { refreshJobs: () => void }) {
-  const queue = usePolling("queue", () => getJson<QueueDetail>("/api/queue"), 2000, true);
+function QueuePage() {
+  const queue = useApiQuery<QueueDetail>("/api/queue", (data) => isQueueActive(data) ? 2_000 : 15_000, true);
   const [selected, setSelected] = useState<QueueRunRow | null>(null);
   const data = queue.envelope?.data;
 
   return (
     <section className="page-stack">
       <PageTitle title="Queue history" detail="Inspect active, waiting, completed, and failed production runs." onRefresh={queue.refresh} />
-      <RunLauncher refreshJobs={refreshJobs} onQueueRefresh={queue.refresh} />
+      <RunLauncher onQueueRefresh={queue.refresh} />
       {queue.loading && <SkeletonLines count={4} />}
       {queue.error && <StateBlock kind="bad" title="Queue read failed" detail={queue.error} />}
       <StateBlock kind="warn" warnings={queue.envelope?.warnings} />
@@ -1787,27 +1763,30 @@ function DetailItem({ label, value }: { label: string; value: ReactNode }) {
   );
 }
 
-function DashboardPage({
-  summary,
-  jobs,
-  loading,
-  error,
-  warnings
-}: {
-  summary?: DashboardSummary;
-  jobs?: ControlJobPage;
-  loading: boolean;
-  error?: string;
-  warnings?: string[];
-}) {
-  const scorePath = `/api/scores${query({ limit: 200, offset: 0, sort: "scored_at", direction: "desc" })}`;
-  const compliancePath = `/api/compliance${query({ limit: 200, offset: 0, sort: "checked_at", direction: "desc" })}`;
-  const scores = usePolling("overview-scores", () => getJson<ScoreIndexPage>(scorePath), 10000, true);
-  const compliance = usePolling("overview-compliance", () => getJson<ComplianceIndexPage>(compliancePath), 10000, true);
-  const scoreRows = scores.envelope?.data.rows ?? [];
-  const readyRows = exportReadyRows(scoreRows);
-  const complianceOverview = buildComplianceOverview(compliance.envelope?.data, scoreRows);
-  const exportOverview = buildExportOverview(jobs?.jobs ?? [], readyRows.length);
+function DashboardPage() {
+  const dashboard = useApiQuery<DashboardSummary>("/api/dashboard", dashboardPollingInterval, true);
+  const overview = useApiQuery<OverviewData>(
+    "/api/overview",
+    (data) => data?.queue_active ? 10_000 : 30_000,
+    true
+  );
+  const summary = dashboard.envelope?.data;
+  const overviewData = overview.envelope?.data;
+  const complianceOverview: ComplianceOverview = {
+    scanned: overviewData?.compliance.scanned ?? 0,
+    passed: overviewData?.compliance.passed ?? 0,
+    blocked: overviewData?.compliance.blocked ?? 0,
+    rate: overviewData?.compliance.rate ?? 0
+  };
+  const exportOverview = buildExportOverview(overviewData?.export);
+  const exportStatusLabel = exportOverview.available
+    ? reviewFlagLabel(exportOverview.status || (exportOverview.dryRun ? "preflight" : "completed"))
+    : "Awaiting reconciliation";
+  const exportHint = !exportOverview.available
+    ? "Awaiting the next packaging pass"
+    : exportOverview.pending > 0
+      ? `${numberText(exportOverview.pending)} clip(s) require reconciliation`
+      : "Automatic batching is current";
   const productionDays = summary?.production_days?.length
     ? summary.production_days.map((point) => {
         const date = new Date(`${point.date}T12:00:00`);
@@ -1815,27 +1794,28 @@ function DashboardPage({
       })
     : buildProductionDays(summary?.rows ?? []);
   const productionTotal = productionDays.reduce((total, day) => total + day.count, 0);
-  const topRows = [...scoreRows]
-    .filter((row) => numericValue(row.total_score) !== undefined)
-    .sort((left, right) => (numericValue(right.total_score) ?? 0) - (numericValue(left.total_score) ?? 0))
-    .slice(0, 5);
-  const trendPoints = buildScoreTrendPoints(scoreRows);
-  const scoreAverage = averageScore(scoreRows);
+  const topRows = overviewData?.top_clips ?? [];
+  const trendPoints: ScoreTrendPoint[] = (overviewData?.score_trend ?? []).map((point) => ({
+    key: point.date,
+    label: shortMonthDay(new Date(`${point.date}T12:00:00`)),
+    average: point.average_score,
+    count: point.scored_count
+  }));
+  const scoreAverage = overviewData?.average_score ?? undefined;
   const firstTrend = trendPoints[0]?.average;
   const latestTrend = trendPoints[trendPoints.length - 1]?.average;
   const scoreDelta = firstTrend !== undefined && latestTrend !== undefined ? latestTrend - firstTrend : undefined;
   const complianceRateText = complianceOverview.scanned > 0 ? `${complianceOverview.rate.toFixed(1)}%` : "-";
   const scoreHint = scoreDelta === undefined
-    ? `${numberText(scoreRows.length)} scored clips`
+    ? `${numberText(overviewData?.scored_count)} scored clips`
     : `${scoreDelta >= 0 ? "+" : "-"}${Math.abs(scoreDelta).toFixed(1)} vs chart start`;
 
   return (
     <section className="page-stack overview-page">
-      {loading && <SkeletonLines count={4} />}
-      {error && <StateBlock kind="bad" title="Dashboard read failed" detail={error} />}
-      {scores.error && <StateBlock kind="bad" title="Score read failed" detail={scores.error} />}
-      {compliance.error && <StateBlock kind="bad" title="Compliance read failed" detail={compliance.error} />}
-      <StateBlock kind="warn" warnings={[...(warnings ?? []), ...(scores.envelope?.warnings ?? []), ...(compliance.envelope?.warnings ?? [])]} />
+      {(dashboard.loading || overview.loading) && <SkeletonLines count={4} />}
+      {dashboard.error && <StateBlock kind="bad" title="Dashboard read failed" detail={dashboard.error} />}
+      {overview.error && <StateBlock kind="bad" title="Overview read failed" detail={overview.error} />}
+      <StateBlock kind="warn" warnings={[...(dashboard.envelope?.warnings ?? []), ...(overview.envelope?.warnings ?? [])]} />
 
       <div className="overview-kpi-grid">
         <OverviewKpiCard
@@ -1846,11 +1826,11 @@ function DashboardPage({
           kind="good"
         />
         <OverviewKpiCard
-          label="Export Ready"
-          value={numberText(readyRows.length)}
-          hint="Approved scored clips"
+          label="Pending Export Packaging"
+          value={exportOverview.available ? numberText(exportOverview.pending) : "—"}
+          hint={exportHint}
           icon={FolderOpen}
-          kind="info"
+          kind={!exportOverview.available ? "info" : exportOverview.pending > 0 || exportOverview.errorCount > 0 ? "bad" : "good"}
         />
         <OverviewKpiCard
           label="Compliance Rate"
@@ -1889,19 +1869,22 @@ function DashboardPage({
               <h2>Export Batches</h2>
               <p>Affiliate distribution packaging</p>
             </div>
-            <Badge value={exportOverview.source} kind={exportOverview.packaged > 0 ? "good" : "neutral"} />
+            <Badge
+              value={exportStatusLabel}
+              kind={!exportOverview.available ? "neutral" : exportOverview.errorCount > 0 ? "bad" : exportOverview.pending > 0 ? "warn" : "good"}
+            />
           </div>
           <div className="overview-export-stats">
-            <OverviewStatLine label="Ready clips" value={numberText(exportOverview.ready)} />
-            <OverviewStatLine label="Packaged clips" value={numberText(exportOverview.packaged)} />
-            <OverviewStatLine label="Pending clips" value={numberText(exportOverview.pending)} />
+            <OverviewStatLine label="Actionable at last pass" value={exportOverview.available ? numberText(exportOverview.actionable) : "—"} />
+            <OverviewStatLine label="Moved last pass" value={exportOverview.available ? numberText(exportOverview.packagedLastRun) : "—"} />
+            <OverviewStatLine label="Remaining now" value={exportOverview.available ? numberText(exportOverview.pending) : "—"} />
+            <OverviewStatLine label="Cumulative assignments" value={exportOverview.available ? numberText(exportOverview.packagedTotal) : "—"} />
             <OverviewStatLine label="Batch size" value={exportOverview.batchSize > 0 ? numberText(exportOverview.batchSize) : "-"} />
           </div>
-          <div className="overview-progress-track" aria-label={`Export batch progress ${exportOverview.progress}%`}>
-            <span style={{ width: `${exportOverview.progress}%` }} />
-          </div>
           <div className="overview-progress-caption">
-            {numberText(exportOverview.packaged)} of {numberText(exportOverview.ready)} ready clips packaged ({exportOverview.progress}%)
+            {!exportOverview.available
+              ? "No operational snapshot exists yet. The next automatic pass or recovery preflight will create one."
+              : `${numberText(exportOverview.packagedLastRun)} of ${numberText(exportOverview.actionable)} actionable clips handled; ${numberText(exportOverview.pending)} remain.${exportOverview.updatedAt ? ` Updated ${new Date(exportOverview.updatedAt).toLocaleString()}.` : ""}`}
           </div>
         </article>
       </div>
@@ -1914,7 +1897,7 @@ function DashboardPage({
               <p>Highest total scores from the latest score index</p>
             </div>
           </div>
-          <OverviewTopClips rows={topRows} loading={scores.loading} />
+          <OverviewTopClips rows={topRows} loading={overview.loading} />
         </article>
 
         <article className="overview-panel overview-quality-panel">
@@ -1926,7 +1909,7 @@ function DashboardPage({
           </div>
           <OverviewQualityChart points={trendPoints} />
           <div className="overview-panel-footer">
-            Average score is <strong>{scoreAverage === undefined ? "-" : scoreAverage.toFixed(1)}</strong> across {numberText(scoreRows.length)} scored clips.
+            Average score is <strong>{scoreAverage === undefined ? "-" : scoreAverage.toFixed(1)}</strong> across {numberText(overviewData?.scored_count)} scored clips.
           </div>
         </article>
       </div>
@@ -1990,7 +1973,7 @@ function OverviewStatLine({ label, value }: { label: string; value: string }) {
   );
 }
 
-function OverviewTopClips({ rows, loading }: { rows: ScoreRow[]; loading: boolean }) {
+function OverviewTopClips({ rows, loading }: { rows: OverviewTopClip[]; loading: boolean }) {
   if (loading && rows.length === 0) {
     return <SkeletonLines count={5} />;
   }
@@ -2014,7 +1997,7 @@ function OverviewTopClips({ rows, loading }: { rows: ScoreRow[]; loading: boolea
             <span>{row.clip_id || row.source_video}</span>
           </div>
           <span className="overview-score-pill">{scoreText(row.total_score)}</span>
-          <span>{row.status || row.row_type}</span>
+          <span>{row.status || "scored"}</span>
           <time>{shortDateText(row.scored_at || row.source_date)}</time>
         </Link>
       ))}
@@ -2022,7 +2005,7 @@ function OverviewTopClips({ rows, loading }: { rows: ScoreRow[]; loading: boolea
   );
 }
 
-function OverviewClipThumb({ row }: { row: ScoreRow }) {
+function OverviewClipThumb({ row }: { row: OverviewTopClip }) {
   const artifact = row.artifact;
   const productInitial = (row.product || "C").trim().slice(0, 1).toUpperCase() || "C";
   if (artifact?.exists && artifact.kind === "image") {
@@ -2083,7 +2066,7 @@ function OverviewQualityChart({ points }: { points: ScoreTrendPoint[] }) {
   );
 }
 
-function ClipReviewPage({ active, refreshJobs }: { active: boolean; refreshJobs: () => void }) {
+function ClipReviewPage({ active }: { active: boolean }) {
   const limit = 50;
   const initialScore = new URLSearchParams(window.location.search).get("score") ?? "";
   const [search, setSearch] = useState("");
@@ -2097,17 +2080,17 @@ function ClipReviewPage({ active, refreshJobs }: { active: boolean; refreshJobs:
   const [forceRescore, setForceRescore] = useState(false);
   const [rescoreConfirmOpen, setRescoreConfirmOpen] = useState(false);
   const [message, setMessage] = useState<ActionMessage>();
+  const debouncedSearch = useDebouncedValue(search, 300);
 
   useEffect(() => {
     setOffset(0);
   }, [search, status, product, sort, direction]);
 
-  const path = `/api/scores${query({ limit, offset, search, status, product, sort, direction })}`;
-  const scores = usePolling(`scores:${path}`, () => getJson<ScoreIndexPage>(path), 10000, active);
-  const detail = usePolling(
-    `score-detail:${selected}`,
-    () => getJson<ScoreDetail>(`/api/scores/${selected}`),
-    0,
+  const path = `/api/scores${query({ limit, offset, search: debouncedSearch, status, product, sort, direction })}`;
+  const scores = useApiQuery<ScoreIndexPage>(path, 10_000, active);
+  const detail = useApiQuery<ScoreDetail>(
+    `/api/scores/${encodeURIComponent(selected)}`,
+    false,
     active && Boolean(selected)
   );
   const page = scores.envelope?.data;
@@ -2131,7 +2114,7 @@ function ClipReviewPage({ active, refreshJobs }: { active: boolean; refreshJobs:
         force_rescore: forceRescore
       }),
       setMessage,
-      refreshJobs,
+      refreshJobQueries,
       [scores.refresh, detail.refresh]
     );
   }
@@ -2636,7 +2619,7 @@ function ScoreDetailPanel({
   );
 }
 
-function CompliancePage({ active, refreshJobs }: { active: boolean; refreshJobs: () => void }) {
+function CompliancePage({ active }: { active: boolean }) {
   const limit = 50;
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("");
@@ -2649,20 +2632,16 @@ function CompliancePage({ active, refreshJobs }: { active: boolean; refreshJobs:
   const [force, setForce] = useState(true);
   const [scanConfirmOpen, setScanConfirmOpen] = useState(false);
   const [message, setMessage] = useState<ActionMessage>();
+  const debouncedSearch = useDebouncedValue(search, 300);
 
   useEffect(() => {
     setOffset(0);
   }, [search, status, product, sort, direction]);
 
-  const path = `/api/compliance${query({ limit, offset, search, status, product, sort, direction })}`;
-  const compliance = usePolling(`compliance:${path}`, () => getJson<ComplianceIndexPage>(path), 10000, active);
+  const path = `/api/compliance${query({ limit, offset, search: debouncedSearch, status, product, sort, direction })}`;
+  const compliance = useApiQuery<ComplianceIndexPage>(path, 10_000, active);
   const detailPath = `/api/compliance/detail${query({ output_dir: selectedOutput })}`;
-  const detail = usePolling(
-    `compliance-detail:${selectedOutput}`,
-    () => getJson<ComplianceIndexPage>(detailPath),
-    0,
-    active && Boolean(selectedOutput)
-  );
+  const detail = useApiQuery<ComplianceIndexPage>(detailPath, false, active && Boolean(selectedOutput));
   const data = compliance.envelope?.data;
   const rows = data?.rows ?? [];
   const detailData = detail.envelope?.data;
@@ -2677,7 +2656,7 @@ function CompliancePage({ active, refreshJobs }: { active: boolean; refreshJobs:
         force
       }),
       setMessage,
-      refreshJobs,
+      refreshJobQueries,
       [compliance.refresh, detail.refresh]
     );
   }
@@ -2875,9 +2854,9 @@ function ViolationPanel({
   );
 }
 
-function ModulesPage({ active, refreshJobs }: { active: boolean; refreshJobs: () => void }) {
+function ModulesPage({ active }: { active: boolean }) {
   const limit = 50;
-  const readiness = usePolling("module-readiness", () => getJson<ModuleReadiness>("/api/modules/readiness"), 10000, active);
+  const readiness = useApiQuery<ModuleReadiness>("/api/modules/readiness", 10_000, active);
   const [search, setSearch] = useState("");
   const [qualityStatus, setQualityStatus] = useState("");
   const [reviewFilter, setReviewFilter] = useState("");
@@ -2886,10 +2865,11 @@ function ModulesPage({ active, refreshJobs }: { active: boolean; refreshJobs: ()
   const [sort, setSort] = useState("product");
   const [direction, setDirection] = useState<SortDirection>("asc");
   const [offset, setOffset] = useState(0);
+  const debouncedSearch = useDebouncedValue(search, 300);
   const libraryPath = `/api/modules/library${query({
     limit,
     offset,
-    search,
+    search: debouncedSearch,
     quality_status: qualityStatus,
     review_status: reviewFilter,
     visual_status: visualStatus,
@@ -2897,7 +2877,7 @@ function ModulesPage({ active, refreshJobs }: { active: boolean; refreshJobs: ()
     sort,
     direction
   })}`;
-  const library = usePolling(`module-library:${libraryPath}`, () => getJson<ModuleLibraryPage>(libraryPath), 10000, active);
+  const library = useApiQuery<ModuleLibraryPage>(libraryPath, 10_000, active);
   const [assemblyOpen, setAssemblyOpen] = useState(false);
   const [assemblyLimit, setAssemblyLimit] = useState("");
   const [assemblyProduct, setAssemblyProduct] = useState("");
@@ -2905,9 +2885,13 @@ function ModulesPage({ active, refreshJobs }: { active: boolean; refreshJobs: ()
   const [assemblyConfirmOpen, setAssemblyConfirmOpen] = useState(false);
   const [selectedModule, setSelectedModule] = useState<ModuleLibraryRow | null>(null);
   const [reviewStatus, setReviewStatus] = useState("approved");
-  const [reviewer, setReviewer] = useState("operator");
   const [note, setNote] = useState("");
   const [message, setMessage] = useState<ActionMessage>();
+  const moduleDetail = useApiQuery<ModuleDetail>(
+    `/api/modules/${encodeURIComponent(selectedModule?.module_id ?? "")}`,
+    false,
+    active && Boolean(selectedModule)
+  );
 
   useEffect(() => {
     setOffset(0);
@@ -2922,6 +2906,11 @@ function ModulesPage({ active, refreshJobs }: { active: boolean; refreshJobs: ()
 
   const libraryData = library.envelope?.data;
   const rows = libraryData?.rows ?? [];
+  const selectedModuleWithDetail = selectedModule ? {
+    ...selectedModule,
+    ...(moduleDetail.envelope?.data.selected ?? {}),
+    transcript_text: moduleDetail.envelope?.data.transcript_text ?? selectedModule.transcript_text ?? ""
+  } : null;
   const readyProducts = readiness.envelope?.data.rows.filter((row) => row.readiness === "ready") ?? [];
   const productOptions = libraryData?.filter_options.product ?? uniqueOptions(rows.map((row) => row.product_key || row.product));
   const qualityOptions = libraryData?.filter_options.quality_status ?? [];
@@ -2931,6 +2920,9 @@ function ModulesPage({ active, refreshJobs }: { active: boolean; refreshJobs: ()
   function refreshAll() {
     readiness.refresh();
     library.refresh();
+    if (selectedModule) {
+      moduleDetail.refresh();
+    }
   }
 
   function openAssembly(productKey?: string) {
@@ -2947,7 +2939,7 @@ function ModulesPage({ active, refreshJobs }: { active: boolean; refreshJobs: ()
         module_product_zoom: assemblyZoom
       }),
       setMessage,
-      refreshJobs,
+      refreshJobQueries,
       [refreshAll]
     );
   }
@@ -2959,11 +2951,10 @@ function ModulesPage({ active, refreshJobs }: { active: boolean; refreshJobs: ()
     void submitMutation(
       () => sendJson<ControlJob>("POST", `/api/modules/${encodeURIComponent(selectedModule.module_id)}/review`, {
         status: reviewStatus,
-        reviewer,
         note
       }),
       setMessage,
-      refreshJobs,
+      refreshJobQueries,
       [refreshAll]
     );
   }
@@ -3060,11 +3051,11 @@ function ModulesPage({ active, refreshJobs }: { active: boolean; refreshJobs: ()
       </Drawer>
 
       <ModuleDetailDrawer
-        module={selectedModule}
+        module={selectedModuleWithDetail}
+        detailLoading={moduleDetail.loading && Boolean(selectedModule)}
+        detailError={moduleDetail.error}
         reviewStatus={reviewStatus}
         setReviewStatus={setReviewStatus}
-        reviewer={reviewer}
-        setReviewer={setReviewer}
         note={note}
         setNote={setNote}
         onSubmit={submitReview}
@@ -3173,20 +3164,20 @@ function ModuleLibraryTable({
 
 function ModuleDetailDrawer({
   module,
+  detailLoading,
+  detailError,
   reviewStatus,
   setReviewStatus,
-  reviewer,
-  setReviewer,
   note,
   setNote,
   onSubmit,
   onClose
 }: {
   module: ModuleLibraryRow | null;
+  detailLoading: boolean;
+  detailError?: string;
   reviewStatus: string;
   setReviewStatus: (value: string) => void;
-  reviewer: string;
-  setReviewer: (value: string) => void;
   note: string;
   setNote: (value: string) => void;
   onSubmit: () => void;
@@ -3218,7 +3209,9 @@ function ModuleDetailDrawer({
           </div>
           <section className="drawer-section">
             <h3>Transcript</h3>
-            <p className="transcript-box">{module.transcript_text || "No transcript text available."}</p>
+            {detailLoading && <SkeletonLines count={2} />}
+            {detailError && <StateBlock kind="bad" title="Module detail failed" detail={detailError} />}
+            {!detailLoading && !detailError && <p className="transcript-box">{module.transcript_text || "No transcript text available."}</p>}
           </section>
           <section className="drawer-section">
             <h3>Review action</h3>
@@ -3229,9 +3222,6 @@ function ModuleDetailDrawer({
                   <option value="needs_review">Needs review</option>
                   <option value="blocked">Block</option>
                 </select>
-              </FilterField>
-              <FilterField label="Reviewer">
-                <input value={reviewer} onChange={(event) => setReviewer(event.target.value)} />
               </FilterField>
               <FilterField label="Note">
                 <input value={note} onChange={(event) => setNote(event.target.value)} placeholder="optional" />
@@ -3264,14 +3254,19 @@ function ModuleDetailDrawer({
   );
 }
 
-function ExportsPage({ jobs, refreshJobs }: { jobs?: ControlJobPage; refreshJobs: () => void }) {
+function ExportsPage() {
   const [outputRoot, setOutputRoot] = useState("");
   const [batchSize, setBatchSize] = useState("");
   const [dryRun, setDryRun] = useState(true);
   const [packagingConfirmOpen, setPackagingConfirmOpen] = useState(false);
   const [message, setMessage] = useState<ActionMessage>();
-  const exportHistory = usePolling("delivery-jobs", () => getJson<ControlJobPage>("/api/control/jobs?limit=100&operation=export_batches"), 5000, true);
-  const exportJobs = exportHistory.envelope?.data.jobs ?? (jobs?.jobs ?? []).filter((job) => job.operation === "export_batches");
+  const overview = useApiQuery<OverviewData>("/api/overview", 30_000, true);
+  const exportHistory = useApiQuery<ControlJobPage>("/api/control/jobs?limit=100&operation=export_batches", jobPollingInterval, true);
+  const exportJobs = exportHistory.envelope?.data.jobs ?? [];
+  const exportOverview = buildExportOverview(overview.envelope?.data.export);
+  const statusLabel = exportOverview.available
+    ? reviewFlagLabel(exportOverview.status || (exportOverview.dryRun ? "preflight" : "completed"))
+    : "Awaiting reconciliation";
 
   function submitExport() {
     void submitMutation(
@@ -3281,30 +3276,50 @@ function ExportsPage({ jobs, refreshJobs }: { jobs?: ControlJobPage; refreshJobs
         dry_run: dryRun
       }),
       setMessage,
-      refreshJobs,
-      [exportHistory.refresh]
+      refreshJobQueries,
+      [overview.refresh, exportHistory.refresh]
     );
   }
 
   return (
     <section className="page-stack">
-      <PageTitle title="Deliveries" detail="Review packaging readiness and create delivery batches." onRefresh={() => { refreshJobs(); exportHistory.refresh(); }} />
+      <PageTitle
+        title="Deliveries"
+        detail="Monitor automatic export batching and reconcile only when attention is required."
+        onRefresh={() => {
+          void overview.refresh();
+          void exportHistory.refresh();
+        }}
+      />
+      {overview.error && <StateBlock kind="bad" title="Automatic packaging status failed" detail={overview.error} />}
       {exportHistory.error && <StateBlock kind="bad" title="Delivery history failed" detail={exportHistory.error} />}
-      <article className="panel action-panel">
+      <article className="panel delivery-status-panel">
         <div className="panel-head">
           <div>
-            <h2>Package export batches</h2>
-            <p>Leave output root empty to use the configured output directory.</p>
+            <h2>Automatic export batching</h2>
+            <p>The pipeline packages actionable clips automatically after each completed run.</p>
           </div>
-          <Badge value={dryRun ? "Dry run" : "Final run"} kind={dryRun ? "info" : "warn"} />
+          <Badge
+            value={statusLabel}
+            kind={!exportOverview.available ? "neutral" : exportOverview.errorCount > 0 ? "bad" : exportOverview.pending > 0 ? "warn" : "good"}
+          />
         </div>
-        <div className="action-row">
-          <FilterField label="Output root">
-            <input value={outputRoot} onChange={(event) => setOutputRoot(event.target.value)} placeholder="optional output root override" />
-          </FilterField>
-          <FilterField label="Batch size">
-            <input value={batchSize} onChange={(event) => setBatchSize(event.target.value)} placeholder="default" inputMode="numeric" />
-          </FilterField>
+        <div className="overview-export-stats delivery-status-stats">
+          <OverviewStatLine label="Actionable at last pass" value={exportOverview.available ? numberText(exportOverview.actionable) : "—"} />
+          <OverviewStatLine label="Moved last pass" value={exportOverview.available ? numberText(exportOverview.packagedLastRun) : "—"} />
+          <OverviewStatLine label="Remaining now" value={exportOverview.available ? numberText(exportOverview.pending) : "—"} />
+          <OverviewStatLine label="Cumulative assignments" value={exportOverview.available ? numberText(exportOverview.packagedTotal) : "—"} />
+          <OverviewStatLine label="Last update" value={exportOverview.updatedAt ? new Date(exportOverview.updatedAt).toLocaleString() : "—"} />
+        </div>
+        {!exportOverview.available && (
+          <p className="muted-copy">The next automatic packaging pass or a recovery preflight will create the first operational snapshot.</p>
+        )}
+      </article>
+      <details className="panel delivery-recovery-panel">
+        <summary>Recovery &amp; Reconciliation</summary>
+        <div className="delivery-recovery-content">
+          <p className="muted-copy">Use these controls only to inspect or retry packaging after an automatic pass reports pending clips or errors.</p>
+          <div className="action-row delivery-recovery-actions">
           <label className="confirm-check">
             <input type="checkbox" checked={dryRun} onChange={(event) => setDryRun(event.target.checked)} />
             Dry run
@@ -3313,17 +3328,29 @@ function ExportsPage({ jobs, refreshJobs }: { jobs?: ControlJobPage; refreshJobs
             className="primary-button"
             onClick={() => dryRun ? submitExport() : setPackagingConfirmOpen(true)}
           >
-            <Download size={16} aria-hidden="true" />
-            {dryRun ? "Run preflight" : "Create final delivery"}
+            <RotateCcw size={16} aria-hidden="true" />
+            {dryRun ? "Run reconciliation preflight" : "Retry packaging"}
           </button>
         </div>
+          <details className="delivery-advanced-options">
+            <summary>Advanced overrides</summary>
+            <div className="action-row">
+              <FilterField label="Output root">
+                <input value={outputRoot} onChange={(event) => setOutputRoot(event.target.value)} placeholder="configured output root" />
+              </FilterField>
+              <FilterField label="Batch size">
+                <input value={batchSize} onChange={(event) => setBatchSize(event.target.value)} placeholder="configured default" inputMode="numeric" />
+              </FilterField>
+            </div>
+          </details>
         <ActionNotice message={message} />
-      </article>
+        </div>
+      </details>
       <ConfirmDialog
         open={packagingConfirmOpen}
-        title="Create final delivery batches?"
-        detail={`Package eligible clips from ${outputRoot || "the configured output root"}${batchSize ? ` in batches of ${batchSize}` : ""}.`}
-        confirmLabel="Create final delivery"
+        title="Retry export packaging?"
+        detail={`Reconcile actionable clips from ${outputRoot || "the configured output root"}${batchSize ? ` using batch size ${batchSize}` : ""}. Automatic packaging remains the normal workflow.`}
+        confirmLabel="Retry packaging"
         danger
         onClose={() => setPackagingConfirmOpen(false)}
         onConfirm={() => {
@@ -3334,12 +3361,12 @@ function ExportsPage({ jobs, refreshJobs }: { jobs?: ControlJobPage; refreshJobs
       <article className="panel">
         <div className="panel-head">
           <div>
-            <h2>Recent export jobs</h2>
-            <p>Packaging results and dry runs from the control job ledger.</p>
+            <h2>Recovery history</h2>
+            <p>Manual preflights and retry results from the control job ledger.</p>
           </div>
         </div>
         {exportJobs.length === 0 ? (
-          <EmptyState icon={Download} title="No export jobs yet" detail="Run a dry run first, then package final batches when ready." />
+          <EmptyState icon={RotateCcw} title="No recovery jobs yet" detail="Automatic packaging has not needed a manual preflight or retry." />
         ) : (
           <JobTable rows={exportJobs} selected="" setSelected={() => undefined} compact />
         )}
@@ -3352,7 +3379,7 @@ const zoomSteps: Array<VariationVariant["zoom_intensity"]> = ["none", "subtle", 
 const fallbackSubtitleSizes: Array<VariationVariant["subtitle_size"]> = ["small", "medium", "large"];
 
 function VariationsPage({ active }: { active: boolean }) {
-  const variations = usePolling("variations", () => getJson<VariationPageData>("/api/variations"), 30000, active);
+  const variations = useApiQuery<VariationPageData>("/api/variations", 30_000, active);
   const data = variations.envelope?.data;
   const normalizedServerProfile = useMemo(
     () => data?.profile ? normalizeUiProfile(data.profile) : null,
@@ -4245,12 +4272,17 @@ function JobsPage({ active }: { active: boolean }) {
   const [offset, setOffset] = useState(0);
   const [selected, setSelected] = useState(initialJob);
   const jobsPath = `/api/control/jobs${query({ limit: 50, offset, operation, status })}`;
-  const jobs = usePolling(`jobs-page:${jobsPath}`, () => getJson<ControlJobPage>(jobsPath), 5000, active);
-  const detail = usePolling(
-    `job-detail:${selected}`,
-    () => getJson<ControlJob>(`/api/control/jobs/${selected}`),
-    0,
+  const jobs = useApiQuery<ControlJobPage>(jobsPath, jobPollingInterval, active);
+  const detail = useApiQuery<ControlJob>(
+    `/api/control/jobs/${encodeURIComponent(selected)}?include_result=false`,
+    (job) => job && ["queued", "running"].includes(job.status) ? 2_000 : false,
     active && Boolean(selected),
+    { cache: false }
+  );
+  const resultPreview = useApiQuery<ControlJobResultPreview>(
+    `/api/control/jobs/${encodeURIComponent(selected)}/result-preview`,
+    false,
+    active && Boolean(selected) && Boolean(detail.envelope?.data.result_metadata?.available),
     { cache: false }
   );
   const rows = jobs.envelope?.data.jobs ?? [];
@@ -4279,7 +4311,15 @@ function JobsPage({ active }: { active: boolean }) {
       {jobs.error && <StateBlock kind="bad" title="Jobs read failed" detail={jobs.error} />}
       <JobTable rows={rows} selected={selected} setSelected={setSelected} />
       <Pagination total={jobs.envelope?.data.total ?? 0} limit={jobs.envelope?.data.limit ?? 50} offset={jobs.envelope?.data.offset ?? offset} setOffset={setOffset} />
-      <JobDetailDrawer job={detail.envelope?.data} loading={detail.loading && Boolean(selected)} error={detail.error} onClose={() => setSelected("")} />
+      <JobDetailDrawer
+        job={detail.envelope?.data}
+        loading={detail.loading && Boolean(selected)}
+        error={detail.error}
+        resultPreview={resultPreview.envelope?.data}
+        resultLoading={resultPreview.loading}
+        resultError={resultPreview.error}
+        onClose={() => setSelected("")}
+      />
     </section>
   );
 }
@@ -4335,20 +4375,30 @@ function JobDetailDrawer({
   job,
   loading,
   error,
+  resultPreview,
+  resultLoading,
+  resultError,
   onClose
 }: {
   job?: ControlJob;
   loading: boolean;
   error?: string;
+  resultPreview?: ControlJobResultPreview;
+  resultLoading: boolean;
+  resultError?: string;
   onClose: () => void;
 }) {
   const requestPreview = useMemo(
     () => job ? boundedJsonPreview(job.request) : undefined,
     [job?.request]
   );
-  const resultPreview = useMemo(
-    () => job ? boundedJsonPreview(job.result ?? null) : undefined,
-    [job?.result]
+  const renderedResultPreview = useMemo(
+    () => job?.result != null
+      ? boundedJsonPreview(job.result)
+      : resultPreview
+        ? { text: resultPreview.preview, truncated: resultPreview.truncated, circular: false }
+        : job ? boundedJsonPreview(null) : undefined,
+    [job?.result, resultPreview]
   );
   return (
     <Drawer open={Boolean(job) || loading || Boolean(error)} title={job ? operationLabel(job.operation) : "Job detail"} detail={job?.job_id} onClose={onClose}>
@@ -4362,6 +4412,13 @@ function JobDetailDrawer({
             <MetricCard label="Started" value={job.started_at ? "Yes" : "No"} hint={job.started_at || "-"} icon={Clock} />
             <MetricCard label="Finished" value={job.finished_at ? "Yes" : "No"} hint={job.finished_at || "-"} icon={CheckCircle2} />
           </div>
+          {job.result_metadata && (
+            <div className="detail-list">
+              <DetailItem label="Stored result" value={job.result_metadata.available ? "Available" : "Unavailable"} />
+              <DetailItem label="Result size" value={job.result_metadata.stored_bytes == null ? "-" : `${numberText(job.result_metadata.stored_bytes)} bytes`} />
+              <DetailItem label="Expires" value={job.result_metadata.expires_at || "-"} />
+            </div>
+          )}
           {job.error && <StateBlock kind="bad" title="Error" detail={job.error} />}
           <section className="drawer-section">
             <h3>Request</h3>
@@ -4374,11 +4431,19 @@ function JobDetailDrawer({
           </section>
           <section className="drawer-section">
             <h3>Result</h3>
-            <pre className="json-panel">{resultPreview?.text ?? "-"}</pre>
-            {resultPreview?.truncated && (
+            {resultLoading && <SkeletonLines count={2} />}
+            {resultError && <StateBlock kind="warn" title="Result preview unavailable" detail={resultError} />}
+            {!resultLoading && !resultError && <pre className="json-panel">{renderedResultPreview?.text ?? "-"}</pre>}
+            {renderedResultPreview?.truncated && (
               <p className="json-preview-note">
-                Preview truncated to protect the renderer{resultPreview.circular ? "; circular values were replaced" : ""}.
+                Preview truncated to protect the renderer{renderedResultPreview.circular ? "; circular values were replaced" : ""}.
               </p>
+            )}
+            {job.result_metadata?.available && (
+              <a className="secondary-button" href={`/api/control/jobs/${encodeURIComponent(job.job_id)}/result`}>
+                <Download size={16} aria-hidden="true" />
+                Download raw result
+              </a>
             )}
           </section>
         </>
@@ -4392,7 +4457,7 @@ function LogsPage({ active }: { active: boolean }) {
   const [search, setSearch] = useState("");
   const [follow, setFollow] = useState(true);
   const [wrap, setWrap] = useState(true);
-  const logs = usePolling(`logs:${lines}`, () => getJson<LogTail>(`/api/logs?lines=${lines}`), follow ? 2000 : 0, active);
+  const logs = useApiQuery<LogTail>(`/api/logs?lines=${lines}`, follow ? 2_000 : false, active);
   const visible = (logs.envelope?.data.lines ?? [])
     .map((line, sourceIndex) => ({ ...line, sourceIndex }))
     .filter((line) => !search || line.text.toLowerCase().includes(search.toLowerCase()));
@@ -4433,8 +4498,8 @@ function LogsPage({ active }: { active: boolean }) {
 }
 
 function SystemPage({ active }: { active: boolean }) {
-  const health = usePolling("health", () => getJson<HealthPayload>("/api/health"), 5000, active);
-  const system = usePolling("system-page", () => getJson<SystemStats>("/api/system"), 5000, active);
+  const health = useApiQuery<HealthPayload>("/api/health", 5_000, active);
+  const system = useApiQuery<SystemStats>("/api/system", 5_000, active);
   const data = system.envelope?.data;
   const [desktop, setDesktop] = useState<DesktopRuntimeStatus>();
   const [copyMessage, setCopyMessage] = useState("");
@@ -4559,8 +4624,8 @@ function settingDescription(entry: SettingsReadEntry): string {
   return entry.category === "queue" ? `${description} Applies on the next queue start.` : description;
 }
 
-function SettingsPage({ active, refreshJobs }: { active: boolean; refreshJobs: () => void }) {
-  const settings = usePolling("settings", () => getJson<SettingsReadSnapshot>("/api/settings/effective"), 30000, active);
+function SettingsPage({ active }: { active: boolean }) {
+  const settings = useApiQuery<SettingsReadSnapshot>("/api/settings/effective", 30_000, active);
   const groups = settings.envelope?.data.groups ?? {};
   const revision = settings.envelope?.data.revision ?? "";
   const entries = Object.values(groups).flat();
@@ -4603,8 +4668,8 @@ function SettingsPage({ active, refreshJobs }: { active: boolean; refreshJobs: (
     return raw;
   }
 
-  const invalidEntries = entries.filter(isInvalid);
-  const changedEntries = entries.filter((entry) => !isInvalid(entry) && String(parseEntry(entry)) !== String(entry.value ?? ""));
+  const invalidEntries = entries.filter((entry) => entry.editable !== false && isInvalid(entry));
+  const changedEntries = entries.filter((entry) => entry.editable !== false && !isInvalid(entry) && String(parseEntry(entry)) !== String(entry.value ?? ""));
   const restartRequiredChanges = changedEntries.filter(
     (entry) => entry.category === "queue" || ["WORKING_DIR", "QUEUE_INPUT_DIR", "QUEUE_STATE_FILE", "QUEUE_FOREVER_STATE_FILE", "QUEUE_CONTROL_FILE"].includes(entry.name)
   );
@@ -4644,7 +4709,7 @@ function SettingsPage({ active, refreshJobs }: { active: boolean; refreshJobs: (
         expected_revision: revision
       }),
       setMessage,
-      refreshJobs,
+      refreshJobQueries,
       [settings.refresh]
     );
   }
@@ -4653,7 +4718,7 @@ function SettingsPage({ active, refreshJobs }: { active: boolean; refreshJobs: (
     void submitMutation(
       () => sendJson<ControlJob>("DELETE", `/api/settings/overrides/${encodeURIComponent(name)}${query({ expected_revision: revision })}`),
       setMessage,
-      refreshJobs,
+      refreshJobQueries,
       [settings.refresh]
     );
   }
@@ -4716,18 +4781,19 @@ function SettingsPage({ active, refreshJobs }: { active: boolean; refreshJobs: (
             </div>
             <div className="settings-list">
               {groupEntries.map((entry) => (
-                <div className={`setting-row editable-setting ${isInvalid(entry) ? "invalid" : ""}`} key={entry.name}>
+                <div className={`setting-row editable-setting ${entry.editable !== false && isInvalid(entry) ? "invalid" : ""}`} key={entry.name}>
                   <div>
                     <strong>{settingLabel(entry.name)}</strong>
                     <span>{settingDescription(entry)}</span>
                     <code>{entry.name}</code>
                     <span>{entry.value_type} - {entry.source}</span>
+                    {entry.editable === false && <span>{entry.read_only_reason || "Managed by operator configuration; restart required after external changes."}</span>}
                     {(entry.minimum !== null || entry.maximum !== null) && (
                       <span>Bounds {entry.minimum ?? "-"} to {entry.maximum ?? "-"}</span>
                     )}
                   </div>
                   {entry.value_type === "bool" ? (
-                    <select value={draft[entry.name] ?? "false"} onChange={(event) => setDraft((current) => ({ ...current, [entry.name]: event.target.value }))}>
+                    <select disabled={entry.editable === false} value={draft[entry.name] ?? "false"} onChange={(event) => setDraft((current) => ({ ...current, [entry.name]: event.target.value }))}>
                       <option value="true">true</option>
                       <option value="false">false</option>
                     </select>
@@ -4737,11 +4803,12 @@ function SettingsPage({ active, refreshJobs }: { active: boolean; refreshJobs: (
                       min={entry.minimum ?? undefined}
                       max={entry.maximum ?? undefined}
                       step={entry.value_type === "int" ? 1 : entry.value_type === "float" ? "any" : undefined}
+                      disabled={entry.editable === false}
                       value={draft[entry.name] ?? ""}
                       onChange={(event) => setDraft((current) => ({ ...current, [entry.name]: event.target.value }))}
                     />
                   )}
-                  <button className="tiny-button" disabled={entry.source !== "settings_override"} onClick={() => setDeleteTarget(entry.name)}>
+                  <button className="tiny-button" disabled={entry.editable === false || entry.source !== "settings_override"} onClick={() => setDeleteTarget(entry.name)}>
                     Reset override
                   </button>
                 </div>
@@ -4764,33 +4831,25 @@ function SettingsPage({ active, refreshJobs }: { active: boolean; refreshJobs: (
 }
 
 function RoutedApp() {
-  const dashboard = usePolling("dashboard", () => getJson<DashboardSummary>("/api/dashboard"), 2000, true);
-  const system = usePolling("system", () => getJson<SystemStats>("/api/system"), 5000, true);
-  const jobs = usePolling("control-jobs", () => getJson<ControlJobPage>("/api/control/jobs?limit=12"), 2000, true);
-  const summary = dashboard.envelope?.data;
-
   return (
-    <AppShell
-      summary={summary}
-      system={system.envelope?.data}
-    >
+    <AppShell>
       <Routes>
         <Route path="/" element={<Navigate to="/overview" replace />} />
-        <Route path="/overview" element={<DashboardPage summary={summary} jobs={jobs.envelope?.data} loading={dashboard.loading} error={dashboard.error} warnings={dashboard.envelope?.warnings} />} />
+        <Route path="/overview" element={<DashboardPage />} />
         <Route path="/production" element={<Navigate to="/production/live" replace />} />
-        <Route path="/production/live" element={<OperationsPage summary={summary} system={system.envelope?.data} jobs={jobs.envelope?.data} loading={dashboard.loading} error={dashboard.error} warnings={dashboard.envelope?.warnings} refresh={dashboard.refresh} refreshJobs={jobs.refresh} />} />
-        <Route path="/production/queue" element={<QueuePage refreshJobs={jobs.refresh} />} />
+        <Route path="/production/live" element={<OperationsPage />} />
+        <Route path="/production/queue" element={<QueuePage />} />
         <Route path="/review" element={<Navigate to="/review/clips" replace />} />
-        <Route path="/review/clips" element={<ClipReviewPage active refreshJobs={jobs.refresh} />} />
-        <Route path="/review/compliance" element={<CompliancePage active refreshJobs={jobs.refresh} />} />
+        <Route path="/review/clips" element={<ClipReviewPage active />} />
+        <Route path="/review/compliance" element={<CompliancePage active />} />
         <Route path="/variants" element={<VariationsPage active />} />
-        <Route path="/modules" element={<ModulesPage active refreshJobs={jobs.refresh} />} />
-        <Route path="/deliveries" element={<ExportsPage jobs={jobs.envelope?.data} refreshJobs={jobs.refresh} />} />
+        <Route path="/modules" element={<ModulesPage active />} />
+        <Route path="/deliveries" element={<ExportsPage />} />
         <Route path="/activity" element={<Navigate to="/activity/jobs" replace />} />
         <Route path="/activity/jobs" element={<JobsPage active />} />
         <Route path="/activity/logs" element={<LogsPage active />} />
         <Route path="/settings" element={<Navigate to="/settings/configuration" replace />} />
-        <Route path="/settings/configuration" element={<SettingsPage active refreshJobs={jobs.refresh} />} />
+        <Route path="/settings/configuration" element={<SettingsPage active />} />
         <Route path="/settings/diagnostics" element={<SystemPage active />} />
         <Route path="/dashboard" element={<Navigate to="/overview" replace />} />
         <Route path="/operations" element={<Navigate to="/production/live" replace />} />
@@ -4804,7 +4863,7 @@ function RoutedApp() {
         <Route path="/system" element={<Navigate to="/settings/diagnostics" replace />} />
         <Route path="*" element={<Navigate to="/overview" replace />} />
       </Routes>
-      <JobTray jobs={jobs.envelope?.data} />
+      <JobTray />
     </AppShell>
   );
 }

@@ -1,10 +1,12 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
-from export_packager import package_export_batches
+from export_packager import _write_export_status, package_export_batches
 
 
 class ExportPackagerTest(unittest.TestCase):
@@ -492,8 +494,71 @@ class ExportPackagerTest(unittest.TestCase):
 
             self.assertEqual(first["packaged_count"], 2)
             self.assertEqual(second["packaged_count"], 0)
+            self.assertEqual(second["eligible_count"], 10)
+            self.assertEqual(second["actionable_count"], 0)
+            self.assertEqual(second["pending_count"], 0)
             self.assertEqual(len(package_items(root)), 2)
             self.assertEqual(len(list(root.glob("vod_01/export_ready/**/*.mp4"))), 10)
+            status = json.loads((root / "export_batches" / "_status.json").read_text(encoding="utf-8"))
+            self.assertEqual(status["status"], "completed")
+            self.assertEqual(status["pending_count"], 0)
+            self.assertEqual(status["packaged_total"], 2)
+
+    def test_dry_run_records_preflight_without_counting_planned_moves_as_packaged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_source(root, "vod_a", [{"clip_id": "clip_0001_v0_original", "score": 9.0}])
+
+            result = package_export_batches(root, cfg=make_cfg(), dry_run=True, trigger="manual")
+            status = json.loads((root / "export_batches" / "_status.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["actionable_count"], 1)
+            self.assertEqual(result["pending_count"], 1)
+            self.assertEqual(result["packaged_total"], 0)
+            self.assertEqual(status["status"], "preflight")
+            self.assertEqual(status["trigger"], "manual")
+            self.assertEqual(status["packaged_count"], 0)
+            self.assertEqual(status["pending_count"], 1)
+            self.assertTrue(next((root / "vod_a" / "export_ready").rglob("*.mp4")).exists())
+
+    def test_packager_exception_records_failed_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch("export_packager._package_export_batches_impl", side_effect=RuntimeError("boom")):
+                with self.assertRaisesRegex(RuntimeError, "boom"):
+                    package_export_batches(root, cfg=make_cfg(), trigger="automatic")
+
+            status = json.loads((root / "export_batches" / "_status.json").read_text(encoding="utf-8"))
+            self.assertEqual(status["status"], "failed")
+            self.assertEqual(status["error_count"], 1)
+            self.assertEqual(status["errors"], ["boom"])
+
+    def test_move_error_records_pending_and_completed_with_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_source(root, "vod_a", [{"clip_id": "clip_0001_v0_original", "score": 9.0}])
+            with mock.patch("export_packager.shutil.move", side_effect=OSError("locked")):
+                result = package_export_batches(root, cfg=make_cfg(), trigger="automatic")
+
+            status = json.loads((root / "export_batches" / "_status.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["actionable_count"], 1)
+            self.assertEqual(result["packaged_count"], 0)
+            self.assertEqual(result["pending_count"], 1)
+            self.assertEqual(status["status"], "completed_with_errors")
+            self.assertEqual(status["pending_count"], 1)
+            self.assertEqual(status["error_count"], 1)
+
+    def test_older_operation_cannot_overwrite_newer_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            status_path = Path(tmp) / "export_batches" / "_status.json"
+            newer = {"operation_id": "new", "started_at_ns": 2, "status": "running"}
+            older = {"operation_id": "old", "started_at_ns": 1, "status": "completed"}
+
+            self.assertTrue(_write_export_status(status_path, newer))
+            self.assertFalse(_write_export_status(status_path, older))
+            persisted = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["operation_id"], "new")
+            self.assertEqual(persisted["status"], "running")
 
     def test_vod_clip_rotation_freezes_legacy_batches_and_vods(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -543,6 +608,110 @@ class ExportPackagerTest(unittest.TestCase):
             self.assertEqual(batch_counts(source_dir), {"1": 2})
             self.assertFalse((source_dir / "export_ready" / "v0" / "clip_0001_v0_original_score9.mp4").exists())
 
+    def test_rejects_inconsistent_external_score_path_without_moving_anything(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_source(root, "vod_a", [{"clip_id": "clip_0001_v0_original", "score": 9.0}])
+            source_dir = root / "vod_a"
+            source = next((source_dir / "export_ready").rglob("*.mp4"))
+            outside = root / "outside.mp4"
+            outside.write_bytes(b"outside")
+            summary_path = source_dir / "scores_summary.json"
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            summary["clips"][0]["clip_path"] = str(outside.resolve())
+            summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+            result = package_export_batches(root, cfg=make_cfg())
+
+            self.assertEqual(result["packaged_count"], 0)
+            self.assertTrue(source.exists())
+            self.assertEqual(outside.read_bytes(), b"outside")
+            self.assertTrue((root / "export_batches" / "_status.json").exists())
+            self.assertFalse((root / "export_batches" / "_manifest.json").exists())
+
+    def test_textual_export_ready_traversal_is_not_authorized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_source(root, "vod_a", [{"clip_id": "clip_0001_v0_original", "score": 9.0}])
+            source_dir = root / "vod_a"
+            original_source = next((source_dir / "export_ready").rglob("*.mp4"))
+            outside = root / "outside.mp4"
+            outside.write_bytes(b"outside")
+            manifest_path = source_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest[0]["output_file"] = "export_ready/../../outside.mp4"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            summary_path = source_dir / "scores_summary.json"
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            summary["clips"][0]["output_file"] = "export_ready/../../outside.mp4"
+            summary["clips"][0]["clip_path"] = str(outside.resolve())
+            summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+            result = package_export_batches(root, cfg=make_cfg())
+
+            self.assertEqual(result["packaged_count"], 0)
+            self.assertTrue(original_source.exists())
+            self.assertEqual(outside.read_bytes(), b"outside")
+            self.assertTrue((root / "export_batches" / "_status.json").exists())
+            self.assertFalse((root / "export_batches" / "_manifest.json").exists())
+
+    def test_export_ready_symlink_escape_is_rejected_without_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_source(root, "vod_a", [{"clip_id": "clip_0001_v0_original", "score": 9.0}])
+            source = next((root / "vod_a" / "export_ready").rglob("*.mp4"))
+            outside_dir = root / "outside"
+            outside_dir.mkdir()
+            outside = outside_dir / source.name
+            outside.write_bytes(b"outside")
+            source.unlink()
+            source.parent.rmdir()
+            try:
+                _make_directory_link(outside_dir, source.parent)
+            except OSError as exc:
+                self.skipTest(f"directory links unavailable: {exc}")
+
+            result = package_export_batches(root, cfg=make_cfg())
+
+            self.assertEqual(result["packaged_count"], 0)
+            self.assertTrue(source.exists())
+            self.assertEqual(outside.read_bytes(), b"outside")
+            self.assertTrue((root / "export_batches" / "_status.json").exists())
+            self.assertFalse((root / "export_batches" / "_manifest.json").exists())
+
+    def test_canonical_in_root_parent_and_absolute_paths_are_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_source(
+                root,
+                "vod_a",
+                [
+                    {"clip_id": "clip_0001_v0_original", "score": 9.0},
+                    {"clip_id": "clip_0002_v0_original", "score": 8.0},
+                ],
+            )
+            source_dir = root / "vod_a"
+            manifest_path = source_dir / "manifest.json"
+            summary_path = source_dir / "scores_summary.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            first = Path(summary["clips"][0]["clip_path"])
+            first_relative = first.relative_to(source_dir).as_posix()
+            first_parts = Path(first_relative).parts
+            parent_relative = (Path(*first_parts[:-1]) / "unused" / ".." / first_parts[-1]).as_posix()
+            manifest[0]["output_file"] = parent_relative
+            summary["clips"][0]["output_file"] = parent_relative
+            second = Path(summary["clips"][1]["clip_path"]).resolve()
+            manifest[1]["output_file"] = str(second)
+            summary["clips"][1]["output_file"] = str(second)
+            summary["clips"][1]["clip_path"] = str(second)
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+            result = package_export_batches(root, cfg=make_cfg())
+
+            self.assertEqual(result["packaged_count"], 2)
+
 
 def make_cfg(one_variant: bool = False):
     return SimpleNamespace(
@@ -552,6 +721,17 @@ def make_cfg(one_variant: bool = False):
         EXPORT_BATCH_VARIANT_COUNT=6,
         EXPORT_PACK_ONE_VARIANT_PER_CLIP=one_variant,
     )
+
+
+def _make_directory_link(target: Path, link: Path) -> None:
+    try:
+        os.symlink(target, link, target_is_directory=True)
+    except OSError:
+        try:
+            import _winapi
+        except ImportError:
+            raise
+        _winapi.CreateJunction(str(target), str(link))
 
 
 def make_rotation_cfg():

@@ -7,8 +7,11 @@ const test = require("node:test");
 const {
   BACKEND_HOST,
   buildBackendCommand,
+  controlRequestHeaders,
+  desktopControlActor,
   desktopStartDirs,
   findProjectRoot,
+  generateControlToken,
   isAllowedNavigation,
   isProjectRoot,
   parseArgs,
@@ -101,6 +104,32 @@ test("navigation guard allows only the managed local backend origin", () => {
   assert.equal(isAllowedNavigation("http://127.0.0.1:5173/", 8765), false);
   assert.equal(isAllowedNavigation("https://127.0.0.1:8765/", 8765), false);
   assert.equal(isAllowedNavigation("https://example.com", 8765), false);
+});
+
+test("control token is strong, unique, and injected only for managed origin", () => {
+  const first = generateControlToken();
+  const second = generateControlToken();
+  assert.notEqual(first, second);
+  assert.ok(first.length >= 43);
+  assert.match(first, /^[A-Za-z0-9_-]+$/);
+
+  const allowed = controlRequestHeaders({
+    targetUrl: "http://127.0.0.1:8765/api/artifacts",
+    backendPort: 8765,
+    token: first,
+    headers: { Accept: "video/mp4" }
+  });
+  assert.equal(allowed.Authorization, `Bearer ${first}`);
+  assert.equal(allowed.Accept, "video/mp4");
+
+  const denied = controlRequestHeaders({
+    targetUrl: "https://example.com/api",
+    backendPort: 8765,
+    token: first,
+    headers: {}
+  });
+  assert.equal(denied.Authorization, undefined);
+  assert.equal(desktopControlActor("Jane User"), "desktop:Jane-User");
 });
 
 test("desktopStartDirs includes useful launch anchors", () => {

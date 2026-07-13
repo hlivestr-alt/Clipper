@@ -12,6 +12,31 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $FrontendDir = Join-Path $Root "new_app"
 
+function New-ControlToken {
+    $bytes = New-Object byte[] 32
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $rng.GetBytes($bytes)
+    }
+    finally {
+        $rng.Dispose()
+    }
+    return [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+}
+
+if ([string]::IsNullOrWhiteSpace($env:CLIPPER_CONTROL_TOKEN)) {
+    if ($FrontendOnly) {
+        throw "-FrontendOnly requires CLIPPER_CONTROL_TOKEN in the environment matching the running backend."
+    }
+    $env:CLIPPER_CONTROL_TOKEN = New-ControlToken
+}
+else {
+    $env:CLIPPER_CONTROL_TOKEN = $env:CLIPPER_CONTROL_TOKEN.Trim()
+}
+$ControlActor = "desktop:$($env:USERNAME)"
+$env:CLIPPER_CONTROL_ACTOR = $ControlActor
+$env:CLIPPER_MIGRATE_JOB_STORAGE = "1"
+
 if ($InstallFrontendDeps) {
     Push-Location $FrontendDir
     try {

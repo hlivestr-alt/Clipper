@@ -572,7 +572,8 @@ class VideoQueueSchedulingTests(unittest.TestCase):
 
             fake_export_packager = types.ModuleType("export_packager")
 
-            def fake_package_export_batches(output_root, cfg=None, batch_size=None):
+            def fake_package_export_batches(output_root, cfg=None, batch_size=None, trigger="direct"):
+                self.assertEqual(trigger, "automatic")
                 started.set()
                 if not release.wait(timeout=5.0):
                     raise RuntimeError("test timed out waiting for release")
@@ -685,7 +686,8 @@ class VideoQueueSchedulingTests(unittest.TestCase):
 
             fake_export_packager = types.ModuleType("export_packager")
 
-            def fake_package_export_batches(output_root, cfg=None, batch_size=None):
+            def fake_package_export_batches(output_root, cfg=None, batch_size=None, trigger="direct"):
+                self.assertEqual(trigger, "automatic")
                 nonlocal packaging_call_count
                 with packaging_call_lock:
                     packaging_call_count += 1

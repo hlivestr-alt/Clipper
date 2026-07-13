@@ -370,10 +370,107 @@ class ReadServiceTests(unittest.TestCase):
         library = self.service.module_library(limit=10, product="serum")
         self.assertEqual(library.data.total, 1)
         self.assertEqual(library.data.rows[0].module_id, "module_001")
+        self.assertNotIn("transcript_text", library.data.rows[0].model_dump())
         self.assertIn("approved", library.data.filter_options["quality_status"])
+
+        detail = self.service.module_detail("module_001")
+        self.assertEqual(detail.data.selected.module_id, "module_001")
+        self.assertEqual(detail.data.transcript_text, "serum intro")
 
         filtered = self.service.module_library(limit=10, quality_status="approved", visual_status="passed")
         self.assertEqual(filtered.data.total, 1)
+
+    def test_overview_is_compact_and_uses_cached_corpora(self):
+        status_path = self.output_root / "export_batches" / "_status.json"
+        status_path.parent.mkdir()
+        status_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "completed",
+                    "updated_at": "2026-06-02T12:05:00+08:00",
+                    "trigger": "automatic",
+                    "actionable_count": 3,
+                    "packaged_count": 2,
+                    "pending_count": 1,
+                    "packaged_total": 55,
+                    "error_count": 0,
+                    "batch_size": 15,
+                    "dry_run": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+        latest_export = {
+            "status": "completed",
+            "updated_at": "2026-06-02T12:00:00+08:00",
+            "result_summary": {
+                "eligible_count": 10,
+                "packaged_count": 4,
+                "batch_size": 2,
+                "dry_run": False,
+            },
+        }
+
+        with (
+            mock.patch.object(self.service, "_load_json_dict", wraps=self.service._load_json_dict) as loader,
+            mock.patch.object(
+                self.service,
+                "_score_records",
+                side_effect=AssertionError("Overview must not build the full score-row corpus"),
+            ),
+            mock.patch.object(
+                self.service,
+                "_compliance_records",
+                side_effect=AssertionError("Overview must not build compliance detail rows"),
+            ),
+        ):
+            first = self.service.overview(latest_export)
+            first_load_count = loader.call_count
+            second = self.service.overview(latest_export)
+
+        self.assertEqual(first.data.revision, second.data.revision)
+        self.assertEqual(loader.call_count, first_load_count)
+        self.assertLessEqual(len(first.data.top_clips), 5)
+        self.assertLessEqual(len(first.data.score_trend), 14)
+        self.assertTrue(first.data.export.available)
+        self.assertEqual(first.data.export.actionable, 3)
+        self.assertEqual(first.data.export.packaged_last_run, 2)
+        self.assertEqual(first.data.export.pending, 1)
+        self.assertEqual(first.data.export.packaged_total, 55)
+        self.assertEqual(first.data.export_ready_count, 1)
+        self.assertNotIn("raw", first.data.model_dump())
+
+    def test_overview_does_not_fall_back_to_scores_or_manual_job_without_status(self):
+        latest_export = {
+            "status": "completed",
+            "updated_at": "2026-06-02T12:00:00+08:00",
+            "result_summary": {"eligible_count": 12006, "packaged_count": 1},
+        }
+
+        result = self.service.overview(latest_export)
+
+        self.assertFalse(result.data.export.available)
+        self.assertEqual(result.data.export.pending, 0)
+        self.assertEqual(result.data.export_ready_count, 0)
+
+    def test_export_status_change_invalidates_overview_cache(self):
+        status_path = self.output_root / "export_batches" / "_status.json"
+        status_path.parent.mkdir()
+        status_path.write_text(
+            json.dumps({"status": "completed", "pending_count": 2, "actionable_count": 2}),
+            encoding="utf-8",
+        )
+        first = self.service.overview()
+        status_path.write_text(
+            json.dumps({"status": "completed", "pending_count": 0, "actionable_count": 0}),
+            encoding="utf-8",
+        )
+
+        second = self.service.overview()
+
+        self.assertNotEqual(first.data.revision, second.data.revision)
+        self.assertEqual(second.data.export.pending, 0)
 
     def test_settings_logs_and_artifact_safety(self):
         settings = self.service.settings_snapshot()

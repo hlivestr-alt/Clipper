@@ -1,3 +1,5 @@
+import { invalidateApiDataForMutation } from "./queryClient";
+
 export type SourceSignature = {
   path: string;
   exists: boolean;
@@ -242,6 +244,11 @@ export type ModuleLibraryRow = {
   visual_product_confidence_max?: number;
   visual_validation_reason?: string;
   file_artifact?: ArtifactRef | null;
+  transcript_text?: string;
+};
+
+export type ModuleDetail = {
+  selected?: ModuleLibraryRow | null;
   transcript_text: string;
 };
 
@@ -270,6 +277,8 @@ export type SettingsReadEntry = {
   category: string;
   minimum?: number | null;
   maximum?: number | null;
+  editable?: boolean;
+  read_only_reason?: string | null;
 };
 
 export type SettingsReadSnapshot = {
@@ -455,11 +464,32 @@ export type ControlJob = {
   error?: string | null;
   conflict_key?: string | null;
   actor: string;
+  result_metadata?: ControlJobResultMetadata | null;
+};
+
+export type ControlJobResultMetadata = {
+  available: boolean;
+  truncated: boolean;
+  original_bytes?: number | null;
+  stored_bytes?: number | null;
+  expires_at?: string | null;
+};
+
+export type ControlJobResultPreview = {
+  job_id?: string;
+  preview: string;
+  truncated: boolean;
+  original_bytes?: number | null;
+  stored_bytes?: number | null;
+  expires_at?: string | null;
 };
 
 export type ControlJobResultSummary = {
   eligible_count?: number | null;
+  actionable_count?: number | null;
   packaged_count?: number | null;
+  pending_count?: number | null;
+  packaged_total?: number | null;
   batch_size?: number | null;
   dry_run?: boolean | null;
 };
@@ -483,15 +513,85 @@ export type ControlJobPage = {
   total: number;
   limit: number;
   offset: number;
+  active_count?: number;
 };
 
-export async function getJson<T>(path: string): Promise<ApiEnvelope<T>> {
-  const response = await fetch(path, { method: "GET" });
-  if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(`${response.status} ${response.statusText}: ${detail}`);
+export type OverviewTopClip = {
+  score_key: string;
+  clip_id: string;
+  source_video?: string;
+  product: string;
+  total_score?: number | null;
+  status?: string;
+  scored_at: string;
+  source_date: string;
+  artifact?: ArtifactRef | null;
+};
+
+export type OverviewScoreTrendPoint = {
+  date: string;
+  average_score: number;
+  scored_count: number;
+};
+
+export type OverviewData = {
+  revision: string;
+  queue_active: boolean;
+  scored_count: number;
+  average_score?: number | null;
+  export_ready_count: number;
+  score_trend: OverviewScoreTrendPoint[];
+  top_clips: OverviewTopClip[];
+  compliance: {
+    scanned: number;
+    passed: number;
+    blocked: number;
+    rate: number;
+  };
+  export: {
+    available: boolean;
+    actionable: number;
+    ready: number;
+    packaged_last_run: number;
+    packaged: number;
+    pending: number;
+    packaged_total: number;
+    error_count: number;
+    batch_size?: number | null;
+    progress: number;
+    status: string;
+    updated_at: string;
+    trigger: string;
+    dry_run: boolean;
+  };
+};
+
+export type RequestOptions = {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+};
+
+export async function getJson<T>(path: string, options: RequestOptions = {}): Promise<ApiEnvelope<T>> {
+  const controller = new AbortController();
+  const timeoutMs = options.timeoutMs ?? 30_000;
+  const abortFromCaller = () => controller.abort(options.signal?.reason);
+  if (options.signal?.aborted) {
+    abortFromCaller();
+  } else {
+    options.signal?.addEventListener("abort", abortFromCaller, { once: true });
   }
-  return (await response.json()) as ApiEnvelope<T>;
+  const timeout = window.setTimeout(() => controller.abort(new DOMException("Request timed out", "TimeoutError")), timeoutMs);
+  try {
+    const response = await fetch(path, { method: "GET", signal: controller.signal });
+    if (!response.ok) {
+      const detail = await response.text();
+      throw new Error(`${response.status} ${response.statusText}: ${detail}`);
+    }
+    return (await response.json()) as ApiEnvelope<T>;
+  } finally {
+    window.clearTimeout(timeout);
+    options.signal?.removeEventListener("abort", abortFromCaller);
+  }
 }
 
 export async function sendJson<T>(
@@ -508,7 +608,9 @@ export async function sendJson<T>(
     const detail = await response.text();
     throw new Error(`${response.status} ${response.statusText}: ${detail}`);
   }
-  return (await response.json()) as ApiEnvelope<T>;
+  const envelope = (await response.json()) as ApiEnvelope<T>;
+  void invalidateApiDataForMutation(path);
+  return envelope;
 }
 
 export function query(params: Record<string, string | number | undefined | null>): string {

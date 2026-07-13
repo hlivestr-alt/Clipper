@@ -861,6 +861,41 @@ tbody tr:hover td {
   gap: 14px;
 }
 
+.delivery-status-panel,
+.delivery-recovery-content {
+  display: grid;
+  gap: 16px;
+}
+
+.delivery-status-stats {
+  grid-template-columns: 1fr;
+  gap: 0;
+}
+
+.delivery-recovery-panel > summary,
+.delivery-advanced-options > summary {
+  color: var(--strong);
+  cursor: pointer;
+  font-weight: 720;
+}
+
+.delivery-recovery-panel[open] > summary {
+  margin-bottom: 16px;
+}
+
+.delivery-recovery-actions {
+  justify-content: space-between;
+}
+
+.delivery-advanced-options {
+  padding-top: 12px;
+  border-top: 1px solid var(--panel-hairline);
+}
+
+.delivery-advanced-options[open] > summary {
+  margin-bottom: 12px;
+}
+
 .clip-review-page {
   position: relative;
   gap: 12px;
@@ -3543,6 +3578,10 @@ input::placeholder {
 }
 
 @media (max-width: 1099px) {
+  .delivery-status-stats {
+    grid-template-columns: 1fr;
+  }
+
   .app-shell {
     grid-template-columns: 1fr;
   }
@@ -3607,6 +3646,10 @@ input::placeholder {
 }
 
 @media (max-width: 760px) {
+  .delivery-status-stats {
+    grid-template-columns: 1fr;
+  }
+
   .main-panel,
   .side-rail {
     padding: 14px;

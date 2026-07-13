@@ -6,9 +6,12 @@ const path = require("node:path");
 const {
   BACKEND_HOST,
   buildBackendCommand,
+  controlRequestHeaders,
+  desktopControlActor,
   desktopStartDirs,
   findProjectRoot,
   getFreePort,
+  generateControlToken,
   isAllowedNavigation,
   parseArgs,
   portableRestartCommand,
@@ -233,6 +236,9 @@ function startBackend(runtime) {
     env: {
       ...process.env,
       CLIPPER_DESKTOP: "1",
+      CLIPPER_CONTROL_TOKEN: runtime.controlToken,
+      CLIPPER_CONTROL_ACTOR: runtime.controlActor,
+      CLIPPER_MIGRATE_JOB_STORAGE: "1",
       PYTHONUNBUFFERED: "1"
     },
     windowsHide: true
@@ -328,6 +334,20 @@ async function createMainWindow(runtime) {
     }
   });
   setupNavigationGuard(mainWindow, runtime.backendPort);
+  const managedOrigin = `http://${BACKEND_HOST}:${runtime.backendPort}`;
+  mainWindow.webContents.session.webRequest.onBeforeSendHeaders(
+    { urls: [`${managedOrigin}/*`] },
+    (details, callback) => {
+      callback({
+        requestHeaders: controlRequestHeaders({
+          targetUrl: details.url,
+          backendPort: runtime.backendPort,
+          token: runtime.controlToken,
+          headers: details.requestHeaders
+        })
+      });
+    }
+  );
   mainWindow.once("ready-to-show", () => {
     if (mainWindow) {
       mainWindow.show();
@@ -355,7 +375,11 @@ function stopBackend() {
 }
 
 async function bootstrap() {
-  const runtime = await resolveRuntime();
+  const runtime = {
+    ...(await resolveRuntime()),
+    controlToken: generateControlToken(),
+    controlActor: desktopControlActor()
+  };
   const commandText = startBackend(runtime);
   try {
     await waitForHealth(runtime.backendPort);

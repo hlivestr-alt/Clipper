@@ -40,6 +40,8 @@ from clipper_app.contracts.control_models import (
     ControlAuditEntry,
     ControlJob,
     ControlJobPage,
+    ControlJobResultMetadata,
+    ControlJobResultPreview,
     ControlJobResultSummary,
     ControlJobStatus,
     ControlJobSummary,

@@ -246,7 +246,6 @@ class ModuleLibraryRow(StrictReadModel):
     visual_product_confidence_max: float = Field(default=0.0, ge=0)
     visual_validation_reason: str = ""
     file_artifact: ArtifactRef | None = None
-    transcript_text: str = ""
 
 
 class ModuleLibraryPage(StrictReadModel):
@@ -258,6 +257,63 @@ class ModuleLibraryPage(StrictReadModel):
     filter_options: dict[str, tuple[str, ...]] = Field(default_factory=dict)
 
 
+class ModuleDetail(StrictReadModel):
+    selected: ModuleLibraryRow | None = None
+    transcript_text: str = ""
+
+
+class OverviewScoreTrendPoint(StrictReadModel):
+    date: str
+    average_score: float = Field(ge=0, le=10)
+    scored_count: int = Field(ge=0)
+
+
+class OverviewTopClip(StrictReadModel):
+    score_key: str
+    clip_id: str = ""
+    product: str = "general"
+    total_score: float | None = None
+    scored_at: str = ""
+    source_date: str = ""
+    artifact: ArtifactRef | None = None
+
+
+class OverviewCompliance(StrictReadModel):
+    scanned: int = Field(default=0, ge=0)
+    passed: int = Field(default=0, ge=0)
+    blocked: int = Field(default=0, ge=0)
+    rate: float = Field(default=0.0, ge=0, le=100)
+
+
+class OverviewExport(StrictReadModel):
+    available: bool = False
+    actionable: int = Field(default=0, ge=0)
+    ready: int = Field(default=0, ge=0)
+    packaged_last_run: int = Field(default=0, ge=0)
+    packaged: int = Field(default=0, ge=0)
+    pending: int = Field(default=0, ge=0)
+    packaged_total: int = Field(default=0, ge=0)
+    error_count: int = Field(default=0, ge=0)
+    batch_size: int = Field(default=0, ge=0)
+    progress: int = Field(default=0, ge=0, le=100)
+    status: str = ""
+    updated_at: str = ""
+    trigger: str = ""
+    dry_run: bool = False
+
+
+class OverviewSummary(StrictReadModel):
+    revision: str
+    queue_active: bool = False
+    scored_count: int = Field(default=0, ge=0)
+    average_score: float | None = Field(default=None, ge=0, le=10)
+    export_ready_count: int = Field(default=0, ge=0)
+    score_trend: tuple[OverviewScoreTrendPoint, ...] = ()
+    top_clips: tuple[OverviewTopClip, ...] = ()
+    compliance: OverviewCompliance = Field(default_factory=OverviewCompliance)
+    export: OverviewExport = Field(default_factory=OverviewExport)
+
+
 class SettingsReadEntry(StrictReadModel):
     name: str
     value: bool | int | float | str | None
@@ -266,6 +322,8 @@ class SettingsReadEntry(StrictReadModel):
     category: str
     minimum: float | None = None
     maximum: float | None = None
+    editable: bool = True
+    read_only_reason: str = ""
 
 
 class SettingsReadSnapshot(StrictReadModel):

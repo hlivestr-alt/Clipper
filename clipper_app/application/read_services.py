@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import subprocess
+import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -12,7 +13,8 @@ from typing import Any, Iterable, Literal
 from urllib.parse import quote
 
 from clipper_app.application.log_tail import reverse_tail
-from clipper_app.application.settings import LegacyConfigProvider, SETTINGS_REGISTRY
+from clipper_app.application.read_cache import ReadCache
+from clipper_app.application.settings import BROWSER_EDITABLE_SETTINGS, LegacyConfigProvider, SETTINGS_REGISTRY
 from clipper_app.contracts.read_models import (
     ArtifactRef,
     ComplianceIndexPage,
@@ -23,8 +25,14 @@ from clipper_app.contracts.read_models import (
     LogTail,
     ModuleLibraryPage,
     ModuleLibraryRow,
+    ModuleDetail,
     ModuleReadiness,
     ModuleReadinessRow,
+    OverviewCompliance,
+    OverviewExport,
+    OverviewScoreTrendPoint,
+    OverviewSummary,
+    OverviewTopClip,
     QueueDetail,
     QueueRunRow,
     QueueVodFile,
@@ -78,6 +86,40 @@ class ScoreRecord:
     row: ScoreRow
     raw: dict[str, Any]
     base_raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _OverviewScoreCandidate:
+    score_key: str
+    clip_id: str
+    product: str
+    total_score: float
+    scored_at: str
+    source_date: str
+    sort_timestamp: str
+    output_dir: Path
+    artifact_value: Any
+
+
+@dataclass(frozen=True)
+class _OverviewScoreCorpus:
+    scored_count: int
+    score_total: float
+    score_value_count: int
+    compliance_blocked_count: int
+    trend: tuple[OverviewScoreTrendPoint, ...]
+    top_clips: tuple[OverviewTopClip, ...]
+    signatures: tuple[SourceSignature, ...]
+    warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _OverviewComplianceCorpus:
+    scanned: int
+    passed: int
+    blocked: int
+    signatures: tuple[SourceSignature, ...]
+    warnings: tuple[str, ...]
 
 
 def parse_timestamp(value: Any) -> datetime | None:
@@ -174,10 +216,33 @@ class ReadDashboardService:
     def __init__(self, settings_provider: LegacyConfigProvider | None = None) -> None:
         self.settings_provider = settings_provider or LegacyConfigProvider()
         self.cfg = self.settings_provider.live_view()
+        self._cache = ReadCache(max_entries=96)
+
+    def invalidate(self, *domains: str) -> None:
+        """Invalidate cached read corpora after a successful mutation."""
+        aliases = {
+            "queue": ("queue", "dashboard", "output_dirs", "scores", "compliance", "overview"),
+            "settings": ("settings", "dashboard", "queue", "modules", "overview"),
+            "scores": ("scores", "overview"),
+            "compliance": ("compliance", "overview"),
+            "modules": ("modules",),
+            "outputs": ("output_dirs", "scores", "compliance", "overview"),
+            "system": ("system",),
+            "overview": ("overview",),
+        }
+        prefixes: list[str] = []
+        for domain in domains:
+            prefixes.extend(aliases.get(domain, (domain,)))
+        self._cache.invalidate(*prefixes)
 
     def dashboard(self, state_path: str | None = None) -> ReadServiceResult:
         state, signature, warnings = self._read_queue_state(state_path)
-        summary = self._build_dashboard_summary(state, signature.path)
+        revision = self._signature_key(signature)
+        summary = self._cache.get_or_load(
+            "dashboard",
+            revision,
+            lambda: self._build_dashboard_summary(state, signature.path),
+        )
         return ReadServiceResult(summary, (signature,), tuple(warnings))
 
     def queue_detail(self, state_path: str | None = None) -> ReadServiceResult:
@@ -186,28 +251,31 @@ class ReadDashboardService:
         supervisor, supervisor_signature, supervisor_warnings = self._read_queue_forever()
         warnings.extend(control_warnings)
         warnings.extend(supervisor_warnings)
-        active_launch = self._normalized_launch_config(state.get("launch_config"))
-        stored_launch = self._normalized_launch_config(control.get("launch_config"))
-        launch = active_launch or stored_launch
-        rows = self._queue_rows(state)
-        videos = [self._aggregate_video_entry(video) for video in self._state_videos(state)]
-        stage_waiting = self._stage_waiting_counts(state, videos)
-        waiting_videos = self._waiting_video_count(state, videos)
-        data = QueueDetail(
-            state_path=signature.path,
-            updated_at=str(state.get("updated_at") or "") or None,
-            queue_status=str(state.get("queue_status") or "unknown"),
-            queue_health=self._queue_health(state),
-            control_status=self._effective_control_status(control, supervisor, launch),
-            launch_config=launch,
-            active_launch_config=active_launch,
-            stored_launch_config=stored_launch,
-            launch_summary=self._launch_summary(launch),
-            stage_waiting=stage_waiting,
-            waiting_videos=waiting_videos,
-            stage_admission_limit=self._stage_admission_limit(state),
-            rows=tuple(rows),
-        )
+        revision = tuple(self._signature_key(item) for item in (signature, control_signature, supervisor_signature))
+
+        def build() -> QueueDetail:
+            active_launch = self._normalized_launch_config(state.get("launch_config"))
+            stored_launch = self._normalized_launch_config(control.get("launch_config"))
+            launch = active_launch or stored_launch
+            rows = self._queue_rows(state)
+            videos = [self._aggregate_video_entry(video) for video in self._state_videos(state)]
+            return QueueDetail(
+                state_path=signature.path,
+                updated_at=str(state.get("updated_at") or "") or None,
+                queue_status=str(state.get("queue_status") or "unknown"),
+                queue_health=self._queue_health(state),
+                control_status=self._effective_control_status(control, supervisor, launch),
+                launch_config=launch,
+                active_launch_config=active_launch,
+                stored_launch_config=stored_launch,
+                launch_summary=self._launch_summary(launch),
+                stage_waiting=self._stage_waiting_counts(state, videos),
+                waiting_videos=self._waiting_video_count(state, videos),
+                stage_admission_limit=self._stage_admission_limit(state),
+                rows=tuple(rows),
+            )
+
+        data = self._cache.get_or_load("queue:detail", revision, build)
         return ReadServiceResult(data, (signature, control_signature, supervisor_signature), tuple(warnings))
 
     def queue_vods(self) -> ReadServiceResult:
@@ -361,6 +429,285 @@ class ReadDashboardService:
         )
         return ReadServiceResult(data, tuple(signatures), tuple(warnings))
 
+    def overview(self, latest_export: Any | None = None) -> ReadServiceResult:
+        del latest_export
+        score_corpus = self._overview_score_corpus()
+        compliance_corpus = self._overview_compliance_corpus()
+        queue_state, queue_signature, queue_warnings = self._read_queue_state(None)
+        export_status_path = self._export_status_path()
+        export_signature = self._source_signature(export_status_path)
+
+        def load_export_status() -> tuple[dict[str, Any], tuple[str, ...]]:
+            status_warnings: list[str] = []
+            payload = self._load_json_dict(export_status_path, status_warnings, optional=True)
+            return payload, tuple(status_warnings)
+
+        export_payload, export_warnings = self._cache.get_or_load(
+            "overview:export-status",
+            self._signature_key(export_signature),
+            load_export_status,
+        )
+
+        revision_source = [
+            *(str(self._signature_key(signature)) for signature in score_corpus.signatures),
+            *(str(self._signature_key(signature)) for signature in compliance_corpus.signatures),
+            str(self._signature_key(queue_signature)),
+            str(self._signature_key(export_signature)),
+        ]
+        revision = hashlib.sha256("|".join(revision_source).encode("utf-8")).hexdigest()
+        cached = self._cache.get("overview", revision)
+        if cached is not None:
+            return cached
+
+        scanned = compliance_corpus.scanned
+        passed = compliance_corpus.passed
+        blocked = compliance_corpus.blocked
+        if scanned == 0 and score_corpus.scored_count:
+            scanned = score_corpus.scored_count
+            blocked = score_corpus.compliance_blocked_count
+            passed = scanned - blocked
+
+        actionable = as_nonnegative_int(export_payload.get("actionable_count"))
+        packaged = as_nonnegative_int(export_payload.get("packaged_count"))
+        batch_size = as_nonnegative_int(export_payload.get("batch_size"))
+        pending = as_nonnegative_int(export_payload.get("pending_count"))
+        packaged_total = as_nonnegative_int(export_payload.get("packaged_total"))
+        available = bool(export_signature.exists and export_payload.get("pending_count") is not None)
+        queue_status = str(queue_state.get("queue_status") or "").casefold()
+        queue_active = queue_status in {"running", "processing", "starting", "queued", "pausing", "stopping"}
+
+        warnings = list(dict.fromkeys([
+            *score_corpus.warnings,
+            *compliance_corpus.warnings,
+            *queue_warnings,
+            *export_warnings,
+        ]))
+        if len(warnings) > 20:
+            omitted = len(warnings) - 19
+            warnings = [*warnings[:19], f"{omitted} additional warning(s) omitted."]
+        data = OverviewSummary(
+            revision=revision,
+            queue_active=queue_active,
+            scored_count=score_corpus.scored_count,
+            average_score=(
+                round(score_corpus.score_total / score_corpus.score_value_count, 3)
+                if score_corpus.score_value_count
+                else None
+            ),
+            export_ready_count=pending if available else 0,
+            score_trend=score_corpus.trend,
+            top_clips=score_corpus.top_clips,
+            compliance=OverviewCompliance(
+                scanned=scanned,
+                passed=passed,
+                blocked=blocked,
+                rate=round((passed / scanned) * 100.0, 3) if scanned else 0.0,
+            ),
+            export=OverviewExport(
+                available=available,
+                actionable=actionable,
+                ready=actionable,
+                packaged_last_run=packaged,
+                packaged=packaged,
+                pending=pending,
+                packaged_total=packaged_total,
+                error_count=as_nonnegative_int(export_payload.get("error_count")),
+                batch_size=batch_size,
+                progress=round((packaged / actionable) * 100) if actionable else 0,
+                status=str(export_payload.get("status") or ""),
+                updated_at=str(export_payload.get("updated_at") or ""),
+                trigger=str(export_payload.get("trigger") or ""),
+                dry_run=bool(export_payload.get("dry_run")),
+            ),
+        )
+        signatures = tuple([
+            queue_signature,
+            export_signature,
+            *score_corpus.signatures[:4],
+            *compliance_corpus.signatures[:4],
+        ])
+        result = ReadServiceResult(data, signatures, tuple(warnings))
+        return self._cache.set("overview", revision, result)
+
+    def _overview_score_corpus(self) -> _OverviewScoreCorpus:
+        output_dirs = self._collect_output_dirs()
+        signatures = tuple(
+            self._source_signature(Path(output_dir) / "scores_summary.json")
+            for output_dir in output_dirs
+        )
+        revision = tuple(self._signature_key(signature) for signature in signatures)
+
+        def load() -> _OverviewScoreCorpus:
+            warnings: list[str] = []
+            scored_count = 0
+            score_total = 0.0
+            score_value_count = 0
+            compliance_blocked_count = 0
+            trend_groups: dict[str, tuple[float, int]] = {}
+            candidates: list[_OverviewScoreCandidate] = []
+            earliest = (datetime.now().astimezone() - timedelta(days=13)).date()
+
+            def add_candidate(
+                *,
+                identity: dict[str, Any],
+                clip_id: Any,
+                product: str,
+                total_score: float | None,
+                scored_at: str,
+                source_date: str,
+                blocked: bool,
+                output_dir: Path,
+                artifact_value: Any,
+            ) -> None:
+                nonlocal scored_count, score_total, score_value_count
+                nonlocal compliance_blocked_count
+                scored_count += 1
+                if blocked:
+                    compliance_blocked_count += 1
+                if total_score is None:
+                    return
+                score_total += total_score
+                score_value_count += 1
+                parsed = parse_timestamp(scored_at or source_date)
+                if parsed is not None and parsed.date() >= earliest:
+                    key = parsed.date().isoformat()
+                    running_total, count = trend_groups.get(key, (0.0, 0))
+                    trend_groups[key] = (running_total + total_score, count + 1)
+                candidates.append(
+                    _OverviewScoreCandidate(
+                        score_key=build_score_key(identity),
+                        clip_id=str(clip_id or ""),
+                        product=product,
+                        total_score=total_score,
+                        scored_at=scored_at,
+                        source_date=source_date,
+                        sort_timestamp=scored_at,
+                        output_dir=output_dir,
+                        artifact_value=artifact_value,
+                    )
+                )
+
+            for output_dir, signature in zip(output_dirs, signatures):
+                payload = self._load_json_dict(Path(signature.path), warnings, optional=True)
+                if not payload:
+                    continue
+                folder = Path(output_dir)
+                source_video, _run_tag = split_output_folder_name(folder.name)
+                source_date = source_date_from_source_video(source_video)
+                for group in self._score_groups_from_summary(payload):
+                    product = str(group.get("product", "general") or "general")
+                    total_score = score_float(group.get("total_score"))
+                    scored_at = str(group.get("scored_at") or "")
+                    blocked = bool(group.get("compliance_blocked", False))
+                    base_clip_id = group.get("base_clip_id") or group.get("clip_id")
+                    artifact_value = group.get("representative_clip_path") or group.get(
+                        "representative_output_file"
+                    )
+                    add_candidate(
+                        identity={"clip_id": base_clip_id, "clip_path": artifact_value},
+                        clip_id=base_clip_id,
+                        product=product,
+                        total_score=total_score,
+                        scored_at=scored_at,
+                        source_date=source_date,
+                        blocked=blocked,
+                        output_dir=folder,
+                        artifact_value=artifact_value,
+                    )
+                    variants = group.get("variants", [])
+                    if not isinstance(variants, list):
+                        continue
+                    for variant in (item for item in variants if isinstance(item, dict)):
+                        variant_artifact = variant.get("clip_path") or variant.get("output_file")
+                        add_candidate(
+                            identity=variant,
+                            clip_id=variant.get("clip_id"),
+                            product=product,
+                            total_score=total_score,
+                            scored_at=str(variant.get("scored_at") or scored_at),
+                            source_date=source_date,
+                            blocked=bool(variant.get("compliance_blocked", blocked)),
+                            output_dir=folder,
+                            artifact_value=variant_artifact,
+                        )
+
+            trend = tuple(
+                OverviewScoreTrendPoint(
+                    date=key,
+                    average_score=round(total / count, 3),
+                    scored_count=count,
+                )
+                for key, (total, count) in sorted(trend_groups.items())[-14:]
+                if count
+            )
+            newest_first = sorted(
+                candidates,
+                key=lambda candidate: parse_timestamp(candidate.sort_timestamp) or MIN_SORT_TIMESTAMP,
+                reverse=True,
+            )
+            top_candidates = sorted(
+                newest_first,
+                key=lambda candidate: candidate.total_score,
+                reverse=True,
+            )[:5]
+            top_clips = tuple(
+                OverviewTopClip(
+                    score_key=candidate.score_key,
+                    clip_id=candidate.clip_id,
+                    product=candidate.product,
+                    total_score=candidate.total_score,
+                    scored_at=candidate.scored_at,
+                    source_date=candidate.source_date,
+                    artifact=self._artifact_for_output(
+                        candidate.output_dir,
+                        candidate.artifact_value,
+                    ),
+                )
+                for candidate in top_candidates
+            )
+            return _OverviewScoreCorpus(
+                scored_count=scored_count,
+                score_total=score_total,
+                score_value_count=score_value_count,
+                compliance_blocked_count=compliance_blocked_count,
+                trend=trend,
+                top_clips=top_clips,
+                signatures=signatures,
+                warnings=tuple(warnings),
+            )
+
+        return self._cache.get_or_load("scores:overview", revision, load)
+
+    def _overview_compliance_corpus(self) -> _OverviewComplianceCorpus:
+        output_dirs = self._collect_output_dirs()
+        signatures = tuple(
+            self._source_signature(Path(output_dir) / "manifest.json")
+            for output_dir in output_dirs
+        )
+        revision = tuple(self._signature_key(signature) for signature in signatures)
+
+        def load() -> _OverviewComplianceCorpus:
+            warnings: list[str] = []
+            scanned = passed = blocked = 0
+            for signature in signatures:
+                for row in self._manifest_rows(Path(signature.path), warnings):
+                    if not self._manifest_row_has_compliance_fields(row):
+                        continue
+                    scanned += 1
+                    if bool(row.get("compliance_passed", False)):
+                        passed += 1
+                    if bool(row.get("compliance_blocked", False)):
+                        blocked += 1
+            return _OverviewComplianceCorpus(
+                scanned=scanned,
+                passed=passed,
+                blocked=blocked,
+                signatures=signatures,
+                warnings=tuple(warnings),
+            )
+
+        return self._cache.get_or_load("compliance:overview", revision, load)
+
     def module_readiness(self) -> ReadServiceResult:
         index_payload, signature, warnings = self._module_index_payload()
         modules = index_payload.get("modules", []) if isinstance(index_payload, dict) else []
@@ -369,6 +716,10 @@ class ReadDashboardService:
         min_main = int(getattr(self.cfg, "MODULAR_ASSEMBLY_READY_MIN_MAIN", 3) or 3)
         min_cta = int(getattr(self.cfg, "MODULAR_ASSEMBLY_READY_MIN_CTA", 3) or 3)
         min_events = max(1, int(getattr(self.cfg, "MODULE_ASSEMBLY_ZOOM_READY_MIN_EVENTS", 1) or 1))
+        revision = (self._signature_key(signature), min_hook, min_main, min_cta, min_events)
+        cached = self._cache.get("modules:readiness", revision)
+        if cached is not None:
+            return cached
         role_counts = {product: {role: 0 for role in MODULE_ROLES} for product, _label in MODULE_PRODUCTS}
         visual_counts = {
             product: {
@@ -431,7 +782,11 @@ class ReadDashboardService:
             thresholds={"hook": min_hook, "main": min_main, "cta": min_cta, "zoom_ready_events": min_events},
             rows=tuple(rows),
         )
-        return ReadServiceResult(data, (signature,), tuple(warnings))
+        return self._cache.set(
+            "modules:readiness",
+            revision,
+            ReadServiceResult(data, (signature,), tuple(warnings)),
+        )
 
     def module_library(
         self,
@@ -448,9 +803,7 @@ class ReadDashboardService:
         direction: Literal["asc", "desc"] = "asc",
     ) -> ReadServiceResult:
         limit, offset = self._bounded_page(limit, offset)
-        index_payload, signature, warnings = self._module_index_payload()
-        modules = index_payload.get("modules", []) if isinstance(index_payload, dict) else []
-        rows = [self._module_row(module) for module in modules if isinstance(module, dict)]
+        rows, modules_by_id, signature, warnings = self._module_corpus()
         filter_options = {
             "product": tuple(sorted({row.product for row in rows if row.product})),
             "source_date": tuple(sorted({row.source_date for row in rows if row.source_date})),
@@ -469,7 +822,11 @@ class ReadDashboardService:
         )
         rows = self._sort_module_rows(rows, sort=sort, direction=direction)
         total = len(rows)
-        page = rows[offset : offset + limit]
+        page = [
+            self._module_row(modules_by_id[row.module_id], include_artifact=True)
+            if row.module_id in modules_by_id else row
+            for row in rows[offset : offset + limit]
+        ]
         data = ModuleLibraryPage(
             library_dir=str(self._module_library_dir()),
             rows=tuple(page),
@@ -477,6 +834,17 @@ class ReadDashboardService:
             limit=limit,
             offset=offset,
             filter_options=filter_options,
+        )
+        return ReadServiceResult(data, (signature,), tuple(warnings))
+
+    def module_detail(self, module_id: str) -> ReadServiceResult:
+        _rows, modules_by_id, signature, warnings = self._module_corpus()
+        module = modules_by_id.get(str(module_id))
+        if module is None:
+            return ReadServiceResult(ModuleDetail(), (signature,), tuple(warnings))
+        data = ModuleDetail(
+            selected=self._module_row(module, include_artifact=True),
+            transcript_text=str(module.get("transcript_text") or ""),
         )
         return ReadServiceResult(data, (signature,), tuple(warnings))
 
@@ -496,13 +864,17 @@ class ReadDashboardService:
                 category=definition.category,
                 minimum=definition.minimum,
                 maximum=definition.maximum,
+                editable=name in BROWSER_EDITABLE_SETTINGS,
+                read_only_reason="" if name in BROWSER_EDITABLE_SETTINGS else "Operator-managed; restart required.",
             )
             groups.setdefault(definition.category, []).append(read_entry)
         data = SettingsReadSnapshot(
             revision=snapshot.revision,
             groups={key: tuple(value) for key, value in sorted(groups.items())},
         )
-        return ReadServiceResult(data)
+        overrides_path = getattr(self.settings_provider, "overrides_path", None)
+        signatures = (self._source_signature(Path(overrides_path)),) if overrides_path is not None else ()
+        return ReadServiceResult(data, signatures)
 
     def log_tail(self, path: str | None = None, *, lines: int = 200) -> ReadServiceResult:
         lines = max(1, min(int(lines or 200), 1000))
@@ -546,6 +918,10 @@ class ReadDashboardService:
         return ReadServiceResult(data, (signature,), warnings)
 
     def system_stats(self) -> ReadServiceResult:
+        bucket = int(time.monotonic() // 2)
+        return self._cache.get_or_load("system", bucket, self._build_system_stats, max_age=2.0)
+
+    def _build_system_stats(self) -> ReadServiceResult:
         warnings: list[str] = []
         try:
             import psutil  # type: ignore
@@ -581,12 +957,16 @@ class ReadDashboardService:
             raise PermissionError("Invalid artifact path.")
         path = Path(requested_path)
         if not path.is_absolute():
-            path = (Path.cwd() / path).resolve()
-        else:
-            path = path.resolve()
+            raise PermissionError("Artifact paths must be absolute.")
+        path = path.resolve()
         allowed = [root for root in self._allowed_artifact_roots() if root.exists()]
         if not any(self._is_relative_to(path, root) for root in allowed):
             raise PermissionError("Artifact path is outside configured read roots.")
+        if path.suffix.casefold() not in {
+            ".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi",
+            ".jpg", ".jpeg", ".png", ".webp", ".gif",
+        }:
+            raise PermissionError("Artifact type is not allowed.")
         if not path.exists() or not path.is_file():
             raise FileNotFoundError(str(path))
         return ResolvedArtifact(path=path, media_type=self._media_type(path))
@@ -599,13 +979,22 @@ class ReadDashboardService:
         signature = self._source_signature(path)
         if not path.exists():
             return {"schema_version": 2, "videos": {}, "updated_at": None}, signature, [f"State file not found: {path}"]
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            return {"schema_version": 2, "videos": {}, "updated_at": None}, signature, [f"Failed to read state file: {exc}"]
-        if not isinstance(payload, dict):
-            return {"schema_version": 2, "videos": {}, "updated_at": None}, signature, ["Queue state JSON was not an object."]
-        return payload, signature, []
+
+        def load() -> tuple[dict[str, Any], tuple[str, ...]]:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                return {"schema_version": 2, "videos": {}, "updated_at": None}, (f"Failed to read state file: {exc}",)
+            if not isinstance(payload, dict):
+                return {"schema_version": 2, "videos": {}, "updated_at": None}, ("Queue state JSON was not an object.",)
+            return payload, ()
+
+        payload, cached_warnings = self._cache.get_or_load(
+            f"queue:state:{signature.path}",
+            self._signature_key(signature),
+            load,
+        )
+        return payload, signature, list(cached_warnings)
 
     def _read_queue_control(self) -> tuple[dict[str, Any], SourceSignature, list[str]]:
         path = Path(str(getattr(self.cfg, "QUEUE_CONTROL_FILE", Path(getattr(self.cfg, "WORKING_DIR", "working")) / "queue_control.json")))
@@ -615,13 +1004,22 @@ class ReadDashboardService:
         signature = self._source_signature(path)
         if not path.exists():
             return {}, signature, []
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            return {}, signature, [f"Failed to read queue control file: {exc}"]
-        if not isinstance(payload, dict):
-            return {}, signature, ["Queue control JSON was not an object."]
-        return payload, signature, []
+
+        def load() -> tuple[dict[str, Any], tuple[str, ...]]:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                return {}, (f"Failed to read queue control file: {exc}",)
+            if not isinstance(payload, dict):
+                return {}, ("Queue control JSON was not an object.",)
+            return payload, ()
+
+        payload, cached_warnings = self._cache.get_or_load(
+            f"queue:control:{signature.path}",
+            self._signature_key(signature),
+            load,
+        )
+        return payload, signature, list(cached_warnings)
 
     def _read_queue_forever(self) -> tuple[dict[str, Any], SourceSignature, list[str]]:
         path = Path(str(getattr(self.cfg, "QUEUE_FOREVER_STATE_FILE", Path(getattr(self.cfg, "WORKING_DIR", "working")) / "queue_forever_state.json")))
@@ -631,13 +1029,22 @@ class ReadDashboardService:
         signature = self._source_signature(path)
         if not path.exists():
             return {}, signature, []
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            return {}, signature, [f"Failed to read queue supervisor state file: {exc}"]
-        if not isinstance(payload, dict):
-            return {}, signature, ["Queue supervisor state JSON was not an object."]
-        return payload, signature, []
+
+        def load() -> tuple[dict[str, Any], tuple[str, ...]]:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                return {}, (f"Failed to read queue supervisor state file: {exc}",)
+            if not isinstance(payload, dict):
+                return {}, ("Queue supervisor state JSON was not an object.",)
+            return payload, ()
+
+        payload, cached_warnings = self._cache.get_or_load(
+            f"queue:supervisor:{signature.path}",
+            self._signature_key(signature),
+            load,
+        )
+        return payload, signature, list(cached_warnings)
 
     @staticmethod
     def _effective_control_status(
@@ -981,20 +1388,26 @@ class ReadDashboardService:
     def _score_records(self) -> tuple[list[ScoreRecord], list[SourceSignature], list[str], ScoreStats]:
         output_dirs = self._collect_output_dirs()
         signatures = [self._source_signature(Path(output_dir) / "scores_summary.json") for output_dir in output_dirs]
-        warnings: list[str] = []
-        records: list[ScoreRecord] = []
-        stats = self._empty_score_stats()
-        for output_dir, signature in zip(output_dirs, signatures):
-            payload = self._load_json_dict(Path(signature.path), warnings, optional=True)
-            if not payload:
-                continue
-            self._accumulate_score_stats(stats, payload)
-            folder = Path(output_dir)
-            source_video, run_tag = split_output_folder_name(folder.name)
-            for group in self._score_groups_from_summary(payload):
-                records.extend(self._score_records_from_group(group, folder, source_video, run_tag))
-        records.sort(key=lambda record: parse_timestamp(record.row.sort_timestamp) or MIN_SORT_TIMESTAMP, reverse=True)
-        return records, signatures, warnings, stats
+        revision = tuple(self._signature_key(signature) for signature in signatures)
+
+        def load() -> tuple[tuple[ScoreRecord, ...], tuple[SourceSignature, ...], tuple[str, ...], ScoreStats]:
+            warnings: list[str] = []
+            records: list[ScoreRecord] = []
+            stats = self._empty_score_stats()
+            for output_dir, signature in zip(output_dirs, signatures):
+                payload = self._load_json_dict(Path(signature.path), warnings, optional=True)
+                if not payload:
+                    continue
+                self._accumulate_score_stats(stats, payload)
+                folder = Path(output_dir)
+                source_video, run_tag = split_output_folder_name(folder.name)
+                for group in self._score_groups_from_summary(payload):
+                    records.extend(self._score_records_from_group(group, folder, source_video, run_tag))
+            records.sort(key=lambda record: parse_timestamp(record.row.sort_timestamp) or MIN_SORT_TIMESTAMP, reverse=True)
+            return tuple(records), tuple(signatures), tuple(warnings), stats
+
+        records, cached_signatures, warnings, stats = self._cache.get_or_load("scores:corpus", revision, load)
+        return list(records), list(cached_signatures), list(warnings), stats
 
     def _score_records_from_group(
         self,
@@ -1248,21 +1661,30 @@ class ReadDashboardService:
     ) -> tuple[list[ComplianceRow], list[ComplianceViolationRow], list[SourceSignature], list[str]]:
         dirs = output_dirs or self._collect_output_dirs()
         deep = output_dirs is not None
+        manifest_signatures = [self._source_signature(Path(output_dir) / "manifest.json") for output_dir in dirs]
+        revision = tuple(self._signature_key(signature) for signature in manifest_signatures)
+        cache_key = "compliance:global" if not deep else f"compliance:detail:{'|'.join(dirs)}"
+        cached = self._cache.get(cache_key, revision, max_age=10.0 if deep else None)
+        if cached is not None:
+            cached_rows, cached_violations, cached_signatures, cached_warnings = cached
+            return list(cached_rows), list(cached_violations), list(cached_signatures), list(cached_warnings)
         warnings: list[str] = []
-        signatures: list[SourceSignature] = []
+        signatures: list[SourceSignature] = list(manifest_signatures)
         rows: list[ComplianceRow] = []
         violations: list[ComplianceViolationRow] = []
-        for output_dir in dirs:
+        for output_dir, manifest_signature in zip(dirs, manifest_signatures):
             folder = Path(output_dir)
             manifest = folder / "manifest.json"
-            manifest_signature = self._source_signature(manifest)
-            signatures.append(manifest_signature)
             source_video, run_tag = split_output_folder_name(folder.name)
             seen_compliance_files: set[str] = set()
             for manifest_row in self._manifest_rows(manifest, warnings):
                 if not deep and not self._manifest_row_has_compliance_fields(manifest_row):
                     continue
-                compliance_path = self._resolve_compliance_path(folder, manifest_row)
+                # The global index and Overview use only the fields already
+                # denormalized into manifest rows. Resolving every sidecar here
+                # performs thousands of filesystem probes without reading it;
+                # reserve that work for the explicit detail endpoint.
+                compliance_path = self._resolve_compliance_path(folder, manifest_row) if deep else None
                 result = self._load_json_dict(compliance_path, warnings, optional=True) if deep and compliance_path else {}
                 if deep and compliance_path:
                     signatures.append(self._source_signature(compliance_path))
@@ -1295,6 +1717,11 @@ class ReadDashboardService:
                         violations.append(self._violation_row(row, violation))
         rows.sort(key=lambda row: parse_timestamp(row.checked_at) or MIN_SORT_TIMESTAMP, reverse=True)
         violations.sort(key=lambda row: parse_timestamp(row.checked_at) or MIN_SORT_TIMESTAMP, reverse=True)
+        self._cache.set(
+            cache_key,
+            revision,
+            (tuple(rows), tuple(violations), tuple(signatures), tuple(warnings)),
+        )
         return rows, violations, signatures, warnings
 
     def _manifest_row_has_compliance_fields(self, row: dict[str, Any]) -> bool:
@@ -1456,17 +1883,49 @@ class ReadDashboardService:
     def _module_index_payload(self) -> tuple[dict[str, Any], SourceSignature, list[str]]:
         path = self._module_library_dir() / "index.json"
         signature = self._source_signature(path)
-        warnings: list[str] = []
-        payload = self._load_json_dict(path, warnings, optional=True)
-        if not signature.exists:
-            warnings.append(f"No module index found at {path}")
-        modules = payload.get("modules", []) if isinstance(payload, dict) else []
-        if modules is not None and not isinstance(modules, list):
-            warnings.append("Module index 'modules' field was not a list.")
-            payload["modules"] = []
-        return payload, signature, warnings
 
-    def _module_row(self, module: dict[str, Any]) -> ModuleLibraryRow:
+        def load() -> tuple[dict[str, Any], tuple[str, ...]]:
+            warnings: list[str] = []
+            payload = self._load_json_dict(path, warnings, optional=True)
+            if not signature.exists:
+                warnings.append(f"No module index found at {path}")
+            modules = payload.get("modules", []) if isinstance(payload, dict) else []
+            if modules is not None and not isinstance(modules, list):
+                warnings.append("Module index 'modules' field was not a list.")
+                payload["modules"] = []
+            return payload, tuple(warnings)
+
+        payload, warnings = self._cache.get_or_load(
+            "modules:index",
+            self._signature_key(signature),
+            load,
+        )
+        return payload, signature, list(warnings)
+
+    def _module_corpus(
+        self,
+    ) -> tuple[list[ModuleLibraryRow], dict[str, dict[str, Any]], SourceSignature, list[str]]:
+        payload, signature, warnings = self._module_index_payload()
+
+        def load() -> tuple[tuple[ModuleLibraryRow, ...], dict[str, dict[str, Any]]]:
+            rows: list[ModuleLibraryRow] = []
+            modules_by_id: dict[str, dict[str, Any]] = {}
+            for module in payload.get("modules", []) if isinstance(payload, dict) else []:
+                if not isinstance(module, dict):
+                    continue
+                row = self._module_row(module, include_artifact=False)
+                rows.append(row)
+                modules_by_id[row.module_id] = module
+            return tuple(rows), modules_by_id
+
+        rows, modules_by_id = self._cache.get_or_load(
+            "modules:corpus",
+            self._signature_key(signature),
+            load,
+        )
+        return list(rows), modules_by_id, signature, warnings
+
+    def _module_row(self, module: dict[str, Any], *, include_artifact: bool = False) -> ModuleLibraryRow:
         product_key = str(module.get("product") or "")
         file_path = str(module.get("file_path") or "")
         return ModuleLibraryRow(
@@ -1485,8 +1944,7 @@ class ReadDashboardService:
             visual_product_hits=as_nonnegative_int(module.get("visual_product_hits")),
             visual_product_confidence_max=round(score_float(module.get("visual_product_confidence_max")) or 0.0, 3),
             visual_validation_reason=str(module.get("visual_validation_reason") or ""),
-            file_artifact=self._artifact_for_output(self._module_library_dir(), file_path),
-            transcript_text=str(module.get("transcript_text") or ""),
+            file_artifact=self._artifact_for_output(self._module_library_dir(), file_path) if include_artifact else None,
         )
 
     def _filter_module_rows(
@@ -1557,8 +2015,8 @@ class ReadDashboardService:
             return len(modules)
 
     def _collect_output_dirs(self) -> tuple[str, ...]:
-        output_dirs: dict[str, Path] = {}
         max_dirs = max(1, int(getattr(self.cfg, "READ_APP_MAX_OUTPUT_DIRS", 200) or 200))
+        output_dirs: dict[str, Path] = {}
 
         def add_output_dir(value: Any) -> None:
             raw = str(value or "").strip()
@@ -1574,22 +2032,44 @@ class ReadDashboardService:
                 if not isinstance(run, dict) or not run.get("output_dir"):
                     continue
                 add_output_dir(run["output_dir"])
+
         root = self._output_root()
-        if root.exists():
+        root_signature = self._source_signature(root)
+
+        def scan_root() -> tuple[str, ...]:
+            discovered: list[Path] = []
+            if not root.exists():
+                return ()
             try:
-                folders = [folder for folder in root.iterdir() if folder.is_dir()]
-                for folder in folders:
-                    if not folder.is_dir():
-                        continue
-                    if not (
-                        (folder / "scores_summary.json").exists()
-                        or (folder / "manifest.json").exists()
-                        or (folder / "compliance").exists()
-                    ):
-                        continue
-                    add_output_dir(folder)
+                with os.scandir(root) as entries:
+                    for entry in entries:
+                        try:
+                            if not entry.is_dir(follow_symlinks=False):
+                                continue
+                        except OSError:
+                            continue
+                        folder = Path(entry.path)
+                        if not (
+                            (folder / "scores_summary.json").exists()
+                            or (folder / "manifest.json").exists()
+                            or (folder / "compliance").exists()
+                        ):
+                            continue
+                        discovered.append(folder)
             except OSError:
-                pass
+                return ()
+            discovered.sort(key=self._safe_mtime_ns, reverse=True)
+            return tuple(str(path) for path in discovered[:max_dirs])
+
+        discovered = self._cache.get_or_load(
+            f"output_dirs:{root_signature.path}:{max_dirs}",
+            self._signature_key(root_signature),
+            scan_root,
+            max_age=30.0,
+        )
+        for folder in discovered:
+            add_output_dir(folder)
+
         sorted_dirs = sorted(output_dirs.values(), key=lambda path: self._safe_mtime_ns(path), reverse=True)
         return tuple(str(path) for path in sorted_dirs[:max_dirs])
 
@@ -1633,7 +2113,16 @@ class ReadDashboardService:
                 if not optional:
                     warnings.append(f"Missing JSON file: {path}")
                 return None
-            return json.loads(path.read_text(encoding="utf-8"))
+            for attempt in range(2):
+                before = self._source_signature(path)
+                text = path.read_text(encoding="utf-8")
+                after = self._source_signature(path)
+                if self._signature_key(before) == self._signature_key(after):
+                    return json.loads(text)
+                if attempt == 0:
+                    continue
+                warnings.append(f"Could not read stable snapshot of {path}; file changed during read.")
+                return None
         except Exception as exc:
             warnings.append(f"Could not read {path}: {exc}")
             return None
@@ -1650,23 +2139,34 @@ class ReadDashboardService:
             return SourceSignature(path=normalized, exists=False)
         return SourceSignature(path=normalized, exists=True, mtime_ns=int(stat.st_mtime_ns), size=int(stat.st_size))
 
+    @staticmethod
+    def _signature_key(signature: SourceSignature) -> tuple[str, bool, int, int]:
+        return (signature.path, signature.exists, signature.mtime_ns, signature.size)
+
     def _default_state_path(self) -> Path:
         return Path(getattr(self.cfg, "QUEUE_STATE_FILE", Path(getattr(self.cfg, "WORKING_DIR", "working")) / "video_queue_state.json"))
 
     def _output_root(self) -> Path:
         return Path(getattr(self.cfg, "OUTPUT_DIR", r"D:\output_clips")).resolve()
 
+    def _export_status_path(self) -> Path:
+        batch_dir_name = str(getattr(self.cfg, "EXPORT_BATCH_DIR_NAME", "export_batches") or "export_batches")
+        return self._output_root() / batch_dir_name / "_status.json"
+
     def _module_library_dir(self) -> Path:
         return Path(getattr(self.cfg, "MODULE_LIBRARY_DIR", r"D:\proya_modules")).resolve()
 
     def _allowed_artifact_roots(self) -> tuple[Path, ...]:
+        working_dir = Path(getattr(self.cfg, "WORKING_DIR", "working"))
+        product_broll = Path(getattr(self.cfg, "PRODUCT_BROLL_DIR", "assets/product_broll"))
         roots = [
             Path(getattr(self.cfg, "OUTPUT_DIR", r"D:\output_clips")),
-            Path(getattr(self.cfg, "WORKING_DIR", "working")),
             Path(getattr(self.cfg, "MODULE_LIBRARY_DIR", r"D:\proya_modules")),
+            product_broll,
+            working_dir / "variation_previews",
             Path.cwd() / "assets" / "variation_preview",
         ]
-        return tuple(root.resolve() for root in roots)
+        return tuple((Path.cwd() / root if not root.is_absolute() else root).resolve() for root in roots)
 
     def _is_relative_to(self, path: Path, root: Path) -> bool:
         try:

@@ -964,6 +964,7 @@ def _apply_compliance(job: dict[str, Any], cfg) -> dict[str, Any] | None:
             apply_compliance_to_hook_payload,
             apply_compliance_to_words,
             check_compliance,
+            compliance_output_root_for_clip,
             compliance_path_for_clip,
             should_block_result,
             write_compliance_result,
@@ -978,8 +979,9 @@ def _apply_compliance(job: dict[str, Any], cfg) -> dict[str, Any] | None:
         hook_payload = job["moment"].get("hook_overlay", {})
         result = check_compliance(job.get("clip_words") or [], job.get("product", "general"), hook_text=hook_payload, cfg=cfg)
         result["blocked"] = should_block_result(result, cfg)
+        compliance_root = compliance_output_root_for_clip(job["output_path"])
         compliance_path = compliance_path_for_clip(job["output_path"], job["clip_id"])
-        write_compliance_result(compliance_path, result)
+        write_compliance_result(compliance_path, result, output_root=compliance_root)
         job["compliance_result"] = result
         job["compliance_json_path"] = str(compliance_path)
     except Exception as exc:

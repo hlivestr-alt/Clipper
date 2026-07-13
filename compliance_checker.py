@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from clipper_app.path_safety import UnsafePathError, resolve_within_root
 from utils import _parse_json_object, lm_studio_openai_chat_kwargs
 
 log = logging.getLogger("proya.compliance_checker")
@@ -736,8 +737,22 @@ def should_block_result(result: dict[str, Any], cfg=None) -> bool:
 
 def compliance_path_for_clip(output_path: str | Path, clip_id: str) -> Path:
     output = Path(output_path)
-    safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(clip_id or output.stem)).strip("_")
-    return _sidecar_output_root(output) / COMPLIANCE_OUTPUT_DIR_NAME / f"{safe_id}_compliance.json"
+    output_root = compliance_output_root_for_clip(output)
+    return _compliance_path_for_run(output_root, clip_id or output.stem)
+
+
+def compliance_output_root_for_clip(output_path: str | Path) -> Path:
+    """Return the canonical run root used for a rendered clip's sidecars."""
+
+    return _sidecar_output_root(Path(output_path)).resolve(strict=False)
+
+
+def _compliance_path_for_run(output_root: Path, clip_id: str) -> Path:
+    safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(clip_id or "clip")).strip("._") or "clip"
+    return resolve_within_root(
+        output_root,
+        Path(COMPLIANCE_OUTPUT_DIR_NAME) / f"{safe_id}_compliance.json",
+    )
 
 
 def _sidecar_output_root(output_path: Path) -> Path:
@@ -751,9 +766,17 @@ def _sidecar_output_root(output_path: Path) -> Path:
     return parent
 
 
-def write_compliance_result(path: str | Path, result: dict[str, Any]) -> Path:
+def write_compliance_result(
+    path: str | Path,
+    result: dict[str, Any],
+    *,
+    output_root: str | Path,
+) -> Path:
     target = Path(path)
+    declared_root = Path(output_root).resolve(strict=False)
+    target = resolve_within_root(declared_root, target)
     target.parent.mkdir(parents=True, exist_ok=True)
+    target = resolve_within_root(declared_root, target)
     _write_json_atomic(target, result)
     return target
 
@@ -778,8 +801,8 @@ def scan_output_dir(
     if cfg is None:
         import config as cfg  # type: ignore
 
-    output_root = Path(output_dir)
-    manifest_path = output_root / "manifest.json"
+    output_root = Path(output_dir).resolve(strict=False)
+    manifest_path = resolve_within_root(output_root, "manifest.json")
     if not manifest_path.exists():
         raise FileNotFoundError(f"Manifest not found: {manifest_path}")
 
@@ -804,12 +827,18 @@ def scan_output_dir(
     auto_fixed = 0
     violation_total = 0
 
+    scan_rows: list[tuple[dict[str, Any], Path]] = []
     for row in manifest:
-        if not isinstance(row, dict):
-            continue
+        if isinstance(row, dict):
+            clip_id = str(row.get("clip_id") or "")
+            scan_rows.append((row, _compliance_path_for_run(output_root, clip_id)))
+
+    # Validate the complete write set before the first sidecar is persisted.
+    for _row, compliance_path in scan_rows:
+        resolve_within_root(output_root, compliance_path)
+
+    for row, compliance_path in scan_rows:
         clip_id = str(row.get("clip_id") or "")
-        output_file = str(row.get("output_file") or f"{clip_id}.mp4")
-        compliance_path = compliance_path_for_clip(output_root / output_file, clip_id)
         if compliance_path.exists() and not force:
             result = json.loads(compliance_path.read_text(encoding="utf-8"))
         else:
@@ -822,7 +851,7 @@ def scan_output_dir(
                 cfg=cfg,
             )
             result["blocked"] = should_block_result(result, cfg)
-            write_compliance_result(compliance_path, result)
+            write_compliance_result(compliance_path, result, output_root=output_root)
         relative_path = _relative_to_output(compliance_path, output_root)
         attach_result_to_manifest_row(row, result, relative_path)
         if result.get("blocked"):
@@ -833,6 +862,7 @@ def scan_output_dir(
         auto_fixed += 1 if result.get("auto_fixed") else 0
         violation_total += int(result.get("violation_count") or 0)
 
+    manifest_path = resolve_within_root(output_root, manifest_path, kind="file")
     _write_json_atomic(manifest_path, manifest)
     update_scores_summary_with_compliance(output_root, manifest)
     return {
@@ -847,8 +877,12 @@ def scan_output_dir(
 
 
 def update_scores_summary_with_compliance(output_dir: str | Path, manifest: list[dict[str, Any]]) -> None:
-    output_root = Path(output_dir)
-    summary_path = output_root / "scores_summary.json"
+    output_root = Path(output_dir).resolve(strict=False)
+    try:
+        summary_path = resolve_within_root(output_root, "scores_summary.json")
+    except (OSError, UnsafePathError) as exc:
+        log.warning("Could not validate scores summary path in %s: %s", output_root, exc)
+        return
     if not summary_path.exists():
         return
     try:
@@ -892,6 +926,7 @@ def update_scores_summary_with_compliance(output_dir: str | Path, manifest: list
                     attach(variant, manifest_by_clip.get(str(variant.get("clip_id"))))
 
     payload["compliance"] = summarize_manifest_compliance(manifest)
+    summary_path = resolve_within_root(output_root, summary_path, kind="file")
     _write_json_atomic(summary_path, payload)
 
 
@@ -1253,8 +1288,12 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 
 def _write_json_atomic(path: Path, payload: Any) -> None:
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    root = path.parent.resolve(strict=False)
+    path = resolve_within_root(root, path)
+    tmp_path = resolve_within_root(root, path.with_suffix(path.suffix + ".tmp"))
     tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path = resolve_within_root(root, tmp_path, kind="file")
+    path = resolve_within_root(root, path)
     tmp_path.replace(path)
 
 

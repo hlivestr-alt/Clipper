@@ -390,6 +390,7 @@ def _prepare_job_compliance(job: dict, clip_words: list, cfg) -> dict | None:
         from compliance_checker import (
             apply_compliance_to_hook_payload,
             check_compliance,
+            compliance_output_root_for_clip,
             compliance_path_for_clip,
             should_block_result,
             write_compliance_result,
@@ -418,8 +419,9 @@ def _prepare_job_compliance(job: dict, clip_words: list, cfg) -> dict | None:
                 job["moment"]["hook_overlay"] = patched_hook
                 job["moment"]["hook"] = patched_hook.get("headline", job["moment"].get("hook", ""))
                 job["hook_payload"] = patched_hook
+        compliance_root = compliance_output_root_for_clip(job["output_path"])
         compliance_path = compliance_path_for_clip(job["output_path"], job["clip_id"])
-        write_compliance_result(compliance_path, result)
+        write_compliance_result(compliance_path, result, output_root=compliance_root)
         job["compliance_result"] = result
         job["compliance_json_path"] = _relative_to_output_path(compliance_path, Path(job["output_path"]))
     except Exception as exc:
@@ -1668,7 +1670,12 @@ def _run_export_batch_packaging(
                 raise TimeoutError(
                     f"another export batch packaging job is still running after {lock_timeout:.0f}s"
                 )
-        result = package_export_batches(output_root, cfg=cfg, batch_size=batch_size)
+        result = package_export_batches(
+            output_root,
+            cfg=cfg,
+            batch_size=batch_size,
+            trigger="automatic",
+        )
     except Exception as exc:
         if queue_continues:
             log.warning("Export batch packaging failed: %s — queue continues", exc)
@@ -3379,6 +3386,7 @@ def main():
             cfg=cfg,
             batch_size=args.batch_size,
             dry_run=args.dry_run,
+            trigger="cli",
         )
         log.info("Export batch packaging complete:")
         log.info("  Output root: %s", result.get("output_root"))

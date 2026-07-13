@@ -29,7 +29,26 @@ class ControlOperation(StrEnum):
     MODULE_REVIEW = "module_review"
 
 
+class ControlJobResultSummary(StrictModel):
+    eligible_count: int | None = Field(default=None, ge=0)
+    actionable_count: int | None = Field(default=None, ge=0)
+    packaged_count: int | None = Field(default=None, ge=0)
+    pending_count: int | None = Field(default=None, ge=0)
+    packaged_total: int | None = Field(default=None, ge=0)
+    batch_size: int | None = Field(default=None, ge=0)
+    dry_run: bool | None = None
+
+
+class ControlJobResultMetadata(StrictModel):
+    available: bool = False
+    truncated: bool = False
+    original_bytes: int = Field(default=0, ge=0)
+    stored_bytes: int = Field(default=0, ge=0)
+    expires_at: str | None = None
+
+
 class ControlJob(StrictModel):
+    schema_version: int = Field(default=2, ge=1)
     job_id: str
     operation: ControlOperation
     status: ControlJobStatus
@@ -39,16 +58,11 @@ class ControlJob(StrictModel):
     finished_at: str | None = None
     request: dict[str, Any] = Field(default_factory=dict)
     result: dict[str, Any] | None = None
+    result_summary: ControlJobResultSummary | None = None
+    result_metadata: ControlJobResultMetadata = Field(default_factory=ControlJobResultMetadata)
     error: str | None = None
     conflict_key: str | None = None
     actor: str = "operator"
-
-
-class ControlJobResultSummary(StrictModel):
-    eligible_count: int | None = Field(default=None, ge=0)
-    packaged_count: int | None = Field(default=None, ge=0)
-    batch_size: int | None = Field(default=None, ge=0)
-    dry_run: bool | None = None
 
 
 class ControlJobSummary(StrictModel):
@@ -65,11 +79,20 @@ class ControlJobSummary(StrictModel):
     actor: str = "operator"
 
 
+class ControlJobResultPreview(StrictModel):
+    job_id: str
+    preview: str
+    truncated: bool = False
+    original_bytes: int = Field(default=0, ge=0)
+    stored_bytes: int = Field(default=0, ge=0)
+
+
 class ControlJobPage(StrictModel):
     jobs: tuple[ControlJobSummary, ...] = ()
     total: int = Field(default=0, ge=0)
     limit: int = Field(ge=1)
     offset: int = Field(ge=0)
+    active_count: int = Field(default=0, ge=0)
 
 
 class ControlAuditEntry(StrictModel):
@@ -85,35 +108,28 @@ class ControlAuditEntry(StrictModel):
 class QueueControlRequest(StrictModel):
     action: QueueAction
     launch_config: QueueLaunchConfig | None = None
-    actor: str = "operator"
 
 
 class SettingsOverrideWriteRequest(StrictModel):
     overrides: dict[str, bool | int | float | str | None] = Field(default_factory=dict)
     expected_revision: str | None = None
-    actor: str = "operator"
 
 
 class SettingsOverrideDeleteRequest(StrictModel):
     expected_revision: str | None = None
-    actor: str = "operator"
 
 
 class RescoreRequest(StrictModel):
     output_dir: str
-    working_dir: str | None = None
     limit: int | None = Field(default=None, ge=1)
     include_failed: bool = False
     force_rescore: bool = False
     flush_every: int | None = Field(default=None, ge=1)
-    actor: str = "operator"
 
 
 class ComplianceScanRequest(StrictModel):
     output_dir: str
-    working_dir: str | None = None
     force: bool = True
-    actor: str = "operator"
 
 
 class ModuleAssemblyRequest(StrictModel):
@@ -121,36 +137,29 @@ class ModuleAssemblyRequest(StrictModel):
     product: str | None = None
     module_assembly_limit: int | None = Field(default=None, ge=0)
     module_product_zoom: bool = False
-    actor: str = "operator"
 
 
 class ExportBatchesRequest(StrictModel):
     output_root: str | None = None
     batch_size: int | None = Field(default=None, ge=1)
     dry_run: bool = False
-    actor: str = "operator"
 
 
 class ModuleReviewRequest(StrictModel):
     status: str
     note: str = ""
-    reviewer: str = "operator"
-    actor: str = "operator"
 
 
 class VariationProfileWriteRequest(StrictModel):
     profile: dict[str, Any] = Field(default_factory=dict)
     expected_revision: str | None = None
-    actor: str = "operator"
 
 
 class VariationPreviewRequest(StrictModel):
     profile: dict[str, Any] = Field(default_factory=dict)
     variant_index: int | None = Field(default=None, ge=0)
-    actor: str = "operator"
 
 
 class VariationPresetWriteRequest(StrictModel):
     name: str
     profile: dict[str, Any] = Field(default_factory=dict)
-    actor: str = "operator"

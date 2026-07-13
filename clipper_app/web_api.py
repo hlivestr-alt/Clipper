@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from clipper_app.application.control_services import (
     ControlJobService,
+    JobCapacityError,
     JobConflictError,
+    JobResultExpiredError,
+    JobResultNotFoundError,
     SettingsRevisionConflict,
     SettingsService,
 )
+from clipper_app.application.api_security import ApiSecuritySettings, origin_allowed, requires_control_auth
 from clipper_app.application.read_services import ReadDashboardService, ReadServiceResult
 from clipper_app.application.services import (
     ComplianceService,
@@ -18,7 +25,7 @@ from clipper_app.application.services import (
     QueueControlService,
     ScoringService,
 )
-from clipper_app.application.settings import SETTINGS_REGISTRY
+from clipper_app.application.settings import BROWSER_EDITABLE_SETTINGS, SETTINGS_REGISTRY
 from clipper_app.contracts.control_models import (
     ComplianceScanRequest,
     ControlJob,
@@ -49,8 +56,9 @@ from clipper_app.contracts.read_models import SettingsReadEntry, SettingsReadSna
 try:
     from fastapi import FastAPI, HTTPException, Query, Request, Response, status
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import FileResponse
+    from fastapi.responses import FileResponse, JSONResponse
     from fastapi.staticfiles import StaticFiles
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
 except ImportError as exc:  # pragma: no cover - exercised only when runtime deps are missing.
     raise RuntimeError(
         "FastAPI is required for the control app. Install requirements.txt first."
@@ -65,6 +73,28 @@ def _envelope(result: ReadServiceResult) -> dict[str, Any]:
         "source_signatures": [signature.model_dump(mode="json") for signature in result.source_signatures],
         "warnings": list(result.warnings),
     }
+
+
+def _read_response(result: ReadServiceResult, request: Request) -> Response:
+    payload = _envelope(result)
+    data = result.data
+    revision = str(getattr(data, "revision", "") or "")
+    signature_payload = [
+        (item.path, item.exists, item.mtime_ns, item.size)
+        for item in result.source_signatures
+    ]
+    if not revision and not signature_payload:
+        revision = json.dumps(payload["data"], sort_keys=True, ensure_ascii=False, default=str)
+    raw = json.dumps(
+        {"revision": revision, "signatures": signature_payload, "query": sorted(request.query_params.multi_items())},
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    etag = f'"{hashlib.sha256(raw.encode("utf-8")).hexdigest()}"'
+    headers = {"ETag": etag, "Cache-Control": "private, no-cache"}
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+    return JSONResponse(payload, headers=headers)
 
 
 def _direction(direction: str) -> str:
@@ -123,6 +153,8 @@ def _settings_read_snapshot(settings_service: SettingsService) -> SettingsReadSn
                 category=definition.category,
                 minimum=definition.minimum,
                 maximum=definition.maximum,
+                editable=name in BROWSER_EDITABLE_SETTINGS,
+                read_only_reason="" if name in BROWSER_EDITABLE_SETTINGS else "Operator-managed; restart required.",
             )
         )
     return SettingsReadSnapshot(
@@ -180,6 +212,17 @@ def _job_envelope(job: ControlJob, response: Response) -> dict[str, Any]:
     return _envelope(ReadServiceResult(job))
 
 
+def _execute_with_invalidation(
+    read_service: ReadDashboardService,
+    domains: tuple[str, ...],
+    execute: Callable[[], Any],
+) -> Any:
+    try:
+        return execute()
+    finally:
+        read_service.invalidate(*domains)
+
+
 def _conflict_response(exc: JobConflictError) -> HTTPException:
     detail: dict[str, Any] = {"message": str(exc)}
     if exc.conflicting_job_id:
@@ -187,6 +230,17 @@ def _conflict_response(exc: JobConflictError) -> HTTPException:
     if exc.job is not None:
         detail["job"] = exc.job.model_dump(mode="json")
     return HTTPException(status_code=409, detail=detail)
+
+
+def _capacity_response(exc: JobCapacityError) -> HTTPException:
+    detail: dict[str, Any] = {"message": str(exc), "lane": exc.lane}
+    if exc.job is not None:
+        detail["job"] = exc.job.model_dump(mode="json")
+    return HTTPException(
+        status_code=429,
+        detail=detail,
+        headers={"Retry-After": str(exc.retry_after)},
+    )
 
 
 def create_app(
@@ -199,16 +253,28 @@ def create_app(
     compliance_service: ComplianceService | None = None,
     module_service: ModuleService | None = None,
     export_service: ExportPackagingService | None = None,
+    security_settings: ApiSecuritySettings | None = None,
 ) -> FastAPI:
     read_service = service or ReadDashboardService()
     provider = read_service.settings_provider
-    jobs = job_service or ControlJobService(read_service.cfg)
+    migrate_legacy_jobs = os.getenv("CLIPPER_MIGRATE_JOB_STORAGE", "").strip().casefold() in {
+        "1",
+        "true",
+        "yes",
+    }
+    jobs = job_service or ControlJobService(
+        read_service.cfg,
+        auto_migrate_legacy=migrate_legacy_jobs,
+    )
     settings_writer = settings_service or SettingsService(provider)
     queue_controls = queue_control_service or QueueControlService(provider)
     scorer = scoring_service or ScoringService(provider)
     compliance_runner = compliance_service or ComplianceService(provider)
     modules = module_service or ModuleService(provider)
     exporter = export_service or ExportPackagingService(provider)
+    security = security_settings or ApiSecuritySettings.from_environment()
+    if security.desktop and security.token is None:
+        raise RuntimeError("CLIPPER_DESKTOP=1 requires CLIPPER_CONTROL_TOKEN")
     api = FastAPI(
         title="Clipper",
         version="0.3.0",
@@ -216,27 +282,48 @@ def create_app(
     )
     api.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+        allow_origins=list(security.allowed_origins),
         allow_credentials=False,
         allow_methods=["GET", "POST", "PUT", "DELETE"],
-        allow_headers=["*"],
+        allow_headers=["Authorization", "Content-Type", "If-None-Match"],
     )
+    api.add_middleware(TrustedHostMiddleware, allowed_hosts=list(security.allowed_hosts))
+
+    @api.middleware("http")
+    async def enforce_control_boundary(request: Request, call_next):
+        if not origin_allowed(
+            request.headers.get("origin"), request.headers.get("host", ""), security
+        ):
+            return JSONResponse({"detail": "Origin is not allowed"}, status_code=403)
+        if requires_control_auth(request.method, request.url.path):
+            if security.token is None:
+                return JSONResponse({"detail": "Control authentication is not configured"}, status_code=503)
+            if not security.authorize(request.headers.get("authorization")):
+                return JSONResponse(
+                    {"detail": "Valid control credentials are required"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            request.state.actor = security.actor
+        else:
+            request.state.actor = "local-operator"
+        return await call_next(request)
 
     @api.get("/api/health")
     def health() -> dict[str, Any]:
         return _envelope(ReadServiceResult({"status": "ok", "mode": "control"}))
 
     @api.get("/api/dashboard")
-    def dashboard(request: Request) -> dict[str, Any]:
+    def dashboard(request: Request) -> Response:
         if "state_path" in request.query_params:
             raise HTTPException(status_code=400, detail="state_path overrides are not supported")
-        return _envelope(read_service.dashboard())
+        return _read_response(read_service.dashboard(), request)
 
     @api.get("/api/queue")
-    def queue(request: Request) -> dict[str, Any]:
+    def queue(request: Request) -> Response:
         if "state_path" in request.query_params:
             raise HTTPException(status_code=400, detail="state_path overrides are not supported")
-        return _envelope(read_service.queue_detail())
+        return _read_response(read_service.queue_detail(), request)
 
     @api.get("/api/queue/vods")
     def queue_vods() -> dict[str, Any]:
@@ -244,6 +331,7 @@ def create_app(
 
     @api.get("/api/scores")
     def scores(
+        request: Request,
         limit: int = Query(default=50, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
         search: str | None = None,
@@ -251,7 +339,7 @@ def create_app(
         product: str | None = None,
         sort: str = "scored_at",
         direction: str = "desc",
-    ) -> dict[str, Any]:
+    ) -> Response:
         try:
             result = read_service.scores(
                 limit=limit,
@@ -264,7 +352,7 @@ def create_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return _envelope(result)
+        return _read_response(result, request)
 
     @api.get("/api/scores/{score_key}")
     def score_detail(score_key: str) -> dict[str, Any]:
@@ -275,6 +363,7 @@ def create_app(
 
     @api.get("/api/compliance")
     def compliance(
+        request: Request,
         limit: int = Query(default=50, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
         search: str | None = None,
@@ -282,7 +371,7 @@ def create_app(
         product: str | None = None,
         sort: str = "checked_at",
         direction: str = "desc",
-    ) -> dict[str, Any]:
+    ) -> Response:
         try:
             result = read_service.compliance(
                 limit=limit,
@@ -295,18 +384,19 @@ def create_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return _envelope(result)
+        return _read_response(result, request)
 
     @api.get("/api/compliance/detail")
     def compliance_detail(output_dir: str) -> dict[str, Any]:
         return _envelope(read_service.compliance_detail(_output_dir_or_404(read_service, output_dir)))
 
     @api.get("/api/modules/readiness")
-    def module_readiness() -> dict[str, Any]:
-        return _envelope(read_service.module_readiness())
+    def module_readiness(request: Request) -> Response:
+        return _read_response(read_service.module_readiness(), request)
 
     @api.get("/api/modules/library")
     def module_library(
+        request: Request,
         limit: int = Query(default=50, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
         search: str | None = None,
@@ -317,7 +407,7 @@ def create_app(
         product: str | None = None,
         sort: str = "product",
         direction: str = "asc",
-    ) -> dict[str, Any]:
+    ) -> Response:
         try:
             result = read_service.module_library(
                 limit=limit,
@@ -333,7 +423,18 @@ def create_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return _envelope(result)
+        return _read_response(result, request)
+
+    @api.get("/api/modules/{module_id}")
+    def module_detail(module_id: str, request: Request) -> Response:
+        result = read_service.module_detail(_safe_module_identifier(module_id))
+        if result.data.selected is None:
+            raise HTTPException(status_code=404, detail="module_id was not found")
+        return _read_response(result, request)
+
+    @api.get("/api/overview")
+    def overview(request: Request) -> Response:
+        return _read_response(read_service.overview(), request)
 
     @api.get("/api/logs")
     def logs(lines: int = Query(default=200, ge=1, le=1000)) -> dict[str, Any]:
@@ -411,23 +512,28 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @api.put("/api/settings/overrides")
-    def settings_overrides(request: SettingsOverrideWriteRequest, response: Response) -> dict[str, Any]:
+    def settings_overrides(request: SettingsOverrideWriteRequest, response: Response, http_request: Request) -> dict[str, Any]:
         def execute() -> SettingsReadSnapshot:
-            snapshot = settings_writer.update(
-                request.overrides,
-                expected_revision=request.expected_revision,
-            )
-            return _settings_read_snapshot(settings_writer).model_copy(update={"revision": snapshot.revision})
+            def update() -> SettingsReadSnapshot:
+                snapshot = settings_writer.update(
+                    request.overrides,
+                    expected_revision=request.expected_revision,
+                )
+                return _settings_read_snapshot(settings_writer).model_copy(update={"revision": snapshot.revision})
+
+            return _execute_with_invalidation(read_service, ("settings",), update)
 
         try:
             job = jobs.submit(
                 operation=ControlOperation.SETTINGS_UPDATE,
                 request=request,
                 executor=execute,
-                actor=request.actor,
+                actor=http_request.state.actor,
             )
         except SettingsRevisionConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except JobCapacityError as exc:
+            raise _capacity_response(exc) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return _job_envelope(job, response)
@@ -436,30 +542,35 @@ def create_app(
     def settings_override_delete(
         name: str,
         response: Response,
+        http_request: Request,
         expected_revision: str | None = None,
-        actor: str = "operator",
     ) -> dict[str, Any]:
-        request = SettingsOverrideDeleteRequest(expected_revision=expected_revision, actor=actor)
+        request = SettingsOverrideDeleteRequest(expected_revision=expected_revision)
 
         def execute() -> SettingsReadSnapshot:
-            snapshot = settings_writer.delete(name, expected_revision=request.expected_revision)
-            return _settings_read_snapshot(settings_writer).model_copy(update={"revision": snapshot.revision})
+            def delete() -> SettingsReadSnapshot:
+                snapshot = settings_writer.delete(name, expected_revision=request.expected_revision)
+                return _settings_read_snapshot(settings_writer).model_copy(update={"revision": snapshot.revision})
+
+            return _execute_with_invalidation(read_service, ("settings",), delete)
 
         try:
             job = jobs.submit(
                 operation=ControlOperation.SETTINGS_DELETE,
                 request={"name": name, **request.model_dump(mode="json")},
                 executor=execute,
-                actor=request.actor,
+                actor=http_request.state.actor,
             )
         except SettingsRevisionConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except JobCapacityError as exc:
+            raise _capacity_response(exc) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return _job_envelope(job, response)
 
     @api.post("/api/control/queue")
-    def control_queue(request: QueueControlRequest, response: Response) -> dict[str, Any]:
+    def control_queue(request: QueueControlRequest, response: Response, http_request: Request) -> dict[str, Any]:
         launch_config = _validated_queue_launch_config(read_service, request)
         queue_cfg = provider.runtime_view(provider.snapshot())
         command = QueueControlCommand(
@@ -482,42 +593,72 @@ def create_app(
             job = jobs.submit(
                 operation=ControlOperation.QUEUE_CONTROL,
                 request=request,
-                executor=lambda: queue_controls.execute(command),
-                actor=request.actor,
+                executor=lambda: _execute_with_invalidation(
+                    read_service, ("queue",), lambda: queue_controls.execute(command)
+                ),
+                actor=http_request.state.actor,
+                conflict_key="queue_control",
             )
         except JobConflictError as exc:
             raise _conflict_response(exc) from exc
+        except JobCapacityError as exc:
+            raise _capacity_response(exc) from exc
         return _job_envelope(job, response)
 
     @api.get("/api/control/jobs")
     def control_jobs(
+        request: Request,
         limit: int = Query(default=50, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
         operation: str | None = None,
         status: str | None = None,
         actor: str | None = None,
-    ) -> dict[str, Any]:
-        return _envelope(ReadServiceResult(jobs.list(
+    ) -> Response:
+        return _read_response(ReadServiceResult(jobs.list(
             limit=limit,
             offset=offset,
             operation=operation,
             status=status,
             actor=actor,
-        )))
+        )), request)
 
     @api.get("/api/control/jobs/{job_id}")
-    def control_job(job_id: str) -> dict[str, Any]:
-        job = jobs.get(job_id)
+    def control_job(job_id: str, request: Request, include_result: bool = True) -> Response:
+        job = jobs.get(job_id, include_result=include_result)
         if job is None:
             raise HTTPException(status_code=404, detail="job_id was not found")
-        return _envelope(ReadServiceResult(job))
+        return _read_response(ReadServiceResult(job), request)
+
+    @api.get("/api/control/jobs/{job_id}/result-preview")
+    def control_job_result_preview(job_id: str) -> dict[str, Any]:
+        try:
+            preview = jobs.get_result_preview(job_id)
+        except JobResultExpiredError as exc:
+            raise HTTPException(status_code=410, detail=str(exc)) from exc
+        except JobResultNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return _envelope(ReadServiceResult(preview))
+
+    @api.get("/api/control/jobs/{job_id}/result")
+    def control_job_result(job_id: str) -> FileResponse:
+        try:
+            result_path = jobs.result_file(job_id)
+        except JobResultExpiredError as exc:
+            raise HTTPException(status_code=410, detail=str(exc)) from exc
+        except JobResultNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return FileResponse(
+            result_path,
+            media_type="application/json",
+            filename=f"clipper-job-{job_id}-result.json",
+        )
 
     @api.post("/api/operations/rescore")
-    def rescore(request: RescoreRequest, response: Response) -> dict[str, Any]:
+    def rescore(request: RescoreRequest, response: Response, http_request: Request) -> dict[str, Any]:
         output_dir = _output_dir_or_404(read_service, request.output_dir)
         command = ScoringCommand(
             output_dir=output_dir,
-            working_dir=request.working_dir,
+            working_dir=None,
             limit=request.limit,
             include_failed=request.include_failed,
             force_rescore=request.force_rescore,
@@ -527,36 +668,44 @@ def create_app(
             job = jobs.submit(
                 operation=ControlOperation.RESCORE,
                 request=request.model_copy(update={"output_dir": output_dir}),
-                executor=lambda: scorer.rescore(command),
-                actor=request.actor,
+                executor=lambda: _execute_with_invalidation(
+                    read_service, ("scores",), lambda: scorer.rescore(command)
+                ),
+                actor=http_request.state.actor,
                 conflict_key=f"rescore:{output_dir.casefold()}",
             )
         except JobConflictError as exc:
             raise _conflict_response(exc) from exc
+        except JobCapacityError as exc:
+            raise _capacity_response(exc) from exc
         return _job_envelope(job, response)
 
     @api.post("/api/operations/compliance-scan")
-    def compliance_scan(request: ComplianceScanRequest, response: Response) -> dict[str, Any]:
+    def compliance_scan(request: ComplianceScanRequest, response: Response, http_request: Request) -> dict[str, Any]:
         output_dir = _output_dir_or_404(read_service, request.output_dir)
         command = ComplianceScanCommand(
             output_dir=output_dir,
-            working_dir=request.working_dir,
+            working_dir=None,
             force=request.force,
         )
         try:
             job = jobs.submit(
                 operation=ControlOperation.COMPLIANCE_SCAN,
                 request=request.model_copy(update={"output_dir": output_dir}),
-                executor=lambda: compliance_runner.scan(command),
-                actor=request.actor,
+                executor=lambda: _execute_with_invalidation(
+                    read_service, ("compliance", "scores"), lambda: compliance_runner.scan(command)
+                ),
+                actor=http_request.state.actor,
                 conflict_key=f"compliance:{output_dir.casefold()}",
             )
         except JobConflictError as exc:
             raise _conflict_response(exc) from exc
+        except JobCapacityError as exc:
+            raise _capacity_response(exc) from exc
         return _job_envelope(job, response)
 
     @api.post("/api/operations/module-assembly")
-    def module_assembly(request: ModuleAssemblyRequest, response: Response) -> dict[str, Any]:
+    def module_assembly(request: ModuleAssemblyRequest, response: Response, http_request: Request) -> dict[str, Any]:
         command = ModuleAssemblyCommand(
             assembly_date=request.assembly_date,
             product=request.product,
@@ -567,16 +716,20 @@ def create_app(
             job = jobs.submit(
                 operation=ControlOperation.MODULE_ASSEMBLY,
                 request=request,
-                executor=lambda: modules.assemble(command),
-                actor=request.actor,
+                executor=lambda: _execute_with_invalidation(
+                    read_service, ("modules",), lambda: modules.assemble(command)
+                ),
+                actor=http_request.state.actor,
                 conflict_key="module_assembly",
             )
         except JobConflictError as exc:
             raise _conflict_response(exc) from exc
+        except JobCapacityError as exc:
+            raise _capacity_response(exc) from exc
         return _job_envelope(job, response)
 
     @api.post("/api/operations/export-batches")
-    def export_batches(request: ExportBatchesRequest, response: Response) -> dict[str, Any]:
+    def export_batches(request: ExportBatchesRequest, response: Response, http_request: Request) -> dict[str, Any]:
         output_root = _output_root_or_404(read_service, request.output_root)
         command = ExportPackagingCommand(
             output_root=output_root,
@@ -587,37 +740,45 @@ def create_app(
             job = jobs.submit(
                 operation=ControlOperation.EXPORT_BATCHES,
                 request=request.model_copy(update={"output_root": output_root}),
-                executor=lambda: exporter.package(command),
-                actor=request.actor,
+                executor=lambda: _execute_with_invalidation(
+                    read_service, ("outputs",), lambda: exporter.package(command)
+                ),
+                actor=http_request.state.actor,
                 conflict_key="export_batches",
             )
         except JobConflictError as exc:
             raise _conflict_response(exc) from exc
+        except JobCapacityError as exc:
+            raise _capacity_response(exc) from exc
         return _job_envelope(job, response)
 
     @api.post("/api/modules/{module_id}/review")
-    def module_review(module_id: str, request: ModuleReviewRequest, response: Response) -> dict[str, Any]:
+    def module_review(module_id: str, request: ModuleReviewRequest, response: Response, http_request: Request) -> dict[str, Any]:
         safe_module_id = _safe_module_identifier(module_id)
         command = ModuleReviewCommand(
             identifier=safe_module_id,
             status=request.status,
             note=request.note,
-            reviewer=request.reviewer,
+            reviewer=http_request.state.actor,
         )
         try:
             job = jobs.submit(
                 operation=ControlOperation.MODULE_REVIEW,
                 request={"module_id": safe_module_id, **request.model_dump(mode="json")},
-                executor=lambda: modules.review(command),
-                actor=request.actor,
+                executor=lambda: _execute_with_invalidation(
+                    read_service, ("modules",), lambda: modules.review(command)
+                ),
+                actor=http_request.state.actor,
             )
         except JobConflictError as exc:
             raise _conflict_response(exc) from exc
+        except JobCapacityError as exc:
+            raise _capacity_response(exc) from exc
         return _job_envelope(job, response)
 
     @api.get("/api/system")
-    def system() -> dict[str, Any]:
-        return _envelope(read_service.system_stats())
+    def system(request: Request) -> Response:
+        return _read_response(read_service.system_stats(), request)
 
     @api.get("/api/artifacts")
     def artifacts(path: str) -> FileResponse:

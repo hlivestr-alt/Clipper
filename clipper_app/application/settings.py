@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -186,6 +187,20 @@ def _definitions() -> tuple[SettingDefinition, ...]:
 
 SETTINGS_REGISTRY = {definition.name: definition for definition in _definitions()}
 
+PRIVILEGED_SETTINGS = frozenset({
+    "OUTPUT_DIR",
+    "WORKING_DIR",
+    "YOLO_WEIGHTS",
+    "QUEUE_INPUT_DIR",
+    "QUEUE_STATE_FILE",
+    "QUEUE_FOREVER_STATE_FILE",
+    "QUEUE_CONTROL_FILE",
+    "MODULE_LIBRARY_DIR",
+    "LM_STUDIO_BASE_URL",
+    "SCORER_VISION_BASE_URL",
+})
+BROWSER_EDITABLE_SETTINGS = frozenset(SETTINGS_REGISTRY) - PRIVILEGED_SETTINGS
+
 
 def validate_setting_relationships(values: Mapping[str, Any]) -> None:
     errors: list[str] = []
@@ -249,8 +264,16 @@ class LegacyConfigProvider:
         self.config_module = config_module
         self.include_persisted_overrides = include_persisted_overrides
         self.overrides_path = Path(overrides_path) if overrides_path is not None else self._default_overrides_path()
+        self._snapshot_lock = threading.RLock()
+        self._snapshot_cache_key: tuple[Any, ...] | None = None
+        self._snapshot_cache: SettingsSnapshot | None = None
 
     def snapshot(self, overrides: Mapping[str, Any] | None = None) -> SettingsSnapshot:
+        cache_key = self._base_snapshot_cache_key() if not overrides else None
+        if cache_key is not None:
+            with self._snapshot_lock:
+                if self._snapshot_cache_key == cache_key and self._snapshot_cache is not None:
+                    return self._snapshot_cache
         persisted = self._load_persisted_overrides() if self.include_persisted_overrides else {}
         command_overrides = normalize_setting_aliases(overrides or {})
         stale_persisted = set(persisted) & DEPRECATED_SETTINGS_OVERRIDES
@@ -287,7 +310,30 @@ class LegacyConfigProvider:
         revision = hashlib.sha256(
             json.dumps(normalized, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
-        return SettingsSnapshot(entries=tuple(entries), revision=revision)
+        snapshot = SettingsSnapshot(entries=tuple(entries), revision=revision)
+        if cache_key is not None:
+            with self._snapshot_lock:
+                self._snapshot_cache_key = cache_key
+                self._snapshot_cache = snapshot
+        return snapshot
+
+    def invalidate(self) -> None:
+        with self._snapshot_lock:
+            self._snapshot_cache_key = None
+            self._snapshot_cache = None
+
+    def _base_snapshot_cache_key(self) -> tuple[Any, ...]:
+        path = self.overrides_path
+        try:
+            stat_key = (str(path.resolve()), path.stat().st_mtime_ns, path.stat().st_size) if path is not None else ("", 0, 0)
+        except OSError:
+            stat_key = (str(path.resolve()) if path is not None else "", 0, 0)
+        config_values = tuple(
+            (name, repr(getattr(self.config_module, name)))
+            for name in SETTINGS_REGISTRY
+            if hasattr(self.config_module, name)
+        )
+        return (self.include_persisted_overrides, stat_key, config_values)
 
     def _default_overrides_path(self) -> Path:
         working_dir = Path(str(getattr(self.config_module, "WORKING_DIR", "working") or "working"))

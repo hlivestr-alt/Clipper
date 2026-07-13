@@ -650,6 +650,7 @@ class ExportPackagingService:
             cfg=cfg,
             batch_size=command.batch_size,
             dry_run=command.dry_run,
+            trigger="manual",
         )
         return ExportPackagingResult(payload=result or {})
 

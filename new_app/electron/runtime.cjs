@@ -1,10 +1,27 @@
 const fs = require("node:fs");
+const crypto = require("node:crypto");
 const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 
 const RUNTIME_CONFIG_SCHEMA_VERSION = 1;
 const BACKEND_HOST = "127.0.0.1";
+
+function generateControlToken() {
+  return crypto.randomBytes(32).toString("base64url");
+}
+
+function desktopControlActor(username = process.env.USERNAME || process.env.USER || "operator") {
+  const safe = String(username || "operator").trim().replace(/[^a-zA-Z0-9@._:+-]+/g, "-").slice(0, 96) || "operator";
+  return `desktop:${safe}`;
+}
+
+function controlRequestHeaders({ targetUrl, backendPort, token, headers = {} } = {}) {
+  if (!token || !isAllowedNavigation(targetUrl, backendPort)) {
+    return { ...headers };
+  }
+  return { ...headers, Authorization: `Bearer ${token}` };
+}
 
 function parseArgs(argv = process.argv.slice(1)) {
   const args = {};
@@ -200,9 +217,12 @@ module.exports = {
   BACKEND_HOST,
   RUNTIME_CONFIG_SCHEMA_VERSION,
   buildBackendCommand,
+  controlRequestHeaders,
+  desktopControlActor,
   desktopStartDirs,
   findProjectRoot,
   getFreePort,
+  generateControlToken,
   isAllowedNavigation,
   isProjectRoot,
   parseArgs,

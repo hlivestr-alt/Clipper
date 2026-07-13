@@ -1,3 +1,6 @@
+import json
+import os
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -6,9 +9,13 @@ from compliance_checker import (
     apply_compliance_to_hook_payload,
     apply_compliance_to_words,
     check_compliance,
+    compliance_output_root_for_clip,
     compliance_path_for_clip,
+    scan_output_dir,
     should_block_result,
+    write_compliance_result,
 )
+from clipper_app.path_safety import UnsafePathError
 
 
 class ComplianceCheckerTest(unittest.TestCase):
@@ -24,6 +31,93 @@ class ComplianceCheckerTest(unittest.TestCase):
         )
 
         self.assertEqual(path, Path(r"C:\clips\run\compliance\clip_0001_compliance.json"))
+
+    def test_compliance_writer_requires_and_enforces_run_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            run = workspace / "run"
+            outside = workspace / "outside"
+            run.mkdir()
+            outside.mkdir()
+            result = {"passed": True}
+
+            with self.assertRaises(TypeError):
+                write_compliance_result(outside / "result.json", result)  # type: ignore[call-arg]
+            with self.assertRaises(UnsafePathError):
+                write_compliance_result(outside / "result.json", result, output_root=run)
+            self.assertFalse((outside / "result.json").exists())
+
+            clip = run / "export_ready" / "v1" / "clip.mp4"
+            compliance_root = compliance_output_root_for_clip(clip)
+            path = compliance_path_for_clip(clip, "clip")
+            written = write_compliance_result(path, result, output_root=compliance_root)
+
+            self.assertEqual(compliance_root, run.resolve())
+            self.assertEqual(written, run / "compliance" / "clip_compliance.json")
+            self.assertTrue(written.exists())
+
+    def test_scan_sidecar_ignores_manifest_traversal_and_sanitizes_clip_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            run = workspace / "run"
+            working = workspace / "working"
+            run.mkdir()
+            working.mkdir()
+            outside = workspace / "outside.mp4"
+            outside.write_bytes(b"outside")
+            (run / "manifest.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "clip_id": "../../unsafe:id",
+                            "output_file": "../outside.mp4",
+                            "start": 0,
+                            "end": 1,
+                            "product": "Serum",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (working / "transcript.json").write_text(
+                json.dumps({"words": [{"word": "serum", "start": 0, "end": 1}]}),
+                encoding="utf-8",
+            )
+
+            result = scan_output_dir(run, working_dir=working, cfg=_cfg())
+
+            self.assertEqual(result["scanned"], 1)
+            sidecars = list((run / "compliance").glob("*_compliance.json"))
+            self.assertEqual(len(sidecars), 1)
+            self.assertEqual(sidecars[0].parent, run / "compliance")
+            self.assertEqual(outside.read_bytes(), b"outside")
+
+    def test_compliance_symlink_escape_fails_before_any_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            run = workspace / "run"
+            working = workspace / "working"
+            outside = workspace / "outside"
+            run.mkdir()
+            working.mkdir()
+            outside.mkdir()
+            manifest_path = run / "manifest.json"
+            manifest_path.write_text(
+                json.dumps([{"clip_id": "clip", "output_file": "clip.mp4", "start": 0, "end": 1}]),
+                encoding="utf-8",
+            )
+            original_manifest = manifest_path.read_bytes()
+            (working / "transcript.json").write_text(json.dumps({"words": []}), encoding="utf-8")
+            try:
+                _make_directory_link(outside, run / "compliance")
+            except OSError as exc:
+                self.skipTest(f"directory symlinks unavailable: {exc}")
+
+            with self.assertRaises(UnsafePathError):
+                scan_output_dir(run, working_dir=working, cfg=_cfg())
+
+            self.assertEqual(manifest_path.read_bytes(), original_manifest)
+            self.assertEqual(list(outside.iterdir()), [])
 
     def test_keyword_fallback_detects_all_violation_types(self):
         text = (
@@ -128,6 +222,17 @@ def _cfg():
         LM_STUDIO_API_KEY="lm-studio",
         LM_STUDIO_MODEL="qwen/qwen3.6-27b",
     )
+
+
+def _make_directory_link(target: Path, link: Path) -> None:
+    try:
+        os.symlink(target, link, target_is_directory=True)
+    except OSError:
+        try:
+            import _winapi
+        except ImportError:
+            raise
+        _winapi.CreateJunction(str(target), str(link))
 
 
 if __name__ == "__main__":
