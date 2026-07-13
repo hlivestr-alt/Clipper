@@ -3283,6 +3283,21 @@ input::placeholder {
   align-items: center;
 }
 
+.percent-control-row input[type="range"],
+.number-control-row input[type="range"] {
+  width: 100%;
+  min-width: 0;
+  padding-inline: 0;
+  border: 0;
+  background: transparent;
+}
+
+.percent-control-row input[type="number"],
+.number-control-row input[type="number"] {
+  width: 64px;
+  min-width: 0;
+}
+
 .percent-control-row input[type="number"] {
   text-align: right;
   font-variant-numeric: tabular-nums;
@@ -3385,6 +3400,12 @@ input::placeholder {
   padding: 12px;
   font: 0.78rem/1.5 "Cascadia Mono", Consolas, monospace;
   white-space: pre-wrap;
+}
+
+.json-preview-note {
+  margin: 8px 0 0;
+  color: var(--warn);
+  font-size: 0.76rem;
 }
 
 .log-panel {

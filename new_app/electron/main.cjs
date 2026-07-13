@@ -11,6 +11,7 @@ const {
   getFreePort,
   isAllowedNavigation,
   parseArgs,
+  portableRestartCommand,
   readRuntimeConfig,
   resolvePythonExe,
   runtimeConfigPath,
@@ -401,7 +402,21 @@ ipcMain.handle("desktop:window-control", (_event, action) => {
 });
 
 ipcMain.handle("desktop:restart-app", () => {
-  app.relaunch();
+  const portableRestart = portableRestartCommand({
+    portableExecutableFile: process.env.PORTABLE_EXECUTABLE_FILE,
+    argv: process.argv.slice(1)
+  });
+  if (portableRestart) {
+    const replacement = spawn(portableRestart.command, portableRestart.args, {
+      cwd: portableRestart.cwd,
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true
+    });
+    replacement.unref();
+  } else {
+    app.relaunch();
+  }
   app.exit(0);
 });
 

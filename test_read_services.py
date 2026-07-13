@@ -391,6 +391,27 @@ class ReadServiceTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             self.service.resolve_artifact(str(self.output_root / "missing.mp4"))
 
+    def test_log_tail_handles_crlf_invalid_utf8_and_missing_final_newline(self):
+        log_path = self.working / "pipeline.log"
+        log_path.write_bytes(b"one\r\nbad:\xff\r\nlast")
+
+        logs = self.service.log_tail(str(log_path), lines=3)
+
+        self.assertEqual([line.text for line in logs.data.lines], ["last", "bad:\ufffd", "one"])
+        self.assertEqual([line.line_number for line in logs.data.lines], [3, 2, 1])
+        self.assertEqual(logs.data.total_lines, 3)
+        self.assertEqual(logs.warnings, ())
+
+    def test_log_tail_warns_when_read_cap_omits_partial_line(self):
+        log_path = self.working / "pipeline.log"
+        log_path.write_bytes(b"x" * ((4 * 1024 * 1024) + 1))
+
+        logs = self.service.log_tail(str(log_path), lines=10)
+
+        self.assertEqual(logs.data.returned_lines, 0)
+        self.assertIsNone(logs.data.total_lines)
+        self.assertIn("4 MiB", logs.warnings[0])
+
     def test_variation_preview_asset_root_is_allowed(self):
         asset_root = self.root / "assets" / "variation_preview"
         asset_root.mkdir(parents=True)

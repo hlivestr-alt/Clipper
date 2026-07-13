@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from product_broll import (
     build_broll_plan,
+    build_random_broll_plan,
     canonical_product,
     product_broll_asset_fingerprint,
     product_broll_preview_sources,
@@ -167,6 +168,49 @@ class ProductBrollTests(unittest.TestCase):
             self.assertTrue(serum["exists"])
             self.assertEqual(serum["video_count"], 1)
             self.assertTrue(serum["preview"]["url"].startswith("/api/artifacts?path="))
+
+    def test_random_cutaway_plan_is_deterministic_sparse_and_product_relevant(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cfg = self._cfg(root)
+            serum_dir = Path(cfg.PRODUCT_BROLL_DIR) / "serum"
+            toner_dir = Path(cfg.PRODUCT_BROLL_DIR) / "toner"
+            serum_dir.mkdir(parents=True)
+            toner_dir.mkdir(parents=True)
+            (serum_dir / "serum_a.mp4").write_bytes(b"a")
+            (serum_dir / "serum_b.mp4").write_bytes(b"b")
+            (toner_dir / "wrong.mp4").write_bytes(b"wrong")
+            probe = self._probe({"serum_a.mp4": 12.0, "serum_b.mp4": 9.0, "wrong.mp4": 20.0})
+
+            first, reason = build_random_broll_plan(
+                {"product": "Serum"}, cfg, 30.0, hook_end=1.0,
+                rng=random.Random(19), probe_fn=probe,
+            )
+            second, _ = build_random_broll_plan(
+                {"product": "Serum"}, cfg, 30.0, hook_end=1.0,
+                rng=random.Random(19), probe_fn=probe,
+            )
+
+            self.assertEqual(reason, "")
+            self.assertEqual(first, second)
+            self.assertEqual(first.product_key, "serum")
+            self.assertTrue(all(Path(segment.path).parent.name == "serum" for segment in first.segments))
+            self.assertLessEqual(len(first.segments), 3)
+            self.assertLessEqual(sum(segment.duration for segment in first.segments), 7.5 + 1e-6)
+            self.assertTrue(all(2.0 <= segment.duration <= 3.0 for segment in first.segments))
+            self.assertTrue(all(segment.start >= 2.5 for segment in first.segments))
+            self.assertTrue(all(segment.start + segment.duration <= 29.5 + 1e-6 for segment in first.segments))
+            for left, right in zip(first.segments, first.segments[1:]):
+                self.assertGreaterEqual(right.start - (left.start + left.duration), 1.0 - 1e-6)
+
+    def test_random_cutaway_plan_falls_back_for_missing_product_assets(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cfg = self._cfg(Path(temp_dir))
+            plan, reason = build_random_broll_plan(
+                {"product": "Mask"}, cfg, 15.0, rng=random.Random(1), probe_fn=self._probe({}),
+            )
+            self.assertIsNone(plan)
+            self.assertIn("folder missing", reason)
 
 
 if __name__ == "__main__":

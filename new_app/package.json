@@ -9,26 +9,29 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 5173",
     "build": "tsc -b && vite build",
+    "test": "vitest run",
     "preview": "vite preview --host 127.0.0.1 --port 5173",
     "desktop:dev": "pnpm build && electron .",
     "desktop:test": "node --test electron/*.test.cjs",
     "desktop:build": "pnpm build && pnpm desktop:test",
     "desktop:portable": "pnpm desktop:build && node electron/build-portable.cjs"
   },
-  "dependencies": {
+  "dependencies": {},
+  "devDependencies": {
     "@vitejs/plugin-react": "^4.3.4",
+    "@testing-library/react": "^16.3.0",
+    "@types/react": "^19.0.2",
+    "@types/react-dom": "^19.0.2",
+    "electron": "^42.5.0",
+    "electron-builder": "^26.15.3",
+    "jsdom": "^26.1.0",
     "lucide-react": "^1.21.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-router-dom": "^7.18.0",
     "typescript": "^5.7.2",
-    "vite": "^6.0.0"
-  },
-  "devDependencies": {
-    "@types/react": "^19.0.2",
-    "@types/react-dom": "^19.0.2",
-    "electron": "^42.5.0",
-    "electron-builder": "^26.15.3"
+    "vite": "^6.0.0",
+    "vitest": "^3.2.4"
   },
   "build": {
     "appId": "id.clipper.operations",
@@ -41,7 +44,8 @@
       "electron/main.cjs",
       "electron/preload.cjs",
       "electron/runtime.cjs",
-      "package.json"
+      "package.json",
+      "!node_modules/**/*"
     ],
     "win": {
       "target": [

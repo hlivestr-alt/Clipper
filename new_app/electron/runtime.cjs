@@ -181,6 +181,21 @@ function desktopStartDirs({ appPath, execPath, dirname, cwd } = {}) {
   ].filter(Boolean);
 }
 
+function portableRestartCommand({ portableExecutableFile, argv = [] } = {}) {
+  if (typeof portableExecutableFile !== "string" || !portableExecutableFile.trim()) {
+    return null;
+  }
+  const command = path.resolve(portableExecutableFile.trim());
+  if (!fs.existsSync(command)) {
+    return null;
+  }
+  return {
+    command,
+    args: Array.isArray(argv) ? argv.map(String) : [],
+    cwd: path.dirname(command)
+  };
+}
+
 module.exports = {
   BACKEND_HOST,
   RUNTIME_CONFIG_SCHEMA_VERSION,
@@ -191,6 +206,7 @@ module.exports = {
   isAllowedNavigation,
   isProjectRoot,
   parseArgs,
+  portableRestartCommand,
   readRuntimeConfig,
   resolvePythonExe,
   runtimeConfigPath,

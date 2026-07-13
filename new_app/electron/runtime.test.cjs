@@ -12,6 +12,7 @@ const {
   isAllowedNavigation,
   isProjectRoot,
   parseArgs,
+  portableRestartCommand,
   readRuntimeConfig,
   resolvePythonExe,
   runtimeConfigPath,
@@ -111,4 +112,24 @@ test("desktopStartDirs includes useful launch anchors", () => {
   });
   assert.equal(dirs.includes("C:\\Data\\clipper_test"), true);
   assert.equal(dirs.includes("C:\\bin"), true);
+});
+
+test("portable restart targets the outer executable and preserves launch arguments", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clipper-portable-restart-"));
+  const executable = path.join(root, "Clipper-portable.exe");
+  fs.writeFileSync(executable, "test", "utf8");
+
+  assert.deepEqual(
+    portableRestartCommand({
+      portableExecutableFile: executable,
+      argv: ["--project-root", "C:\\Data\\clipper_test"]
+    }),
+    {
+      command: executable,
+      args: ["--project-root", "C:\\Data\\clipper_test"],
+      cwd: root
+    }
+  );
+  assert.equal(portableRestartCommand({ portableExecutableFile: path.join(root, "missing.exe") }), null);
+  assert.equal(portableRestartCommand({}), null);
 });

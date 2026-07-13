@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 7
-PREVIEW_RENDER_VERSION = 11
+SCHEMA_VERSION = 8
+PREVIEW_RENDER_VERSION = 12
 MIN_VARIANTS = 1
 MAX_VARIANTS = 6
 
@@ -195,6 +195,7 @@ def default_profile(cfg) -> dict[str, Any]:
         template = dict(_DEFAULT_VARIANTS[index % len(_DEFAULT_VARIANTS)])
         template["name"] = template["name"] if index < len(_DEFAULT_VARIANTS) else f"Variant {index + 1}"
         template["visual_mode"] = str(template.get("visual_mode") or "host")
+        template["random_broll_enabled"] = False
         template["font_id"] = default_font
         template["bgm_path"] = ""
         template["subtitle_size"] = "medium"
@@ -375,10 +376,12 @@ def normalize_variant(raw: dict[str, Any], index: int, cfg) -> dict[str, Any]:
     elif not letterbox_hook_font_id:
         letterbox_hook_font_id = font_id
 
+    visual_mode = _normalize_visual_mode(raw.get("visual_mode"), defaults.get("visual_mode", "host"))
     variant = {
         "name": _clean_label(raw.get("name") or defaults["name"] or f"Variant {index + 1}", f"Variant {index + 1}"),
         "hook_type": _normalize_hook_type(raw.get("hook_type"), defaults["hook_type"]),
-        "visual_mode": _normalize_visual_mode(raw.get("visual_mode"), defaults.get("visual_mode", "host")),
+        "visual_mode": visual_mode,
+        "random_broll_enabled": bool(raw.get("random_broll_enabled", False)) and visual_mode != "broll_audio",
         "font_id": font_id,
         "font_color": _hex(raw.get("font_color"), defaults["font_color"]),
         "highlight_color": _hex(raw.get("highlight_color"), defaults["highlight_color"]),

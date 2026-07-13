@@ -188,6 +188,61 @@ class ControlServiceTests(unittest.TestCase):
             self.assertTrue(any('"status": "interrupted"' in line for line in audit_lines))
             self.assertTrue(any('"status": "rejected"' in line for line in audit_lines))
 
+    def test_control_job_list_uses_compact_summaries_but_detail_remains_complete(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            service = ControlJobService(self._config(root), run_async=False)
+            large_request = "request-data" * 100_000
+            large_result = "result-data" * 200_000
+
+            completed = service.submit(
+                operation=ControlOperation.EXPORT_BATCHES,
+                request={"notes": large_request},
+                executor=lambda: {
+                    "payload": {
+                        "eligible_count": 48,
+                        "packaged_count": 30,
+                        "batch_size": 15,
+                        "dry_run": True,
+                        "manifest": large_result,
+                    }
+                },
+            )
+
+            page = service.list(limit=12)
+            self.assertEqual(page.total, 1)
+            summary = page.jobs[0]
+            self.assertEqual(summary.job_id, completed.job_id)
+            self.assertEqual(summary.result_summary.eligible_count, 48)
+            self.assertEqual(summary.result_summary.packaged_count, 30)
+            self.assertEqual(summary.result_summary.batch_size, 15)
+            self.assertTrue(summary.result_summary.dry_run)
+            summary_payload = page.model_dump(mode="json")["jobs"][0]
+            self.assertNotIn("request", summary_payload)
+            self.assertNotIn("result", summary_payload)
+            self.assertLess(len(page.model_dump_json()), 2_048)
+
+            detail = service.get(completed.job_id)
+            self.assertEqual(detail.request["notes"], large_request)
+            self.assertEqual(detail.result["payload"]["manifest"], large_result)
+
+    def test_control_audit_uses_bounded_rotating_append(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with mock.patch("clipper_app.application.control_services.append_rotating_text") as append:
+                service = ControlJobService(self._config(root), run_async=False)
+                service.submit(
+                    operation=ControlOperation.RESCORE,
+                    request={"output_dir": "out"},
+                    executor=lambda: {"updated": 1},
+                )
+
+            self.assertGreaterEqual(append.call_count, 3)
+            for call in append.call_args_list:
+                self.assertEqual(call.kwargs["max_bytes"], 10 * 1024 * 1024)
+                self.assertEqual(call.kwargs["backup_count"], 5)
+                self.assertTrue(call.args[1].endswith("\n"))
+
     def test_export_packaging_service_uses_runtime_settings_view(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

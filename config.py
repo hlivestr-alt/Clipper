@@ -541,6 +541,11 @@ SCORER_SIMILARITY_MAX_FRAMES = 24
 EXPORT_BATCHES_ENABLED = True
 EXPORT_BATCH_DIR_NAME = "export_batches"
 EXPORT_BATCH_SIZE = 15
+# Default layout: one export-ready variant per base clip, rotated by persisted
+# VOD order and clip number into folders containing at most 15 VODs.
+EXPORT_BATCH_STRATEGY = "vod_clip_variant_rotation"
+EXPORT_BATCH_VARIANT_COUNT = 6
+# Used only by the legacy score_round_robin_all_variants strategy.
 EXPORT_PACK_ONE_VARIANT_PER_CLIP = False
 
 # Pre-subtitle advertising compliance checks for Indonesian skincare claims.

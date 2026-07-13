@@ -46,6 +46,11 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
 
+from clipper_app.application.logging_utils import (
+    LockedSizeRotatingFileHandler,
+    PIPELINE_LOG_BACKUP_COUNT,
+    PIPELINE_LOG_MAX_BYTES,
+)
 from stage_cache import stage_fingerprint, stage_fingerprint_matches, write_stage_fingerprint
 
 try:
@@ -60,7 +65,12 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("pipeline.log", encoding="utf-8"),
+        LockedSizeRotatingFileHandler(
+            "pipeline.log",
+            max_bytes=PIPELINE_LOG_MAX_BYTES,
+            backup_count=PIPELINE_LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        ),
     ],
 )
 log = logging.getLogger("proya.main")
@@ -505,6 +515,7 @@ def _build_manifest_row(job: dict, product_event_count: int, status: str) -> dic
             "variant_index": int(getattr(variant, "variant_index", 0) or 0),
             "hook_type": str(getattr(variant, "hook_type", "text") or "text"),
             "visual_mode": str(getattr(variant, "visual_mode", "host") or "host"),
+            "random_broll_enabled": bool(getattr(variant, "random_broll_enabled", False)),
             "font_id": str(getattr(variant, "font_id", "") or getattr(variant, "font_subtitle", "") or ""),
             "subtitle_position": str(getattr(variant, "subtitle_position", "") or ""),
             "subtitle_y_frac": float(getattr(variant, "subtitle_y_frac", getattr(variant, "subtitle_y_pos", 0.80)) or 0.80),
@@ -536,6 +547,15 @@ def _build_manifest_row(job: dict, product_event_count: int, status: str) -> dic
         row["product_broll_product"] = str(product_broll_render.get("product_key") or "")
         row["product_broll_folder"] = str(product_broll_render.get("folder") or "")
         row["product_broll_clip_count"] = int(product_broll_render.get("clip_count") or 0)
+    random_broll_render = moment.get("_random_product_broll_render")
+    if isinstance(random_broll_render, dict):
+        row["random_product_broll"] = bool(random_broll_render.get("active", False))
+        row["random_product_broll_fallback"] = bool(random_broll_render.get("fallback", False))
+        row["random_product_broll_reason"] = str(random_broll_render.get("reason") or "")
+        row["random_product_broll_product"] = str(random_broll_render.get("product_key") or "")
+        row["random_product_broll_folder"] = str(random_broll_render.get("folder") or "")
+        row["random_product_broll_clip_count"] = int(random_broll_render.get("clip_count") or 0)
+        row["random_product_broll_segments"] = list(random_broll_render.get("segments") or [])
     return row
 
 

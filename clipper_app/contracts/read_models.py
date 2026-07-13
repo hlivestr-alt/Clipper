@@ -274,14 +274,14 @@ class SettingsReadSnapshot(StrictReadModel):
 
 
 class LogLine(StrictReadModel):
-    line_number: int = Field(ge=1)
+    line_number: int | None = Field(default=None, ge=1)
     text: str
 
 
 class LogTail(StrictReadModel):
     path: str
     exists: bool
-    total_lines: int = Field(default=0, ge=0)
+    total_lines: int | None = Field(default=None, ge=0)
     returned_lines: int = Field(default=0, ge=0)
     lines: tuple[LogLine, ...] = ()
 

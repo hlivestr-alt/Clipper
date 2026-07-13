@@ -410,8 +410,10 @@ class VariationGeneratorTests(unittest.TestCase):
             profile["variants"][0]["name"] = "Clean Control"
             profile["variants"][0]["hook_type"] = "text_b_roll"
             profile["variants"][0]["subtitle_enabled"] = False
+            profile["variants"][0]["random_broll_enabled"] = True
             profile["variants"][1]["name"] = "Bar Variant"
             profile["variants"][1]["visual_mode"] = "broll_audio"
+            profile["variants"][1]["random_broll_enabled"] = True
             profile["variants"][1]["mirror_enabled"] = True
             profile["variants"][1]["before_after_mode"] = "compact"
             profile["variants"][1]["letterbox_enabled"] = True
@@ -443,9 +445,12 @@ class VariationGeneratorTests(unittest.TestCase):
             self.assertEqual(expanded[0]["_variant"].display_name, "Clean Control")
             self.assertEqual(expanded[0]["_variant"].hook_type, "text_b_roll")
             self.assertFalse(expanded[0]["_variant"].subtitle_enabled)
+            self.assertTrue(expanded[0]["_variant"].random_broll_enabled)
+            self.assertEqual(expanded[0]["_base_clip_id"], "clip_0001")
             self.assertEqual(expanded[0]["_variant"].profile_revision, saved["revision"])
             self.assertTrue(expanded[1]["_variant"].letterbox_enabled)
             self.assertEqual(expanded[1]["_variant"].visual_mode, "broll_audio")
+            self.assertFalse(expanded[1]["_variant"].random_broll_enabled)
             self.assertTrue(expanded[1]["_variant"].mirror)
             self.assertEqual(expanded[1]["_variant"].before_after_variant_mode, "fullscreen")
             self.assertEqual(expanded[1]["_variant"].speed_ramp, 1.0)
@@ -774,6 +779,10 @@ class VariationGeneratorTests(unittest.TestCase):
         self.assertEqual(patched._letterbox_hook_x_frac, 0.42)
         self.assertEqual(patched._letterbox_hook_y_frac, 0.64)
         self.assertEqual(patched._hook_format, "text_before_after_image")
+
+        random_variant = VariantConfig(visual_mode="host", random_broll_enabled=True)
+        random_patched = apply_variant_to_cfg(base_cfg, random_variant)
+        self.assertTrue(random_patched._random_broll_enabled)
 
 
 if __name__ == "__main__":

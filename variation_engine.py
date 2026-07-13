@@ -293,6 +293,7 @@ class VariantConfig:
     display_name: str = ""
     hook_type: str = "text"
     visual_mode: str = "host"
+    random_broll_enabled: bool = False
     font_id: str = ""
     font_color: str = "#FFFFFF"
     highlight_color: str = "#FFD600"
@@ -385,6 +386,7 @@ def apply_variant_to_cfg(base_cfg, variant: VariantConfig):
     patched._hook_type = variant.hook_type
     patched._visual_mode = variant.visual_mode
     patched._variant_visual_mode = variant.visual_mode
+    patched._random_broll_enabled = bool(variant.random_broll_enabled) and variant.visual_mode != "broll_audio"
     patched._variant_font_id = variant.font_id
     patched._variant_font_color = variant.font_color
     patched._variant_highlight_color = variant.highlight_color
@@ -623,6 +625,7 @@ def _profile_variants(base_cfg, seed: int | None = None) -> list[VariantConfig] 
             continue
         hook_type = str(raw.get("hook_type") or "text")
         visual_mode = str(raw.get("visual_mode") or "host")
+        random_broll_enabled = bool(raw.get("random_broll_enabled", False)) and visual_mode != "broll_audio"
         subtitle_position = str(raw.get("subtitle_position") or "bottom")
         color_grade = str(raw.get("color_grade") or "original")
         zoom_intensity = str(raw.get("zoom_intensity") or "normal")
@@ -692,6 +695,7 @@ def _profile_variants(base_cfg, seed: int | None = None) -> list[VariantConfig] 
                 display_name=display_name,
                 hook_type=hook_type,
                 visual_mode=visual_mode,
+                random_broll_enabled=random_broll_enabled,
                 font_id=str(raw.get("font_id") or ""),
                 font_color=font_color,
                 highlight_color=highlight_color,
@@ -1417,6 +1421,7 @@ def expand_moments_with_variants(
         for variant_for_moment in moment_variants:
             m = _apply_variant_timeline_offsets(moment, variant_for_moment)
             m["_variant"] = variant_for_moment
+            m["_base_clip_id"] = base_clip_id
             # Give variant its own clip_id so files don't collide
             m["clip_id"] = f"{base_clip_id}_{variant_for_moment.variant_id}"
             expanded.append(m)

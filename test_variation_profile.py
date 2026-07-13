@@ -36,7 +36,7 @@ class VariationProfileTests(unittest.TestCase):
 
             profile = default_profile(cfg)
 
-            self.assertEqual(profile["schema_version"], 7)
+            self.assertEqual(profile["schema_version"], 8)
             self.assertEqual(profile["variant_count"], 6)
             self.assertEqual(
                 [idx for idx, item in enumerate(profile["variants"]) if item["letterbox_enabled"]],
@@ -44,6 +44,7 @@ class VariationProfileTests(unittest.TestCase):
             )
             self.assertEqual(profile["variants"][0]["hook_type"], "text")
             self.assertEqual(profile["variants"][0]["visual_mode"], "host")
+            self.assertFalse(profile["variants"][0]["random_broll_enabled"])
             self.assertTrue(profile["variants"][0]["subtitle_enabled"])
             self.assertEqual(profile["variants"][0]["subtitle_size"], "medium")
             self.assertTrue(profile["variants"][0]["product_zoom_enabled"])
@@ -110,7 +111,7 @@ class VariationProfileTests(unittest.TestCase):
                 cfg,
             )
 
-            self.assertEqual(loaded["schema_version"], 7)
+            self.assertEqual(loaded["schema_version"], 8)
             self.assertEqual(loaded["variants"][0]["visual_mode"], "host")
             self.assertEqual(loaded["variants"][0]["subtitle_size"], "medium")
             self.assertFalse(loaded["variants"][0]["letterbox_hook_enabled"])
@@ -170,6 +171,8 @@ class VariationProfileTests(unittest.TestCase):
             profile["variants"][2]["letterbox_enabled"] = False
             profile["variants"][0]["hook_type"] = "pain"
             profile["variants"][1]["visual_mode"] = "broll_audio"
+            profile["variants"][0]["random_broll_enabled"] = True
+            profile["variants"][1]["random_broll_enabled"] = True
             profile["variants"][1]["subtitle_enabled"] = False
             profile["variants"][1]["mirror_enabled"] = True
             profile["variants"][1]["before_after_mode"] = "compact"
@@ -195,6 +198,8 @@ class VariationProfileTests(unittest.TestCase):
             )
             self.assertEqual(loaded["variants"][0]["hook_type"], "text")
             self.assertEqual(loaded["variants"][1]["visual_mode"], "broll_audio")
+            self.assertTrue(loaded["variants"][0]["random_broll_enabled"])
+            self.assertFalse(loaded["variants"][1]["random_broll_enabled"])
             self.assertFalse(loaded["variants"][1]["subtitle_enabled"])
             self.assertTrue(loaded["variants"][1]["mirror_enabled"])
             self.assertEqual(loaded["variants"][1]["before_after_mode"], "fullscreen")

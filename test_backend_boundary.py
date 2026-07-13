@@ -378,6 +378,35 @@ class BackendBoundaryTests(unittest.TestCase):
             self.assertEqual(snapshot.control["supervisor_launch"]["pid"], 12345)
             self.assertEqual(snapshot.control["supervisor_launch"]["replaced_pids"], [])
 
+    def test_queue_control_rotates_supervisor_log_before_launch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            working = tmp_path / "working"
+            working.mkdir()
+            launch_log = working / "queue_supervisor_launch.log"
+            launch_log.write_bytes(b"old-line\n" * 20)
+            cfg = self._config()
+            cfg.WORKING_DIR = str(working)
+            service = QueueControlService(
+                LegacyConfigProvider(cfg, include_persisted_overrides=False)
+            )
+            process = SimpleNamespace(pid=12345)
+
+            with mock.patch.object(service, "_process_command_lines", return_value=[]), \
+                mock.patch("clipper_app.application.services.SUPERVISOR_LOG_MAX_BYTES", 64), \
+                mock.patch("clipper_app.application.services.subprocess.Popen", return_value=process):
+                service.execute(QueueControlCommand(
+                    action=QueueAction.START,
+                    control_path=str(tmp_path / "queue_control.json"),
+                    forever_state_path=str(tmp_path / "queue_forever_state.json"),
+                    queue_state_path=str(tmp_path / "video_queue_state.json"),
+                ))
+
+            backup = working / "queue_supervisor_launch.log.1"
+            self.assertTrue(backup.exists())
+            self.assertLessEqual(backup.stat().st_size, 64)
+            self.assertTrue(backup.read_bytes().startswith(b"old-line\n"))
+
     def test_queue_control_start_passes_launch_config_to_supervisor(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

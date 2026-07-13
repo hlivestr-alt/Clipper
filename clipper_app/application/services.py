@@ -12,6 +12,11 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from clipper_app.application.events import EventSink, NullEventSink
+from clipper_app.application.logging_utils import (
+    SUPERVISOR_LOG_BACKUP_COUNT,
+    SUPERVISOR_LOG_MAX_BYTES,
+    rotate_file_if_oversize,
+)
 from clipper_app.application.settings import LegacyConfigProvider
 from clipper_app.contracts.events import OperationKind, ProgressEvent
 from clipper_app.contracts.models import (
@@ -231,6 +236,11 @@ class QueueControlService:
 
         launch_log = self._resolve_project_path(getattr(cfg, "WORKING_DIR", "working"), repo_root) / "queue_supervisor_launch.log"
         launch_log.parent.mkdir(parents=True, exist_ok=True)
+        rotate_file_if_oversize(
+            launch_log,
+            max_bytes=SUPERVISOR_LOG_MAX_BYTES,
+            backup_count=SUPERVISOR_LOG_BACKUP_COUNT,
+        )
         command_line = [
             sys.executable,
             str(supervisor_script),

@@ -436,6 +436,7 @@ def edit_clip(
             bgm_path=bgm_path,
             hook_format=hook_format,
             broll_visual_plan=broll_visual_plan,
+            product_events=product_events,
             cfg=cfg,
         )
     finally:
@@ -1036,7 +1037,7 @@ def _build_and_run(
     W, H, clip_duration, clip_fps, has_audio,
     moment, prod_trigger, face_zooms,
     zoom_dur, zoom_scale, hook_end,
-    extra_inputs, sfx_events, bgm_path, hook_format, broll_visual_plan, cfg,
+    extra_inputs, sfx_events, bgm_path, hook_format, broll_visual_plan, cfg, product_events=None,
 ) -> bool:
     """
     Assemble -filter_complex string and run FFmpeg.
@@ -1064,6 +1065,48 @@ def _build_and_run(
         crop_x_offset = 0.0
         prod_trigger = None
         face_zooms = []
+
+    random_broll_plan = None
+    random_broll_requested = bool(getattr(cfg, "_random_broll_enabled", False)) and not broll_visual_active
+    if random_broll_requested:
+        try:
+            from product_broll import build_random_broll_plan, random_plan_manifest
+
+            seed = getattr(cfg, "VARIANT_SEED", 42)
+            base_clip_id = str(moment.get("_base_clip_id") or moment.get("clip_id") or "clip_unknown")
+            variant_id = str(getattr(cfg, "_variant_id", "") or "variant")
+            picker = random.Random(f"{seed}|{base_clip_id}|{variant_id}|random_broll")
+            random_broll_plan, fallback_reason = build_random_broll_plan(
+                moment,
+                cfg,
+                clip_duration,
+                hook_end=hook_end,
+                rng=picker,
+                product_events=product_events,
+            )
+            if random_broll_plan:
+                moment["_random_product_broll_render"] = {
+                    "active": True,
+                    "fallback": False,
+                    **random_plan_manifest(random_broll_plan),
+                }
+            else:
+                log.warning("Random relevant B-roll unavailable; using host visual: %s", fallback_reason)
+                moment["_random_product_broll_render"] = {
+                    "active": False,
+                    "fallback": True,
+                    "reason": fallback_reason,
+                }
+        except Exception as exc:
+            log.warning("Random relevant B-roll preparation failed; using host visual: %s", exc)
+            moment["_random_product_broll_render"] = {
+                "active": False,
+                "fallback": True,
+                "reason": str(exc),
+            }
+            random_broll_plan = None
+    else:
+        moment.pop("_random_product_broll_render", None)
 
     # Apply zoom trigger offset
     if prod_trigger and zoom_trig_off != 0.0:
@@ -1129,6 +1172,12 @@ def _build_and_run(
             broll_visual_input_indices.append(next_input_idx)
             cmd += ["-i", clip.path]
             next_input_idx += 1
+    random_broll_input_indices = []
+    if random_broll_plan is not None:
+        for segment in random_broll_plan.segments:
+            random_broll_input_indices.append(next_input_idx)
+            cmd += ["-i", segment.path]
+            next_input_idx += 1
 
     # ── Build filter_complex ──────────────────────────────────────────────────
     fc = []       # filter_complex lines
@@ -1186,7 +1235,8 @@ def _build_and_run(
 
     # ── 3. ASS subtitles (hardcoded burn-in) ─────────────────────────────────
 
-    if ass_path and Path(ass_path).exists():
+    letterbox_visible = _letterbox_has_visible_bars(H, cfg)
+    if ass_path and Path(ass_path).exists() and random_broll_plan is None and not letterbox_visible:
         # Windows path escaping for FFmpeg ass= filter:
         # Forward slashes only, and drive colon must be escaped as \:
         # e.g.  C:/Users/... → C\:/Users/...
@@ -1216,8 +1266,19 @@ def _build_and_run(
     else:
         vid = _add_before_after_overlay_filters(fc, vid, extra_inputs, clip_duration, W, H, cfg, hook_format)
 
-    if _letterbox_has_visible_bars(H, cfg):
+    if letterbox_visible:
         vid = _add_letterbox_drawboxes(fc, vid, "vletterboxtext", H, cfg)
+    if random_broll_plan is not None:
+        vid = _add_random_broll_cutaway_filters(
+            fc,
+            vid,
+            random_broll_input_indices,
+            random_broll_plan,
+            W,
+            H,
+            output_fps,
+        )
+    if letterbox_visible or random_broll_plan is not None:
         if ass_path and Path(ass_path).exists():
             safe_ass = _escape_ass_filter_path(ass_path)
             ass_filter = f"ass={safe_ass}"
@@ -1703,6 +1764,42 @@ def _add_product_broll_visual_filters(
 
     fc.append(f"{current}trim=0:{clip_duration:.3f},setpts=PTS-STARTPTS[vbrollbase]")
     return "[vbrollbase]"
+
+
+def _add_random_broll_cutaway_filters(
+    fc,
+    vid: str,
+    input_indices: list[int],
+    plan,
+    W: int,
+    H: int,
+    output_fps: int,
+) -> str:
+    """Overlay silent full-frame cutaways; downstream text and watermarks stay visible."""
+    segments = list(getattr(plan, "segments", []) or [])
+    current = vid
+    for index, (input_idx, segment) in enumerate(zip(input_indices, segments)):
+        start = max(0.0, float(getattr(segment, "start", 0.0) or 0.0))
+        duration = max(0.0, float(getattr(segment, "duration", 0.0) or 0.0))
+        source_start = max(0.0, float(getattr(segment, "source_start", 0.0) or 0.0))
+        if duration <= 0.01:
+            continue
+        end = start + duration
+        source_end = source_start + duration
+        source_label = f"vrbrollsrc{index}"
+        output_label = f"vrbroll{index}"
+        fc.append(
+            f"[{input_idx}:v]"
+            f"trim=start={source_start:.3f}:end={source_end:.3f},setpts=PTS-STARTPTS+{start:.3f}/TB,"
+            f"scale={W}:{H}:force_original_aspect_ratio=increase,"
+            f"crop={W}:{H},fps={output_fps},format=yuv420p,setsar=1[{source_label}]"
+        )
+        fc.append(
+            f"{current}[{source_label}]overlay=x=0:y=0:eof_action=pass:"
+            f"enable='between(t,{start:.3f},{end:.3f})'[{output_label}]"
+        )
+        current = f"[{output_label}]"
+    return current
 
 
 def _add_transitional_hook_concat_filters(

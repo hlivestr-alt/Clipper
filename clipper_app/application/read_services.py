@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Iterable, Literal
 from urllib.parse import quote
 
+from clipper_app.application.log_tail import reverse_tail
 from clipper_app.application.settings import LegacyConfigProvider, SETTINGS_REGISTRY
 from clipper_app.contracts.read_models import (
     ArtifactRef,
@@ -519,27 +520,30 @@ class ReadDashboardService:
         if not target.exists():
             return ReadServiceResult(LogTail(path=str(target), exists=False), (signature,), ("pipeline.log was not found.",))
         try:
-            raw_lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+            tail = reverse_tail(target, line_limit=lines)
         except OSError as exc:
             return ReadServiceResult(
                 LogTail(path=str(target), exists=True),
                 (signature,),
                 (f"Could not read log: {exc}",),
             )
-        start = max(0, len(raw_lines) - lines)
-        newest_first = reversed(tuple(enumerate(raw_lines[start:], start=start)))
         payload = tuple(
-            LogLine(line_number=index + 1, text=text)
-            for index, text in newest_first
+            LogLine(line_number=line.line_number, text=line.text)
+            for line in tail.lines
         )
         data = LogTail(
             path=str(target),
             exists=True,
-            total_lines=len(raw_lines),
+            total_lines=tail.total_lines,
             returned_lines=len(payload),
             lines=payload,
         )
-        return ReadServiceResult(data, (signature,))
+        warnings = ()
+        if tail.partial_oldest_line:
+            warnings = (
+                "Log tail reached the 4 MiB read limit; the partial oldest line was omitted.",
+            )
+        return ReadServiceResult(data, (signature,), warnings)
 
     def system_stats(self) -> ReadServiceResult:
         warnings: list[str] = []

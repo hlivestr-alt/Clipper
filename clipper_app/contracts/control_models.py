@@ -44,8 +44,29 @@ class ControlJob(StrictModel):
     actor: str = "operator"
 
 
+class ControlJobResultSummary(StrictModel):
+    eligible_count: int | None = Field(default=None, ge=0)
+    packaged_count: int | None = Field(default=None, ge=0)
+    batch_size: int | None = Field(default=None, ge=0)
+    dry_run: bool | None = None
+
+
+class ControlJobSummary(StrictModel):
+    job_id: str
+    operation: ControlOperation
+    status: ControlJobStatus
+    created_at: str
+    updated_at: str
+    started_at: str | None = None
+    finished_at: str | None = None
+    result_summary: ControlJobResultSummary | None = None
+    error: str | None = None
+    conflict_key: str | None = None
+    actor: str = "operator"
+
+
 class ControlJobPage(StrictModel):
-    jobs: tuple[ControlJob, ...] = ()
+    jobs: tuple[ControlJobSummary, ...] = ()
     total: int = Field(default=0, ge=0)
     limit: int = Field(ge=1)
     offset: int = Field(ge=0)
@@ -63,9 +84,6 @@ class ControlAuditEntry(StrictModel):
 
 class QueueControlRequest(StrictModel):
     action: QueueAction
-    control_path: str | None = None
-    forever_state_path: str | None = None
-    queue_state_path: str | None = None
     launch_config: QueueLaunchConfig | None = None
     actor: str = "operator"
 

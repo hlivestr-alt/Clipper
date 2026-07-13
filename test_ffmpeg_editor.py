@@ -8,6 +8,7 @@ from ffmpeg_editor import (
     _add_before_after_overlay_filters,
     _add_letterbox_hook_text,
     _add_product_broll_visual_filters,
+    _add_random_broll_cutaway_filters,
     _add_transitional_hook_concat_filters,
     _build_and_run,
     _build_zoom_expressions,
@@ -20,7 +21,7 @@ from ffmpeg_editor import (
     _variant_hook_format,
     _write_ass_file,
 )
-from product_broll import BrollClip, BrollPlan, BrollTransition
+from product_broll import BrollClip, BrollPlan, BrollTransition, RandomBrollPlan, RandomBrollSegment
 
 
 class FfmpegEditorFallbackTests(unittest.TestCase):
@@ -321,6 +322,25 @@ class FfmpegEditorFallbackTests(unittest.TestCase):
         self.assertIn("-map 0:a", cmd_text)
         self.assertIn("xfade=transition=fade", cmd_text)
         self.assertNotIn("[1:a]", cmd_text)
+
+    def test_random_broll_cutaway_graph_uses_source_offsets_and_full_frame_overlay(self):
+        plan = RandomBrollPlan(
+            product_key="serum",
+            product_label="Serum",
+            folder="assets/product_broll/serum",
+            segments=(RandomBrollSegment("serum.mp4", start=4.25, duration=2.5, source_start=1.75),),
+        )
+        fc = ["[0:v]drawbox=x=0:y=0:w=1080:h=200:color=black:t=fill[vletterboxtext]"]
+
+        output = _add_random_broll_cutaway_filters(fc, "[vletterboxtext]", [1], plan, 1080, 1920, 30)
+
+        joined = ";".join(fc)
+        self.assertEqual(output, "[vrbroll0]")
+        self.assertIn("trim=start=1.750:end=4.250", joined)
+        self.assertIn("scale=1080:1920:force_original_aspect_ratio=increase", joined)
+        self.assertIn("[vletterboxtext][vrbrollsrc0]overlay", joined)
+        self.assertIn("between(t,4.250,6.750)", joined)
+        self.assertNotIn("[1:a]", joined)
 
 
 if __name__ == "__main__":

@@ -391,6 +391,138 @@ class ExportPackagerTest(unittest.TestCase):
             for folders in base_folders(package_items(root)).values():
                 self.assertEqual(len(folders), 2)
 
+    def test_vod_clip_rotation_matches_requested_15_vod_layout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for vod_number in range(1, 16):
+                write_source(root, f"vod_{vod_number:02d}", rotation_specs(clip_count=3))
+
+            result = package_export_batches(root, cfg=make_rotation_cfg(), batch_size=15)
+
+            self.assertEqual(result["allocation_strategy"], "vod_clip_variant_rotation")
+            self.assertEqual(result["packaged_count"], 45)
+            self.assertEqual(batch_counts(root), {"1": 15, "2": 15, "3": 15})
+            items = package_items(root)
+            by_vod_clip = {
+                (item["normalized_source_vod"], item["base_clip_id"]): item
+                for item in items
+            }
+            for vod_number in range(1, 16):
+                for clip_number in range(1, 4):
+                    item = by_vod_clip[(f"vod_{vod_number:02d}", f"clip_{clip_number:04d}")]
+                    expected_variant = (vod_number - 1 + clip_number - 1) % 6
+                    self.assertTrue(item["selected_variant"].startswith(f"v{expected_variant}_"))
+                    self.assertEqual(item["batch_folder"], str(clip_number))
+                    self.assertEqual(item["vod_index"], vod_number - 1)
+
+            selected_paths = {Path(item["source_path"]) for item in items}
+            self.assertTrue(all(not path.exists() for path in selected_paths))
+            remaining = list(root.glob("vod_*/export_ready/**/*.mp4"))
+            self.assertEqual(len(remaining), (15 * 3 * 6) - 45)
+
+    def test_vod_clip_rotation_uses_second_lane_group_after_15_vods(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for vod_number in range(1, 17):
+                write_source(root, f"vod_{vod_number:02d}", rotation_specs(clip_count=2))
+
+            package_export_batches(root, cfg=make_rotation_cfg(), batch_size=15)
+
+            self.assertEqual(batch_counts(root), {"1": 15, "2": 15, "3": 1, "4": 1})
+            items = package_items(root)
+            vod_16 = [item for item in items if item["normalized_source_vod"] == "vod_16"]
+            self.assertEqual({item["batch_folder"] for item in vod_16}, {"3", "4"})
+            self.assertTrue(all(item["vod_group"] == 1 for item in vod_16))
+
+    def test_vod_clip_rotation_incremental_matches_bulk_layout(self):
+        with tempfile.TemporaryDirectory() as bulk_tmp, tempfile.TemporaryDirectory() as incremental_tmp:
+            bulk_root = Path(bulk_tmp)
+            incremental_root = Path(incremental_tmp)
+            for vod_number in range(1, 17):
+                write_source(bulk_root, f"vod_{vod_number:02d}", rotation_specs(clip_count=3))
+            package_export_batches(bulk_root, cfg=make_rotation_cfg(), batch_size=15)
+
+            for vod_number in range(1, 17):
+                write_source(incremental_root, f"vod_{vod_number:02d}", rotation_specs(clip_count=3))
+                package_export_batches(incremental_root, cfg=make_rotation_cfg(), batch_size=15)
+
+            def layout(root):
+                return {
+                    (item["normalized_source_vod"], item["base_clip_id"]): (
+                        item["selected_variant"],
+                        item["batch_folder"],
+                    )
+                    for item in package_items(root)
+                }
+
+            self.assertEqual(layout(bulk_root), layout(incremental_root))
+
+    def test_vod_clip_rotation_falls_forward_to_next_export_ready_variant(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_source(
+                root,
+                "vod_01",
+                [
+                    {"clip_id": "clip_0001_v0_original", "score": 9.0, "tier": "review_needed"},
+                    {"clip_id": "clip_0001_v1_first_available", "score": 8.0},
+                    {"clip_id": "clip_0001_v3_later_available", "score": 7.0},
+                    {"clip_id": "clip_0002_v0_only_available", "score": 9.0},
+                ],
+            )
+
+            result = package_export_batches(root, cfg=make_rotation_cfg(), batch_size=15)
+
+            self.assertEqual(result["packaged_count"], 2)
+            items = {item["base_clip_id"]: item for item in package_items(root)}
+            self.assertEqual(items["clip_0001"]["requested_variant"], "v0")
+            self.assertEqual(items["clip_0001"]["selected_variant"], "v1_first_available")
+            self.assertEqual(items["clip_0001"]["selection_reason"], "rotation_fallback")
+            self.assertEqual(items["clip_0002"]["requested_variant"], "v1")
+            self.assertEqual(items["clip_0002"]["selected_variant"], "v0_only_available")
+            self.assertTrue((root / "vod_01" / "review_needed" / "v0").exists())
+
+    def test_vod_clip_rotation_does_not_package_another_variant_on_rerun(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_source(root, "vod_01", rotation_specs(clip_count=2))
+
+            first = package_export_batches(root, cfg=make_rotation_cfg(), batch_size=15)
+            second = package_export_batches(root, cfg=make_rotation_cfg(), batch_size=15)
+
+            self.assertEqual(first["packaged_count"], 2)
+            self.assertEqual(second["packaged_count"], 0)
+            self.assertEqual(len(package_items(root)), 2)
+            self.assertEqual(len(list(root.glob("vod_01/export_ready/**/*.mp4"))), 10)
+
+    def test_vod_clip_rotation_freezes_legacy_batches_and_vods(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_legacy_batch(root, 1, 15)
+            write_source(root, "legacy_vod", rotation_specs(clip_count=1))
+            legacy_cfg = make_cfg()
+            package_export_batches(root, cfg=legacy_cfg, batch_size=15)
+            previous_highest_folder = max(int(name) for name in batch_counts(root))
+            write_source(root, "new_vod", rotation_specs(clip_count=2))
+
+            result = package_export_batches(root, cfg=make_rotation_cfg(), batch_size=15)
+
+            self.assertEqual(result["packaged_count"], 2)
+            manifest = package_manifest(root)
+            self.assertEqual(
+                manifest["rotation_layout"]["started_at_folder"],
+                previous_highest_folder + 1,
+            )
+            new_items = [
+                item for item in manifest["items"]
+                if item.get("allocation_strategy") == "vod_clip_variant_rotation"
+            ]
+            self.assertEqual(
+                {item["batch_folder"] for item in new_items},
+                {str(previous_highest_folder + 1), str(previous_highest_folder + 2)},
+            )
+            self.assertIn("legacy_vod", manifest["rotation_layout"]["legacy_source_vods"])
+
     def test_can_package_single_vod_output_folder_directly(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -416,8 +548,32 @@ def make_cfg(one_variant: bool = False):
     return SimpleNamespace(
         EXPORT_BATCH_DIR_NAME="export_batches",
         EXPORT_BATCH_SIZE=15,
+        EXPORT_BATCH_STRATEGY="score_round_robin_all_variants",
+        EXPORT_BATCH_VARIANT_COUNT=6,
         EXPORT_PACK_ONE_VARIANT_PER_CLIP=one_variant,
     )
+
+
+def make_rotation_cfg():
+    return SimpleNamespace(
+        EXPORT_BATCH_DIR_NAME="export_batches",
+        EXPORT_BATCH_SIZE=15,
+        EXPORT_BATCH_STRATEGY="vod_clip_variant_rotation",
+        EXPORT_BATCH_VARIANT_COUNT=6,
+        EXPORT_PACK_ONE_VARIANT_PER_CLIP=False,
+    )
+
+
+def rotation_specs(clip_count: int) -> list[dict]:
+    return [
+        {
+            "clip_id": f"clip_{clip_number:04d}_v{variant_number}_variant_{variant_number}",
+            "score": 9.0 - (variant_number * 0.1),
+            "version": f"v{variant_number}",
+        }
+        for clip_number in range(1, clip_count + 1)
+        for variant_number in range(6)
+    ]
 
 
 def write_source(root: Path, source_name: str, specs: list[dict]) -> None:

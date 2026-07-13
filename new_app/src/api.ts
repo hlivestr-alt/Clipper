@@ -257,9 +257,9 @@ export type ModuleLibraryPage = {
 export type LogTail = {
   path: string;
   exists: boolean;
-  total_lines: number;
+  total_lines: number | null;
   returned_lines: number;
-  lines: { line_number: number; text: string }[];
+  lines: { line_number: number | null; text: string }[];
 };
 
 export type SettingsReadEntry = {
@@ -292,6 +292,7 @@ export type VariationVariant = {
   name: string;
   hook_type: string;
   visual_mode: "host" | "broll_audio";
+  random_broll_enabled: boolean;
   before_after_mode: "fullscreen";
   font_id: string;
   font_color: string;
@@ -456,8 +457,29 @@ export type ControlJob = {
   actor: string;
 };
 
+export type ControlJobResultSummary = {
+  eligible_count?: number | null;
+  packaged_count?: number | null;
+  batch_size?: number | null;
+  dry_run?: boolean | null;
+};
+
+export type ControlJobSummary = {
+  job_id: string;
+  operation: ControlOperation;
+  status: ControlJobStatus;
+  created_at: string;
+  updated_at: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+  error?: string | null;
+  conflict_key?: string | null;
+  actor: string;
+  result_summary?: ControlJobResultSummary | null;
+};
+
 export type ControlJobPage = {
-  jobs: ControlJob[];
+  jobs: ControlJobSummary[];
   total: number;
   limit: number;
   offset: number;

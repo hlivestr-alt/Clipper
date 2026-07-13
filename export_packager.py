@@ -16,6 +16,10 @@ from typing import Any
 PACKAGER_SCHEMA_VERSION = 1
 HASH_BYTES = 64 * 1024
 TIER_DIRS = {"export_ready", "review_needed", "rejected"}
+ROTATION_STRATEGY = "vod_clip_variant_rotation"
+SCORE_ROUND_ROBIN_STRATEGY = "score_round_robin_all_variants"
+ROTATION_LAYOUT_VERSION = 1
+DEFAULT_VARIANT_COUNT = 6
 
 
 @dataclass
@@ -35,6 +39,13 @@ class ExportCandidate:
     product: str = ""
     clip_type: str = ""
     excluded_variants: list[str] | None = None
+    allocation_strategy: str = ""
+    selection_reason: str = ""
+    requested_variant: str = ""
+    vod_index: int | None = None
+    vod_group: int | None = None
+    clip_number: int | None = None
+    lane_key: str = ""
 
 
 def package_export_batches(
@@ -64,46 +75,86 @@ def package_export_batches(
         for item in existing_items
         if item.get("content_md5_64k")
     }
+    strategy = _export_batch_strategy(cfg)
     one_variant_per_clip = bool(getattr(cfg, "EXPORT_PACK_ONE_VARIANT_PER_CLIP", False))
 
     raw_candidates = _discover_export_ready_candidates(root, batch_root)
-    candidate_pool = raw_candidates
-    variant_stats = {
-        "one_variant_per_clip": one_variant_per_clip,
-        "excluded_variant_count": 0,
-        "excluded_existing_base_count": 0,
-    }
-    if one_variant_per_clip:
-        candidate_pool, variant_stats = _select_one_variant_per_base_clip(
-            raw_candidates,
-            existing_base_clip_keys=_existing_base_clip_keys(existing_items),
-        )
-    candidates, duplicate_stats = _dedupe_candidates(
-        candidate_pool,
-        existing_source_keys=existing_source_keys,
-        existing_hashes=existing_hashes,
-    )
-    candidates.sort(
-        key=lambda item: (
-            -item.total_score,
-            item.normalized_source_vod,
-            item.clip_id.casefold(),
-            item.source_output_file.casefold(),
-        )
-    )
-
     existing_counts = _existing_batch_counts(batch_root, existing_items)
     legacy_batch_folder_cutoff, cutoff_needs_persist = _resolve_legacy_batch_folder_cutoff(
         manifest,
         existing_counts,
     )
-    assignments = _assign_score_round_robin(
-        candidates,
-        existing_counts,
-        existing_items,
-        size,
-        legacy_batch_folder_cutoff=legacy_batch_folder_cutoff,
-    )
+    candidate_pool = raw_candidates
+    variant_stats = {
+        "one_variant_per_clip": one_variant_per_clip or strategy == ROTATION_STRATEGY,
+        "excluded_variant_count": 0,
+        "excluded_existing_base_count": 0,
+        "excluded_legacy_vod_count": 0,
+    }
+    rotation_layout: dict[str, Any] | None = None
+    if strategy == ROTATION_STRATEGY:
+        rotation_layout = _load_or_create_rotation_layout(
+            manifest,
+            existing_counts,
+            existing_items,
+            size,
+        )
+        size = max(1, int(rotation_layout.get("batch_size") or size))
+        deduped_raw_candidates, duplicate_stats = _dedupe_candidates(
+            raw_candidates,
+            existing_source_keys=existing_source_keys,
+            existing_hashes=existing_hashes,
+        )
+        candidate_pool, variant_stats = _select_rotation_candidates(
+            deduped_raw_candidates,
+            existing_items=existing_items,
+            rotation_layout=rotation_layout,
+            batch_size=size,
+            variant_count=max(
+                1,
+                int(getattr(cfg, "EXPORT_BATCH_VARIANT_COUNT", DEFAULT_VARIANT_COUNT) or DEFAULT_VARIANT_COUNT),
+            ),
+        )
+        candidates = candidate_pool
+    elif one_variant_per_clip:
+        candidate_pool, variant_stats = _select_one_variant_per_base_clip(
+            raw_candidates,
+            existing_base_clip_keys=_existing_base_clip_keys(existing_items),
+        )
+        candidates, duplicate_stats = _dedupe_candidates(
+            candidate_pool,
+            existing_source_keys=existing_source_keys,
+            existing_hashes=existing_hashes,
+        )
+    else:
+        candidates, duplicate_stats = _dedupe_candidates(
+            candidate_pool,
+            existing_source_keys=existing_source_keys,
+            existing_hashes=existing_hashes,
+        )
+    if strategy == ROTATION_STRATEGY:
+        candidates.sort(key=_rotation_candidate_sort_key)
+        assignments = _assign_vod_clip_rotation(
+            candidates,
+            rotation_layout=rotation_layout or {},
+            existing_counts=existing_counts,
+        )
+    else:
+        candidates.sort(
+            key=lambda item: (
+                -item.total_score,
+                item.normalized_source_vod,
+                item.clip_id.casefold(),
+                item.source_output_file.casefold(),
+            )
+        )
+        assignments = _assign_score_round_robin(
+            candidates,
+            existing_counts,
+            existing_items,
+            size,
+            legacy_batch_folder_cutoff=legacy_batch_folder_cutoff,
+        )
     planned_destinations: set[str] = set()
     moved_items: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -128,7 +179,15 @@ def package_export_batches(
             "base_clip_id": candidate.base_clip_id,
             "selected_variant": candidate.variant_id,
             "excluded_variants": list(candidate.excluded_variants or []),
-            "selection_reason": "best_variant_only" if one_variant_per_clip else "all_variants_included",
+            "selection_reason": candidate.selection_reason or (
+                "best_variant_only" if one_variant_per_clip else "all_variants_included"
+            ),
+            "allocation_strategy": strategy,
+            "requested_variant": candidate.requested_variant,
+            "vod_index": candidate.vod_index,
+            "vod_group": candidate.vod_group,
+            "clip_number": candidate.clip_number,
+            "lane_key": candidate.lane_key,
             "source_clip_key": candidate.source_clip_key,
             "base_clip_key": candidate.base_clip_key,
             "content_md5_64k": candidate.content_md5_64k,
@@ -175,11 +234,14 @@ def package_export_batches(
             "batch_root": str(batch_root.resolve()),
             "batch_size": size,
             "legacy_batch_folder_cutoff": legacy_batch_folder_cutoff,
-            "order": "score_round_robin",
+            "order": strategy,
+            "allocation_strategy": strategy,
             "append_only": True,
             "items": manifest_items,
             "counts_by_batch": _counts_by_batch(manifest_items, batch_root),
         })
+        if rotation_layout is not None:
+            updated_manifest["rotation_layout"] = rotation_layout
         _write_json_atomic(manifest_path, updated_manifest)
 
     return {
@@ -194,9 +256,11 @@ def package_export_batches(
         "candidate_count_after_variant_filter": len(candidate_pool),
         "new_unique_count": len(candidates),
         "packaged_count": len(moved_items),
-        "one_variant_per_clip": one_variant_per_clip,
+        "allocation_strategy": strategy,
+        "one_variant_per_clip": variant_stats["one_variant_per_clip"],
         "excluded_variant_count": variant_stats["excluded_variant_count"],
         "excluded_existing_base_count": variant_stats["excluded_existing_base_count"],
+        "excluded_legacy_vod_count": variant_stats.get("excluded_legacy_vod_count", 0),
         "duplicate_existing_count": duplicate_stats["duplicate_existing_count"],
         "duplicate_candidate_count": duplicate_stats["duplicate_candidate_count"],
         "missing_count": duplicate_stats["missing_count"],
@@ -376,7 +440,223 @@ def _select_one_variant_per_base_clip(
         "one_variant_per_clip": True,
         "excluded_variant_count": excluded_variant_count,
         "excluded_existing_base_count": excluded_existing_base_count,
+        "excluded_legacy_vod_count": 0,
     }
+
+
+def _export_batch_strategy(cfg) -> str:
+    value = str(getattr(cfg, "EXPORT_BATCH_STRATEGY", ROTATION_STRATEGY) or ROTATION_STRATEGY)
+    normalized = value.casefold().strip()
+    aliases = {
+        "score_round_robin": SCORE_ROUND_ROBIN_STRATEGY,
+        "all_variants": SCORE_ROUND_ROBIN_STRATEGY,
+        SCORE_ROUND_ROBIN_STRATEGY: SCORE_ROUND_ROBIN_STRATEGY,
+        ROTATION_STRATEGY: ROTATION_STRATEGY,
+    }
+    return aliases.get(normalized, ROTATION_STRATEGY)
+
+
+def _load_or_create_rotation_layout(
+    manifest: dict[str, Any],
+    existing_counts: dict[int, int],
+    existing_items: list[dict[str, Any]],
+    batch_size: int,
+) -> dict[str, Any]:
+    stored = manifest.get("rotation_layout")
+    if isinstance(stored, dict) and int(stored.get("version") or 0) == ROTATION_LAYOUT_VERSION:
+        layout = dict(stored)
+        layout["vod_order"] = [
+            str(value)
+            for value in layout.get("vod_order", [])
+            if str(value).strip()
+        ]
+        layout["lanes"] = {
+            str(key): int(value)
+            for key, value in dict(layout.get("lanes") or {}).items()
+            if str(key).strip() and _coerce_nonnegative_int(value) is not None
+        }
+        layout["batch_size"] = max(1, int(layout.get("batch_size") or batch_size))
+        layout.setdefault("started_at_folder", max(existing_counts.keys(), default=0) + 1)
+        layout.setdefault("legacy_source_vods", _legacy_source_vods(existing_items))
+        return layout
+
+    return {
+        "version": ROTATION_LAYOUT_VERSION,
+        "strategy": ROTATION_STRATEGY,
+        "batch_size": max(1, int(batch_size)),
+        "started_at_folder": max(existing_counts.keys(), default=0) + 1,
+        "vod_order": [],
+        "lanes": {},
+        "legacy_source_vods": _legacy_source_vods(existing_items),
+    }
+
+
+def _legacy_source_vods(existing_items: list[dict[str, Any]]) -> list[str]:
+    return sorted({
+        _normalize_source_vod(str(item.get("normalized_source_vod") or item.get("source_vod") or ""))
+        for item in existing_items
+        if isinstance(item, dict)
+        and str(item.get("allocation_strategy") or "") != ROTATION_STRATEGY
+    })
+
+
+def _select_rotation_candidates(
+    candidates: list[ExportCandidate],
+    existing_items: list[dict[str, Any]],
+    rotation_layout: dict[str, Any],
+    batch_size: int,
+    variant_count: int,
+) -> tuple[list[ExportCandidate], dict[str, Any]]:
+    selected: list[ExportCandidate] = []
+    excluded_variant_count = 0
+    excluded_existing_base_count = 0
+    excluded_legacy_vod_count = 0
+    existing_bases = _existing_base_clip_keys(existing_items)
+    legacy_vods = {
+        _normalize_source_vod(value)
+        for value in rotation_layout.get("legacy_source_vods", [])
+    }
+    vod_order = [
+        _normalize_source_vod(value)
+        for value in rotation_layout.get("vod_order", [])
+    ]
+    vod_indexes = {source: index for index, source in enumerate(vod_order)}
+    candidates_by_vod: dict[str, list[ExportCandidate]] = {}
+    for candidate in candidates:
+        candidates_by_vod.setdefault(candidate.normalized_source_vod, []).append(candidate)
+
+    for source_vod in sorted(candidates_by_vod):
+        source_candidates = candidates_by_vod[source_vod]
+        if source_vod in legacy_vods and source_vod not in vod_indexes:
+            excluded_legacy_vod_count += len(source_candidates)
+            continue
+        if source_vod not in vod_indexes:
+            vod_indexes[source_vod] = len(vod_order)
+            vod_order.append(source_vod)
+        vod_index = vod_indexes[source_vod]
+        candidates_by_base: dict[str, list[ExportCandidate]] = {}
+        for candidate in source_candidates:
+            if candidate.base_clip_key in existing_bases:
+                excluded_existing_base_count += 1
+                continue
+            candidates_by_base.setdefault(candidate.base_clip_key, []).append(candidate)
+
+        for base_key in sorted(candidates_by_base, key=lambda key: _base_group_sort_key(candidates_by_base[key])):
+            variants = candidates_by_base[base_key]
+            clip_number = _clip_number(variants[0].base_clip_id)
+            if clip_number is None:
+                clip_number = _fallback_clip_position(variants[0].base_clip_id, candidates_by_base)
+            requested_index = (vod_index + max(0, clip_number - 1)) % variant_count
+            chosen, used_fallback = _select_rotated_variant(variants, requested_index, variant_count)
+            chosen.excluded_variants = [
+                candidate.variant_id
+                for candidate in variants
+                if candidate is not chosen
+            ]
+            chosen.allocation_strategy = ROTATION_STRATEGY
+            chosen.selection_reason = "rotation_fallback" if used_fallback else "vod_clip_rotation"
+            chosen.requested_variant = f"v{requested_index}"
+            chosen.vod_index = vod_index
+            chosen.vod_group = vod_index // max(1, batch_size)
+            chosen.clip_number = clip_number
+            chosen.lane_key = f"clip_{clip_number}:vod_group_{chosen.vod_group}"
+            excluded_variant_count += max(0, len(variants) - 1)
+            selected.append(chosen)
+
+    rotation_layout["vod_order"] = vod_order
+    return selected, {
+        "one_variant_per_clip": True,
+        "excluded_variant_count": excluded_variant_count,
+        "excluded_existing_base_count": excluded_existing_base_count,
+        "excluded_legacy_vod_count": excluded_legacy_vod_count,
+    }
+
+
+def _base_group_sort_key(candidates: list[ExportCandidate]) -> tuple[int, str]:
+    base_clip_id = candidates[0].base_clip_id if candidates else ""
+    clip_number = _clip_number(base_clip_id)
+    return (clip_number if clip_number is not None else 999999, base_clip_id.casefold())
+
+
+def _fallback_clip_position(base_clip_id: str, groups: dict[str, list[ExportCandidate]]) -> int:
+    ordered = sorted(
+        {items[0].base_clip_id for items in groups.values() if items},
+        key=lambda value: value.casefold(),
+    )
+    try:
+        return ordered.index(base_clip_id) + 1
+    except ValueError:
+        return 1
+
+
+def _clip_number(base_clip_id: str) -> int | None:
+    match = re.search(r"(?:^|_)clip_(\d+)(?:_|$)", str(base_clip_id or ""), flags=re.IGNORECASE)
+    if match is None:
+        match = re.search(r"(\d+)", str(base_clip_id or ""))
+    return int(match.group(1)) if match else None
+
+
+def _variant_number(candidate: ExportCandidate) -> int | None:
+    match = re.match(r"v(\d+)", str(candidate.variant_id or ""), flags=re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _select_rotated_variant(
+    variants: list[ExportCandidate],
+    requested_index: int,
+    variant_count: int,
+) -> tuple[ExportCandidate, bool]:
+    ordered = sorted(
+        variants,
+        key=lambda candidate: (
+            _variant_number(candidate) if _variant_number(candidate) is not None else 999999,
+            -candidate.total_score,
+            candidate.source_output_file.casefold(),
+        ),
+    )
+    by_index: dict[int, list[ExportCandidate]] = {}
+    for candidate in ordered:
+        number = _variant_number(candidate)
+        if number is not None:
+            by_index.setdefault(number, []).append(candidate)
+    for offset in range(max(1, variant_count)):
+        index = (requested_index + offset) % max(1, variant_count)
+        if by_index.get(index):
+            return by_index[index][0], offset != 0
+    return ordered[0], True
+
+
+def _rotation_candidate_sort_key(candidate: ExportCandidate) -> tuple[int, int, str, str]:
+    return (
+        candidate.vod_index if candidate.vod_index is not None else 999999,
+        candidate.clip_number if candidate.clip_number is not None else 999999,
+        candidate.normalized_source_vod,
+        candidate.clip_id.casefold(),
+    )
+
+
+def _assign_vod_clip_rotation(
+    candidates: list[ExportCandidate],
+    rotation_layout: dict[str, Any],
+    existing_counts: dict[int, int],
+) -> list[tuple[ExportCandidate, int]]:
+    lanes = {
+        str(key): int(value)
+        for key, value in dict(rotation_layout.get("lanes") or {}).items()
+        if _coerce_nonnegative_int(value) is not None
+    }
+    next_folder = max(
+        [max(existing_counts.keys(), default=0), int(rotation_layout.get("started_at_folder") or 1) - 1, *lanes.values()]
+    ) + 1
+    assignments: list[tuple[ExportCandidate, int]] = []
+    for candidate in sorted(candidates, key=_rotation_candidate_sort_key):
+        lane_key = candidate.lane_key
+        if lane_key not in lanes:
+            lanes[lane_key] = next_folder
+            next_folder += 1
+        assignments.append((candidate, lanes[lane_key]))
+    rotation_layout["lanes"] = lanes
+    return assignments
 
 
 def _variant_sort_key(candidate: ExportCandidate) -> tuple[int, str, str]:

@@ -78,7 +78,17 @@ class ReadApiTests(unittest.TestCase):
         service = ReadDashboardService(LegacyConfigProvider(config))
         jobs = ControlJobService(config, run_async=False)
         settings = SettingsService(service.settings_provider)
-        self.client = TestClient(create_app(service, job_service=jobs, settings_service=settings))
+        queue_controls = mock.Mock()
+        queue_controls.execute.return_value = {"control": {}, "supervisor": {}, "queue": {}}
+        self.client = TestClient(create_app(
+            service,
+            job_service=jobs,
+            settings_service=settings,
+            queue_control_service=queue_controls,
+        ))
+        self.config = config
+        self.jobs = jobs
+        self.queue_controls = queue_controls
         self.allowed_artifact = str(run_dir / "clip.mp4")
         self.run_dir = run_dir
 
@@ -151,23 +161,56 @@ class ReadApiTests(unittest.TestCase):
         job = response.json()["data"]
         self.assertEqual(job["operation"], "settings_update")
         self.assertEqual(job["status"], "completed")
-        self.assertEqual(self.client.get("/api/control/jobs").json()["data"]["total"], 1)
+        listed = self.client.get("/api/control/jobs").json()["data"]
+        self.assertEqual(listed["total"], 1)
+        self.assertNotIn("request", listed["jobs"][0])
+        self.assertNotIn("result", listed["jobs"][0])
+        detail = self.client.get(f"/api/control/jobs/{job['job_id']}").json()["data"]
+        self.assertIn("request", detail)
+        self.assertIn("result", detail)
 
     def test_mutation_path_safety_and_queue_job(self):
         denied = self.client.post("/api/operations/rescore", json={"output_dir": "../config.py"})
         self.assertEqual(denied.status_code, 403)
 
-        queue_response = self.client.post(
+        path_override = self.client.post(
             "/api/control/queue",
-            json={"action": "status", "control_path": str(self.run_dir / "control.json")},
+            json={
+                "action": "status",
+                "control_path": str(self.run_dir / "control.json"),
+                "forever_state_path": str(self.run_dir / "forever.json"),
+                "queue_state_path": str(self.run_dir / "queue.json"),
+            },
         )
+        self.assertEqual(path_override.status_code, 422)
+
+        queue_response = self.client.post("/api/control/queue", json={"action": "status"})
         self.assertEqual(queue_response.status_code, 202)
         job = queue_response.json()["data"]
         self.assertEqual(job["operation"], "queue_control")
         self.assertEqual(job["status"], "completed")
+        command = self.queue_controls.execute.call_args.args[0]
+        self.assertEqual(command.control_path, self.config.QUEUE_CONTROL_FILE)
+        self.assertEqual(command.forever_state_path, self.config.QUEUE_FOREVER_STATE_FILE)
+        self.assertEqual(command.queue_state_path, self.config.QUEUE_STATE_FILE)
         filtered = self.client.get("/api/control/jobs", params={"operation": "queue_control", "status": "completed"})
         self.assertEqual(filtered.status_code, 200)
         self.assertEqual(filtered.json()["data"]["total"], 1)
+
+    def test_public_state_path_overrides_are_rejected_and_hidden_from_openapi(self):
+        for route in ("/api/dashboard", "/api/queue"):
+            response = self.client.get(route, params={"state_path": str(self.run_dir / "state.json")})
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("not supported", response.json()["detail"])
+
+        schema = self.client.get("/openapi.json").json()
+        for route in ("/api/dashboard", "/api/queue"):
+            parameters = schema["paths"][route]["get"].get("parameters", [])
+            self.assertNotIn("state_path", {item["name"] for item in parameters})
+        request_properties = schema["components"]["schemas"]["QueueControlRequest"]["properties"]
+        self.assertNotIn("control_path", request_properties)
+        self.assertNotIn("forever_state_path", request_properties)
+        self.assertNotIn("queue_state_path", request_properties)
 
     def test_working_dir_override_is_shared_by_settings_and_variations(self):
         effective = self.client.get("/api/settings/effective").json()["data"]

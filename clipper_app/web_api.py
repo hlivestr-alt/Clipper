@@ -47,7 +47,7 @@ from clipper_app.contracts.models import (
 from clipper_app.contracts.read_models import SettingsReadEntry, SettingsReadSnapshot
 
 try:
-    from fastapi import FastAPI, HTTPException, Query, Response, status
+    from fastapi import FastAPI, HTTPException, Query, Request, Response, status
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse
     from fastapi.staticfiles import StaticFiles
@@ -227,12 +227,16 @@ def create_app(
         return _envelope(ReadServiceResult({"status": "ok", "mode": "control"}))
 
     @api.get("/api/dashboard")
-    def dashboard(state_path: str | None = None) -> dict[str, Any]:
-        return _envelope(read_service.dashboard(state_path=state_path))
+    def dashboard(request: Request) -> dict[str, Any]:
+        if "state_path" in request.query_params:
+            raise HTTPException(status_code=400, detail="state_path overrides are not supported")
+        return _envelope(read_service.dashboard())
 
     @api.get("/api/queue")
-    def queue(state_path: str | None = None) -> dict[str, Any]:
-        return _envelope(read_service.queue_detail(state_path=state_path))
+    def queue(request: Request) -> dict[str, Any]:
+        if "state_path" in request.query_params:
+            raise HTTPException(status_code=400, detail="state_path overrides are not supported")
+        return _envelope(read_service.queue_detail())
 
     @api.get("/api/queue/vods")
     def queue_vods() -> dict[str, Any]:
@@ -457,11 +461,21 @@ def create_app(
     @api.post("/api/control/queue")
     def control_queue(request: QueueControlRequest, response: Response) -> dict[str, Any]:
         launch_config = _validated_queue_launch_config(read_service, request)
+        queue_cfg = provider.runtime_view(provider.snapshot())
         command = QueueControlCommand(
             action=request.action,
-            control_path=request.control_path,
-            forever_state_path=request.forever_state_path,
-            queue_state_path=request.queue_state_path,
+            control_path=str(
+                getattr(queue_cfg, "QUEUE_CONTROL_FILE", "working/queue_control.json")
+                or "working/queue_control.json"
+            ),
+            forever_state_path=str(
+                getattr(queue_cfg, "QUEUE_FOREVER_STATE_FILE", "working/queue_forever_state.json")
+                or "working/queue_forever_state.json"
+            ),
+            queue_state_path=str(
+                getattr(queue_cfg, "QUEUE_STATE_FILE", "working/video_queue_state.json")
+                or "working/video_queue_state.json"
+            ),
             launch_config=launch_config,
         )
         try:

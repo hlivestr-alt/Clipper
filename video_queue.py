@@ -32,6 +32,11 @@ from queue import Empty, Full, PriorityQueue, Queue
 from typing import Optional
 
 import queue_control
+from clipper_app.application.logging_utils import (
+    LockedSizeRotatingFileHandler,
+    PIPELINE_LOG_BACKUP_COUNT,
+    PIPELINE_LOG_MAX_BYTES,
+)
 from stage_cache import stage_fingerprint_matches, write_stage_fingerprint
 
 
@@ -41,7 +46,12 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("pipeline.log", encoding="utf-8"),
+        LockedSizeRotatingFileHandler(
+            "pipeline.log",
+            max_bytes=PIPELINE_LOG_MAX_BYTES,
+            backup_count=PIPELINE_LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        ),
     ],
 )
 log = logging.getLogger("proya.queue")

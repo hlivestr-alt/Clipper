@@ -61,6 +61,7 @@ import {
   ComplianceViolationRow,
   ControlJob,
   ControlJobPage,
+  ControlJobSummary,
   DashboardSummary,
   DesktopRuntimeStatus,
   getJson,
@@ -90,6 +91,7 @@ import {
   VariationProfile,
   VariationVariant
 } from "./api";
+import { boundedJsonPreview } from "./boundedJsonPreview";
 import { usePolling } from "./usePolling";
 
 type BadgeKind = "good" | "bad" | "warn" | "info" | "neutral";
@@ -635,12 +637,7 @@ function buildComplianceOverview(data: ComplianceIndexPage | undefined, scoreRow
   return { scanned, passed, blocked, rate };
 }
 
-function exportPayload(job?: ControlJob): Record<string, unknown> | undefined {
-  const result = asRecord(job?.result);
-  return asRecord(result?.payload) ?? result;
-}
-
-function buildExportOverview(jobs: ControlJob[], readyFallback: number): ExportOverview {
+function buildExportOverview(jobs: ControlJobSummary[], readyFallback: number): ExportOverview {
   const latest = [...jobs]
     .filter((job) => job.operation === "export_batches")
     .sort((left, right) => {
@@ -648,7 +645,7 @@ function buildExportOverview(jobs: ControlJob[], readyFallback: number): ExportO
       const rightDate = parseDateValue(right.updated_at)?.getTime() ?? 0;
       return rightDate - leftDate;
     })[0];
-  const payload = exportPayload(latest);
+  const payload = asRecord(latest?.result_summary);
   const ready = Math.max(0, Math.round(recordNumber(payload, "eligible_count") ?? readyFallback));
   const packaged = Math.max(0, Math.round(recordNumber(payload, "packaged_count") ?? 0));
   const batchSize = Math.max(0, Math.round(recordNumber(payload, "batch_size") ?? 0));
@@ -3438,7 +3435,10 @@ function VariationsPage({ active }: { active: boolean }) {
     if (!draft) {
       return;
     }
-    const variants = draft.variants.map((variant, itemIndex) => itemIndex === index ? { ...variant, ...patch } : variant);
+    const safePatch = patch.visual_mode === "broll_audio"
+      ? { ...patch, random_broll_enabled: false }
+      : patch;
+    const variants = draft.variants.map((variant, itemIndex) => itemIndex === index ? { ...variant, ...safePatch } : variant);
     updateDraft({ ...draft, variants });
   }
 
@@ -3715,6 +3715,12 @@ function VariationsPage({ active }: { active: boolean }) {
                         </select>
                       </FilterField>
                       <ToggleField label="SFX" checked={variant.sfx_enabled} disabled={!featureFlags.sfx} onChange={(value) => updateVariant(index, { sfx_enabled: value })} />
+                      <ToggleField
+                        label="Random relevant B-roll"
+                        checked={variant.random_broll_enabled}
+                        disabled={variant.visual_mode === "broll_audio"}
+                        onChange={(value) => updateVariant(index, { random_broll_enabled: value })}
+                      />
                       <ToggleField
                         label="Product zoom"
                         checked={variant.product_zoom_enabled}
@@ -4106,6 +4112,7 @@ function normalizeUiProfile(profile: VariationProfile): VariationProfile {
   copy.variants = copy.variants.map((variant) => ({
     ...variant,
     before_after_mode: "fullscreen",
+    random_broll_enabled: variant.random_broll_enabled ?? false,
     subtitle_size: variant.subtitle_size ?? "medium",
     letterbox_hook_enabled: variant.letterbox_hook_enabled ?? false,
     letterbox_hook_font_id: variant.letterbox_hook_font_id || variant.font_id || "",
@@ -4163,6 +4170,7 @@ function createUiVariant(index: number, base?: VariationVariant): VariationVaria
     name: `Variant ${index + 1}`,
     hook_type: base?.hook_type ?? "text",
     visual_mode: base?.visual_mode ?? "host",
+    random_broll_enabled: base?.visual_mode === "broll_audio" ? false : base?.random_broll_enabled ?? false,
     before_after_mode: base?.before_after_mode ?? "fullscreen",
     font_id: base?.font_id ?? "",
     font_color: base?.font_color ?? "#FFFFFF",
@@ -4242,7 +4250,8 @@ function JobsPage({ active }: { active: boolean }) {
     `job-detail:${selected}`,
     () => getJson<ControlJob>(`/api/control/jobs/${selected}`),
     0,
-    active && Boolean(selected)
+    active && Boolean(selected),
+    { cache: false }
   );
   const rows = jobs.envelope?.data.jobs ?? [];
   const operations: ControlJob["operation"][] = ["queue_control", "settings_update", "settings_delete", "settings_reset", "rescore", "compliance_scan", "module_assembly", "export_batches", "module_review"];
@@ -4281,7 +4290,7 @@ function JobTable({
   setSelected,
   compact = false
 }: {
-  rows: ControlJob[];
+  rows: ControlJobSummary[];
   selected: string;
   setSelected: (id: string) => void;
   compact?: boolean;
@@ -4333,6 +4342,14 @@ function JobDetailDrawer({
   error?: string;
   onClose: () => void;
 }) {
+  const requestPreview = useMemo(
+    () => job ? boundedJsonPreview(job.request) : undefined,
+    [job?.request]
+  );
+  const resultPreview = useMemo(
+    () => job ? boundedJsonPreview(job.result ?? null) : undefined,
+    [job?.result]
+  );
   return (
     <Drawer open={Boolean(job) || loading || Boolean(error)} title={job ? operationLabel(job.operation) : "Job detail"} detail={job?.job_id} onClose={onClose}>
       {loading && <SkeletonLines count={5} />}
@@ -4348,11 +4365,21 @@ function JobDetailDrawer({
           {job.error && <StateBlock kind="bad" title="Error" detail={job.error} />}
           <section className="drawer-section">
             <h3>Request</h3>
-            <pre className="json-panel">{compactJson(job.request)}</pre>
+            <pre className="json-panel">{requestPreview?.text ?? "-"}</pre>
+            {requestPreview?.truncated && (
+              <p className="json-preview-note">
+                Preview truncated to protect the renderer{requestPreview.circular ? "; circular values were replaced" : ""}.
+              </p>
+            )}
           </section>
           <section className="drawer-section">
             <h3>Result</h3>
-            <pre className="json-panel">{compactJson(job.result)}</pre>
+            <pre className="json-panel">{resultPreview?.text ?? "-"}</pre>
+            {resultPreview?.truncated && (
+              <p className="json-preview-note">
+                Preview truncated to protect the renderer{resultPreview.circular ? "; circular values were replaced" : ""}.
+              </p>
+            )}
           </section>
         </>
       )}
@@ -4366,7 +4393,11 @@ function LogsPage({ active }: { active: boolean }) {
   const [follow, setFollow] = useState(true);
   const [wrap, setWrap] = useState(true);
   const logs = usePolling(`logs:${lines}`, () => getJson<LogTail>(`/api/logs?lines=${lines}`), follow ? 2000 : 0, active);
-  const visible = (logs.envelope?.data.lines ?? []).filter((line) => !search || line.text.toLowerCase().includes(search.toLowerCase()));
+  const visible = (logs.envelope?.data.lines ?? [])
+    .map((line, sourceIndex) => ({ ...line, sourceIndex }))
+    .filter((line) => !search || line.text.toLowerCase().includes(search.toLowerCase()));
+  const totalLines = logs.envelope?.data.total_lines;
+  const returnedLines = logs.envelope?.data.returned_lines ?? 0;
   return (
     <section className="page-stack">
       <PageTitle title="Pipeline logs" detail="Follow current pipeline output or pause to investigate an issue." onRefresh={logs.refresh} />
@@ -4388,13 +4419,13 @@ function LogsPage({ active }: { active: boolean }) {
       <StateBlock kind="warn" warnings={logs.envelope?.warnings} />
       <div className="log-meta">
         <span>{logs.envelope?.data.path || "pipeline.log"}</span>
-        <span>{numberText(logs.envelope?.data.returned_lines)} of {numberText(logs.envelope?.data.total_lines)} lines</span>
+        <span>{totalLines == null ? `Latest ${numberText(returnedLines)} lines` : `Latest ${numberText(returnedLines)} of ${numberText(totalLines)} lines`}</span>
         <span>{logs.envelope?.generated_at ? `Updated ${displayTime(logs.envelope.generated_at)}` : "Waiting for log data"}</span>
       </div>
       {visible.length === 0 && !logs.loading && <EmptyState icon={Terminal} title={search ? "No matching log lines" : "No log lines yet"} detail={search ? "Change the search text or line range." : "Pipeline output will appear here when a run starts."} />}
       <div className={`log-panel ${wrap ? "wrap" : "nowrap"}`} role="log" aria-live={follow ? "polite" : "off"}>
         {visible.map((line) => (
-          <div key={line.line_number}><span>{line.line_number}</span>{line.text}</div>
+          <div key={line.line_number == null ? `recent-${line.sourceIndex}` : `line-${line.line_number}`}><span>{line.line_number ?? "\u00b7"}</span>{line.text}</div>
         ))}
       </div>
     </section>

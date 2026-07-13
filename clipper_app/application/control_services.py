@@ -12,6 +12,11 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 
+from clipper_app.application.logging_utils import (
+    AUDIT_LOG_BACKUP_COUNT,
+    AUDIT_LOG_MAX_BYTES,
+    append_rotating_text,
+)
 from clipper_app.application.settings import (
     LegacyConfigProvider,
     SETTINGS_REGISTRY,
@@ -22,7 +27,9 @@ from clipper_app.contracts.control_models import (
     ControlAuditEntry,
     ControlJob,
     ControlJobPage,
+    ControlJobResultSummary,
     ControlJobStatus,
+    ControlJobSummary,
     ControlOperation,
 )
 from clipper_app.contracts.models import SettingsSnapshot
@@ -52,6 +59,45 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
         encoding="utf-8",
     )
     temp_path.replace(path)
+
+
+def _non_negative_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float) and value.is_integer() and value >= 0:
+        return int(value)
+    return None
+
+
+def _control_job_summary(job: ControlJob) -> ControlJobSummary:
+    result_summary: ControlJobResultSummary | None = None
+    if job.operation == ControlOperation.EXPORT_BATCHES and job.result is not None:
+        result: Mapping[str, Any] = job.result
+        nested = result.get("payload")
+        if isinstance(nested, Mapping):
+            result = nested
+        dry_run = result.get("dry_run")
+        result_summary = ControlJobResultSummary(
+            eligible_count=_non_negative_int(result.get("eligible_count")),
+            packaged_count=_non_negative_int(result.get("packaged_count")),
+            batch_size=_non_negative_int(result.get("batch_size")),
+            dry_run=dry_run if isinstance(dry_run, bool) else None,
+        )
+    return ControlJobSummary(
+        job_id=job.job_id,
+        operation=job.operation,
+        status=job.status,
+        created_at=job.created_at,
+        updated_at=job.updated_at,
+        started_at=job.started_at,
+        finished_at=job.finished_at,
+        result_summary=result_summary,
+        error=job.error,
+        conflict_key=job.conflict_key,
+        actor=job.actor,
+    )
 
 
 class SettingsRevisionConflict(ValueError):
@@ -264,8 +310,13 @@ class ControlJobService:
     ) -> ControlJobPage:
         limit = max(1, min(int(limit or 50), 200))
         offset = max(0, int(offset or 0))
-        jobs = [self._load_job(path) for path in self.jobs_dir.glob("*.json")]
-        jobs = [job for job in jobs if job is not None]
+        jobs: list[ControlJobSummary] = []
+        for path in self.jobs_dir.glob("*.json"):
+            job = self._load_job(path)
+            if job is not None:
+                summary = _control_job_summary(job)
+                del job
+                jobs.append(summary)
         if operation:
             normalized_operation = str(operation).strip().casefold()
             jobs = [job for job in jobs if job.operation.value.casefold() == normalized_operation]
@@ -390,6 +441,9 @@ class ControlJobService:
             actor=job.actor,
             detail=dict(detail or {}),
         )
-        with self.audit_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(entry.model_dump(mode="json"), ensure_ascii=False, sort_keys=True))
-            handle.write("\n")
+        append_rotating_text(
+            self.audit_path,
+            json.dumps(entry.model_dump(mode="json"), ensure_ascii=False, sort_keys=True) + "\n",
+            max_bytes=AUDIT_LOG_MAX_BYTES,
+            backup_count=AUDIT_LOG_BACKUP_COUNT,
+        )

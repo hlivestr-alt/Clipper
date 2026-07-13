@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import random
 import re
 import subprocess
@@ -76,6 +77,22 @@ class BrollPlan:
     transitions: tuple[BrollTransition, ...]
     target_duration: float
     crossfade: float
+
+
+@dataclass(frozen=True)
+class RandomBrollSegment:
+    path: str
+    start: float
+    duration: float
+    source_start: float
+
+
+@dataclass(frozen=True)
+class RandomBrollPlan:
+    product_key: str
+    product_label: str
+    folder: str
+    segments: tuple[RandomBrollSegment, ...]
 
 
 ProbeFn = Callable[[str], dict[str, Any] | None]
@@ -319,6 +336,116 @@ def build_broll_plan(
     )
 
 
+def build_random_broll_plan(
+    moment: dict[str, Any],
+    cfg,
+    clip_duration: float,
+    hook_end: float = 0.0,
+    rng: random.Random | None = None,
+    probe_fn: ProbeFn | None = None,
+    product_events: list[dict[str, Any]] | None = None,
+) -> tuple[RandomBrollPlan | None, str]:
+    """Plan sparse, repeatable product-matched cutaways over the host video."""
+    try:
+        duration = float(clip_duration)
+    except (TypeError, ValueError):
+        duration = 0.0
+    protected_until = max(2.5, _safe_float(hook_end, 0.0))
+    eligible_end = duration - 0.5
+    eligible_duration = eligible_end - protected_until
+    if eligible_duration < 2.0:
+        return None, "clip has no room for a random B-roll cutaway after the opening hook"
+
+    product_key = resolve_moment_product_key(moment, product_events=product_events)
+    if not product_key:
+        return None, "moment has no supported product for random product B-roll"
+
+    folder = product_broll_folder(cfg, product_key)
+    if not folder.exists() or not folder.is_dir():
+        return None, f"product B-roll folder missing for {product_key}: {folder}"
+
+    files = list_product_broll_files(cfg, product_key)
+    if not files:
+        return None, f"product B-roll folder has no supported videos for {product_key}: {folder}"
+
+    probe = probe_fn or probe_video
+    clips: list[BrollClip] = []
+    for path in files:
+        info = probe(str(path))
+        if not info:
+            continue
+        clip_length = _safe_float(info.get("duration"), 0.0)
+        if clip_length < 2.0:
+            continue
+        clips.append(BrollClip(
+            path=str(path),
+            duration=clip_length,
+            width=int(info.get("width") or 0),
+            height=int(info.get("height") or 0),
+            fps=info.get("fps"),
+        ))
+    if not clips:
+        return None, f"product B-roll folder has no valid videos at least 2 seconds long for {product_key}: {folder}"
+
+    picker = rng or random.Random()
+    coverage_budget = duration * 0.25
+    target_count = min(3, max(1, math.ceil(eligible_duration / 10.0)))
+    count = min(
+        target_count,
+        int(coverage_budget // 2.0),
+        int((eligible_duration + 1.0) // 3.0),
+    )
+    if count < 1:
+        return None, "clip is too short for a 2-second random B-roll cutaway within the 25% coverage limit"
+
+    chosen: list[tuple[BrollClip, float, float]] = []
+    remaining_budget = coverage_budget
+    previous: BrollClip | None = None
+    for index in range(count):
+        choices = [clip for clip in clips if previous is None or len(clips) == 1 or clip.path != previous.path]
+        asset = picker.choice(choices or clips)
+        remaining_count = count - index - 1
+        max_segment = min(3.0, asset.duration, remaining_budget - (remaining_count * 2.0))
+        if max_segment < 2.0:
+            break
+        segment_duration = picker.uniform(2.0, max_segment) if max_segment > 2.0 else 2.0
+        source_start = picker.uniform(0.0, max(0.0, asset.duration - segment_duration))
+        chosen.append((asset, segment_duration, source_start))
+        remaining_budget -= segment_duration
+        previous = asset
+
+    if not chosen:
+        return None, "valid product B-roll assets could not fit the sparse cutaway schedule"
+
+    required = sum(item[1] for item in chosen) + max(0, len(chosen) - 1)
+    if required > eligible_duration + 1e-6:
+        return None, "random B-roll cutaways could not fit without overlapping"
+    slack = max(0.0, eligible_duration - required)
+    weights = [picker.random() for _ in range(len(chosen) + 1)]
+    weight_total = sum(weights) or 1.0
+    gaps = [slack * weight / weight_total for weight in weights]
+
+    segments: list[RandomBrollSegment] = []
+    cursor = protected_until + gaps[0]
+    for index, (asset, segment_duration, source_start) in enumerate(chosen):
+        segments.append(RandomBrollSegment(
+            path=asset.path,
+            start=round(cursor, 6),
+            duration=round(segment_duration, 6),
+            source_start=round(source_start, 6),
+        ))
+        cursor += segment_duration
+        if index < len(chosen) - 1:
+            cursor += 1.0 + gaps[index + 1]
+
+    return RandomBrollPlan(
+        product_key=product_key,
+        product_label=PRODUCT_LABELS.get(product_key, product_key.replace("_", " ").title()),
+        folder=str(folder),
+        segments=tuple(segments),
+    ), ""
+
+
 def plan_manifest(plan: BrollPlan) -> dict[str, Any]:
     return {
         "product_key": plan.product_key,
@@ -327,6 +454,25 @@ def plan_manifest(plan: BrollPlan) -> dict[str, Any]:
         "clip_count": len(plan.clips),
         "clips": [str(Path(clip.path).name) for clip in plan.clips],
         "crossfade": plan.crossfade,
+    }
+
+
+def random_plan_manifest(plan: RandomBrollPlan) -> dict[str, Any]:
+    return {
+        "product_key": plan.product_key,
+        "product_label": plan.product_label,
+        "folder": plan.folder,
+        "clip_count": len(plan.segments),
+        "clips": [str(Path(segment.path).name) for segment in plan.segments],
+        "segments": [
+            {
+                "file": str(Path(segment.path).name),
+                "start": segment.start,
+                "duration": segment.duration,
+                "source_start": segment.source_start,
+            }
+            for segment in plan.segments
+        ],
     }
 
 
