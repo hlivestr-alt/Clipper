@@ -79,6 +79,8 @@ log = logging.getLogger("proya.main")
 EXPORT_BATCH_ASYNC_ENV = "PROYA_QUEUE_EXPORT_PACKAGING_ASYNC"
 EXPORT_BATCH_TIMEOUT_ENV = "PROYA_EXPORT_BATCH_TIMEOUT_SECONDS"
 _EXPORT_BATCH_PACKAGING_LOCK = threading.Lock()
+_EXPORT_BATCH_THREADS_LOCK = threading.Lock()
+_EXPORT_BATCH_THREADS: set[threading.Thread] = set()
 
 
 class PipelinePaused(RuntimeError):
@@ -1638,6 +1640,7 @@ def _run_export_batch_packaging(
     progress_callback=None,
     lock_timeout: float | None = None,
     queue_continues: bool = False,
+    source_output_dir: str | Path | None = None,
 ) -> dict:
     if not bool(getattr(cfg, "EXPORT_BATCHES_ENABLED", False)):
         return {}
@@ -1670,12 +1673,14 @@ def _run_export_batch_packaging(
                 raise TimeoutError(
                     f"another export batch packaging job is still running after {lock_timeout:.0f}s"
                 )
-        result = package_export_batches(
-            output_root,
-            cfg=cfg,
-            batch_size=batch_size,
-            trigger="automatic",
-        )
+        package_kwargs = {
+            "cfg": cfg,
+            "batch_size": batch_size,
+            "trigger": "automatic",
+        }
+        if source_output_dir is not None:
+            package_kwargs["source_output_dir"] = source_output_dir
+        result = package_export_batches(output_root, **package_kwargs)
     except Exception as exc:
         if queue_continues:
             log.warning("Export batch packaging failed: %s — queue continues", exc)
@@ -1688,9 +1693,10 @@ def _run_export_batch_packaging(
 
     _log_export_batch_success(result)
     log.info(
-        "  Export batch packaging: eligible=%s new_unique=%s moved=%s duplicate_existing=%s duplicate_candidate=%s errors=%s",
+        "  Export batch packaging: eligible=%s new_unique=%s intaken=%s batched=%s duplicate_existing=%s duplicate_candidate=%s errors=%s",
         result.get("eligible_count", 0),
         result.get("new_unique_count", 0),
+        result.get("intake_count", 0),
         result.get("packaged_count", 0),
         result.get("duplicate_existing_count", 0),
         result.get("duplicate_candidate_count", 0),
@@ -1703,7 +1709,10 @@ def _run_export_batch_packaging(
     return result
 
 
-def _start_export_batch_packaging_thread(cfg) -> threading.Thread:
+def _start_export_batch_packaging_thread(
+    cfg,
+    source_output_dir: str | Path | None = None,
+) -> threading.Thread:
     timeout = _export_batch_timeout_seconds(cfg)
 
     def worker() -> None:
@@ -1729,17 +1738,51 @@ def _start_export_batch_packaging_thread(cfg) -> threading.Thread:
                 progress_callback=None,
                 lock_timeout=timeout if timeout > 0 else None,
                 queue_continues=True,
+                source_output_dir=source_output_dir,
             )
         finally:
             done.set()
+            with _EXPORT_BATCH_THREADS_LOCK:
+                _EXPORT_BATCH_THREADS.discard(threading.current_thread())
 
     thread = threading.Thread(
         target=worker,
         name=f"export-batch-packaging-{int(time.time())}",
-        daemon=True,
+        daemon=False,
     )
-    thread.start()
+    with _EXPORT_BATCH_THREADS_LOCK:
+        _EXPORT_BATCH_THREADS.add(thread)
+    try:
+        thread.start()
+    except BaseException:
+        with _EXPORT_BATCH_THREADS_LOCK:
+            _EXPORT_BATCH_THREADS.discard(thread)
+        raise
     return thread
+
+
+def wait_for_export_batch_packaging(timeout: float | None = None) -> int:
+    """Wait for every submitted export job so one-shot queue exit cannot kill intake."""
+    deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+    waited = 0
+    while True:
+        with _EXPORT_BATCH_THREADS_LOCK:
+            threads = [
+                thread
+                for thread in _EXPORT_BATCH_THREADS
+                if thread is not threading.current_thread() and thread.is_alive()
+            ]
+        if not threads:
+            return waited
+        for thread in threads:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if remaining == 0.0:
+                return waited
+            log.info("Waiting for export batch packaging to finish: %s", thread.name)
+            thread.join(timeout=remaining)
+            waited += 1
+        if deadline is not None and time.monotonic() >= deadline:
+            return waited
 
 
 def _package_export_batches_if_enabled(
@@ -1747,6 +1790,7 @@ def _package_export_batches_if_enabled(
     progress_callback=None,
     *,
     max_clips: int | None = None,
+    source_output_dir: str | Path | None = None,
 ) -> dict:
     if not bool(getattr(cfg, "EXPORT_BATCHES_ENABLED", False)):
         return {}
@@ -1761,10 +1805,14 @@ def _package_export_batches_if_enabled(
                 99,
                 "Export batch packaging submitted in background...",
             )
-        thread = _start_export_batch_packaging_thread(cfg)
+        thread = _start_export_batch_packaging_thread(cfg, source_output_dir=source_output_dir)
         log.info("Export batch packaging submitted in background: %s", thread.name)
         return {"async": True, "thread_name": thread.name}
-    return _run_export_batch_packaging(cfg, progress_callback=progress_callback)
+    return _run_export_batch_packaging(
+        cfg,
+        progress_callback=progress_callback,
+        source_output_dir=source_output_dir,
+    )
 
 
 def _attach_score_to_manifest(row: dict, score: dict, cfg) -> None:
@@ -2066,7 +2114,13 @@ def _run_pipeline_impl(
             variant_seed = getattr(cfg, "VARIANT_SEED", 42)
             log.info(f"\n── VARIATION ENGINE ──────────────────────────────────────────────")
             log.info(f"  Base moments: {len(moments)} | Variants per clip: {n_variants}")
-            moments = expand_moments_with_variants(moments, cfg, n_variants=n_variants, seed=variant_seed)
+            moments = expand_moments_with_variants(
+                moments,
+                cfg,
+                n_variants=n_variants,
+                seed=variant_seed,
+                source_identity=video_path,
+            )
             log.info(f"  Total clip jobs after expansion: {len(moments)}")
         except ImportError:
             log.warning("variation_engine.py not found — skipping variations")
@@ -2251,6 +2305,7 @@ def _run_pipeline_impl(
                 n_variants=requested_variants,
                 seed=variant_seed,
                 selection_mode=selection_mode,
+                source_identity=video_path,
             )
             log.info(f"  Total clip jobs after expansion: {len(moments)}")
     except ImportError:
@@ -2445,6 +2500,7 @@ def _run_pipeline_impl(
         cfg,
         progress_callback,
         max_clips=max_clips,
+        source_output_dir=output_dir,
     )
 
     log.info("\n" + "=" * 70)

@@ -394,6 +394,7 @@ class ControlJobService:
     interactive_pending: int = 16
     batch_workers: int = 2
     batch_pending: int = 8
+    on_change: Callable[[ControlJob], None] | None = None
 
     def __post_init__(self) -> None:
         if self.config_module is None:
@@ -746,6 +747,11 @@ class ControlJobService:
             self._job_path(job.job_id),
             metadata.model_dump(mode="json", exclude={"result"}),
         )
+        if self.on_change is not None:
+            try:
+                self.on_change(job)
+            except Exception:
+                pass
 
     def _load_job(self, path: Path) -> ControlJob | None:
         try:

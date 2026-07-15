@@ -13,6 +13,7 @@ from typing import Any, Iterable, Literal
 from urllib.parse import quote
 
 from clipper_app.application.log_tail import reverse_tail
+from clipper_app.application.queue_repository import QueueStateRepository, queue_storage_mode
 from clipper_app.application.read_cache import ReadCache
 from clipper_app.application.settings import BROWSER_EDITABLE_SETTINGS, LegacyConfigProvider, SETTINGS_REGISTRY
 from clipper_app.contracts.read_models import (
@@ -73,6 +74,7 @@ class ReadServiceResult:
     data: Any
     source_signatures: tuple[SourceSignature, ...] = ()
     warnings: tuple[str, ...] = ()
+    revision: str | None = None
 
 
 @dataclass(frozen=True)
@@ -213,10 +215,23 @@ def module_source_date_value(module: dict[str, Any]) -> str:
 
 
 class ReadDashboardService:
-    def __init__(self, settings_provider: LegacyConfigProvider | None = None) -> None:
+    def __init__(
+        self,
+        settings_provider: LegacyConfigProvider | None = None,
+        *,
+        force_legacy: bool = False,
+    ) -> None:
         self.settings_provider = settings_provider or LegacyConfigProvider()
         self.cfg = self.settings_provider.live_view()
         self._cache = ReadCache(max_entries=96)
+        self.catalog_mode = "legacy" if force_legacy else (
+            os.getenv("CLIPPER_CATALOG_MODE", "legacy").strip().casefold() or "legacy"
+        )
+        self._catalog = None
+        if self.catalog_mode == "catalog":
+            from clipper_app.application.catalog import CatalogDatabase, CatalogQueryService
+
+            self._catalog = CatalogQueryService(CatalogDatabase.from_config(self.cfg), self.cfg)
 
     def invalidate(self, *domains: str) -> None:
         """Invalidate cached read corpora after a successful mutation."""
@@ -327,6 +342,17 @@ class ReadDashboardService:
         direction: Literal["asc", "desc"] = "desc",
     ) -> ReadServiceResult:
         limit, offset = self._bounded_page(limit, offset)
+        if self._catalog is not None and self._catalog.ready("score_records"):
+            data = self._catalog.scores(
+                limit=limit,
+                offset=offset,
+                search=search,
+                status=status,
+                product=product,
+                sort=sort,
+                direction=direction,
+            )
+            return ReadServiceResult(data, revision=self._catalog.revision("scores"))
         records, signatures, warnings, stats = self._score_records()
         filter_options = {
             "product": tuple(sorted({record.row.product for record in records if record.row.product})),
@@ -347,6 +373,11 @@ class ReadDashboardService:
         return ReadServiceResult(data, tuple(signatures), tuple(warnings))
 
     def score_detail(self, score_key: str) -> ReadServiceResult:
+        if self._catalog is not None and self._catalog.ready("score_records"):
+            return ReadServiceResult(
+                self._catalog.score_detail(score_key),
+                revision=self._catalog.revision("scores"),
+            )
         records, signatures, warnings, _stats = self._score_records()
         selected = next((record for record in records if record.row.score_key == score_key), None)
         variants: list[ScoreRow] = []
@@ -376,6 +407,17 @@ class ReadDashboardService:
         direction: Literal["asc", "desc"] = "desc",
     ) -> ReadServiceResult:
         limit, offset = self._bounded_page(limit, offset)
+        if self._catalog is not None and self._catalog.ready("compliance_results"):
+            data = self._catalog.compliance(
+                limit=limit,
+                offset=offset,
+                search=search,
+                status=status,
+                product=product,
+                sort=sort,
+                direction=direction,
+            )
+            return ReadServiceResult(data, revision=self._catalog.revision("compliance"))
         rows, violations, signatures, warnings = self._compliance_records()
         filter_options = {
             "product": tuple(sorted({row.product for row in rows if row.product})),
@@ -412,6 +454,9 @@ class ReadDashboardService:
         return ReadServiceResult(data, tuple(signatures), tuple(warnings))
 
     def compliance_detail(self, output_dir: str) -> ReadServiceResult:
+        if self._catalog is not None and self._catalog.ready("compliance_results"):
+            data = self._catalog.compliance_detail(output_dir)
+            return ReadServiceResult(data, revision=self._catalog.revision("compliance"))
         rows, violations, signatures, warnings = self._compliance_records((output_dir,))
         data = ComplianceIndexPage(
             rows=tuple(rows),
@@ -431,9 +476,24 @@ class ReadDashboardService:
 
     def overview(self, latest_export: Any | None = None) -> ReadServiceResult:
         del latest_export
+        if self._catalog is not None and self._catalog.ready("score_records"):
+            export_status_path = self._export_status_path()
+            export_signature = self._source_signature(export_status_path)
+            export_warnings: list[str] = []
+            export_payload = self._load_json_dict(export_status_path, export_warnings, optional=True)
+            data = self._catalog.overview(
+                queue_active=None,
+                export_payload=export_payload,
+            )
+            return ReadServiceResult(
+                data,
+                (export_signature,),
+                tuple(export_warnings),
+                revision=data.revision,
+            )
         score_corpus = self._overview_score_corpus()
         compliance_corpus = self._overview_compliance_corpus()
-        queue_state, queue_signature, queue_warnings = self._read_queue_state(None)
+        queue_state, queue_signature, queue_warnings = self._read_queue_state(None, include_history=False)
         export_status_path = self._export_status_path()
         export_signature = self._source_signature(export_status_path)
 
@@ -709,6 +769,11 @@ class ReadDashboardService:
         return self._cache.get_or_load("compliance:overview", revision, load)
 
     def module_readiness(self) -> ReadServiceResult:
+        if self._catalog is not None and self._catalog.ready("modules"):
+            return ReadServiceResult(
+                self._catalog.module_readiness(),
+                revision=self._catalog.revision("modules"),
+            )
         index_payload, signature, warnings = self._module_index_payload()
         modules = index_payload.get("modules", []) if isinstance(index_payload, dict) else []
         modules = [module for module in modules if isinstance(module, dict)]
@@ -803,6 +868,20 @@ class ReadDashboardService:
         direction: Literal["asc", "desc"] = "asc",
     ) -> ReadServiceResult:
         limit, offset = self._bounded_page(limit, offset)
+        if self._catalog is not None and self._catalog.ready("modules"):
+            data = self._catalog.modules(
+                limit=limit,
+                offset=offset,
+                search=search,
+                status=status,
+                quality_status=quality_status,
+                review_status=review_status,
+                visual_status=visual_status,
+                product=product,
+                sort=sort,
+                direction=direction,
+            )
+            return ReadServiceResult(data, revision=self._catalog.revision("modules"))
         rows, modules_by_id, signature, warnings = self._module_corpus()
         filter_options = {
             "product": tuple(sorted({row.product for row in rows if row.product})),
@@ -838,6 +917,11 @@ class ReadDashboardService:
         return ReadServiceResult(data, (signature,), tuple(warnings))
 
     def module_detail(self, module_id: str) -> ReadServiceResult:
+        if self._catalog is not None and self._catalog.ready("modules"):
+            return ReadServiceResult(
+                self._catalog.module_detail(module_id),
+                revision=self._catalog.revision("modules"),
+            )
         _rows, modules_by_id, signature, warnings = self._module_corpus()
         module = modules_by_id.get(str(module_id))
         if module is None:
@@ -971,12 +1055,30 @@ class ReadDashboardService:
             raise FileNotFoundError(str(path))
         return ResolvedArtifact(path=path, media_type=self._media_type(path))
 
-    def _read_queue_state(self, state_path: str | None) -> tuple[dict[str, Any], SourceSignature, list[str]]:
+    def _read_queue_state(
+        self,
+        state_path: str | None,
+        *,
+        include_history: bool = True,
+    ) -> tuple[dict[str, Any], SourceSignature, list[str]]:
         path = Path(state_path) if state_path else self._default_state_path()
         if not path.is_absolute():
             path = Path.cwd() / path
         path = path.resolve()
         signature = self._source_signature(path)
+        storage_mode = queue_storage_mode() if state_path is None else "json"
+        if storage_mode != "json":
+            repository = QueueStateRepository(path, mode=storage_mode)
+            try:
+                payload = repository.load(include_history=include_history)
+            except Exception as exc:
+                return (
+                    {"schema_version": 3, "videos": {}, "updated_at": None},
+                    signature,
+                    [f"Failed to read authoritative queue state: {exc}"],
+                )
+            if payload:
+                return payload, signature, []
         if not path.exists():
             return {"schema_version": 2, "videos": {}, "updated_at": None}, signature, [f"State file not found: {path}"]
 

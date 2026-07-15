@@ -14,6 +14,54 @@ from variation_engine import (
 from variation_profile import default_profile, save_active_profile
 
 
+def _source_aware_transitional_cfg(root: Path, asset_count: int) -> SimpleNamespace:
+    hook_dir = root / "transitional_hooks"
+    hook_dir.mkdir()
+    for index in range(asset_count):
+        Path(hook_dir, f"viral_hook_{index:02d}.mp4").touch()
+    cfg = SimpleNamespace(
+        WORKING_DIR=str(root / "working"),
+        OUTPUT_DIR=str(root / "output"),
+        VARIANTS_PER_CLIP=6,
+        HOOK_DURATION=1.5,
+        HOOK_FONTSIZE=100,
+        ZOOM_SCALE=1.45,
+        SUBTITLE_Y_POS=0.80,
+        FONT_SUBTITLE="assets/fonts/Montserrat-ExtraBold.ttf",
+        FONT_HOOK="assets/fonts/Montserrat-ExtraBold.ttf",
+        FONT_HOOK_FALLBACKS=[],
+        KARAOKE_ACTIVE_COLOR="#FFD600",
+        KARAOKE_INACTIVE_OPACITY=1.0,
+        BROLL_INTRO_ENABLED=False,
+        BGM_DIR=str(root / "bgm"),
+        TRANSITIONAL_HOOK_ENABLED=True,
+        TRANSITIONAL_HOOK_DIR=str(hook_dir),
+    )
+    profile = default_profile(cfg)
+    profile["variants"][2]["name"] = "Transitional Hook"
+    profile["variants"][2]["hook_type"] = "transitional_hook"
+    profile["variants"][5]["name"] = "Transitional + BB"
+    profile["variants"][5]["hook_type"] = "transitional_hook"
+    profile["variants"][5]["letterbox_enabled"] = True
+    save_active_profile(cfg, profile, expected_revision=default_profile(cfg)["revision"])
+    return cfg
+
+
+def _transitional_moments(count: int) -> list[dict]:
+    return [
+        {
+            "clip_id": f"clip_{index:04d}",
+            "start": float(index * 30),
+            "end": float(index * 30 + 20),
+            "score": 9,
+            "hook": f"Hook {index}",
+            "product": "Serum",
+            "selected_text": f"source moment {index}",
+        }
+        for index in range(count)
+    ]
+
+
 class VariationGeneratorTests(unittest.TestCase):
     def test_global_audio_switches_cannot_be_reenabled_by_variant(self):
         base_cfg = SimpleNamespace(
@@ -611,6 +659,82 @@ class VariationGeneratorTests(unittest.TestCase):
             self.assertEqual(patched._transitional_hook_path, variant.transitional_hook_path)
             self.assertEqual(patched._hook_format, "transitional_hook")
             self.assertEqual(patched.HOOK_DURATION, 0.0)
+
+    def test_source_aware_transitional_hooks_are_stable_distinct_and_non_repeating(self):
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            cfg = _source_aware_transitional_cfg(root, asset_count=6)
+            moments = _transitional_moments(3)
+
+            first = expand_moments_with_variants(
+                moments,
+                cfg,
+                n_variants=6,
+                seed=42,
+                source_identity=str(root / "source_a.mp4"),
+            )
+            repeat = expand_moments_with_variants(
+                _transitional_moments(3),
+                cfg,
+                n_variants=6,
+                seed=42,
+                source_identity=str(root / "SOURCE_A.mp4"),
+            )
+            other_source = expand_moments_with_variants(
+                _transitional_moments(3),
+                cfg,
+                n_variants=6,
+                seed=42,
+                source_identity=str(root / "source_b.mp4"),
+            )
+
+            first_paths = [
+                item["_variant"].transitional_hook_path
+                for item in first
+                if item["_variant"].transitional_hook_path
+            ]
+            repeat_paths = [
+                item["_variant"].transitional_hook_path
+                for item in repeat
+                if item["_variant"].transitional_hook_path
+            ]
+            other_paths = [
+                item["_variant"].transitional_hook_path
+                for item in other_source
+                if item["_variant"].transitional_hook_path
+            ]
+            self.assertEqual(first_paths, repeat_paths)
+            self.assertNotEqual(first_paths, other_paths)
+            self.assertEqual(len(first_paths), len(set(first_paths)))
+            self.assertEqual(
+                {
+                    item["_variant"].variant_id
+                    for item in first
+                    if item["_variant"].transitional_hook_path
+                },
+                {"v2_transitional_hook", "v5_transitional_bb"},
+            )
+
+    def test_source_aware_transitional_hook_pool_reshuffles_without_boundary_repeat(self):
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            cfg = _source_aware_transitional_cfg(root, asset_count=3)
+            expanded = expand_moments_with_variants(
+                _transitional_moments(4),
+                cfg,
+                n_variants=6,
+                seed=42,
+                source_identity=str(root / "source.mp4"),
+            )
+
+            paths = [
+                item["_variant"].transitional_hook_path
+                for item in expanded
+                if item["_variant"].transitional_hook_path
+            ]
+            self.assertEqual(len(set(paths[0:3])), 3)
+            self.assertEqual(len(set(paths[3:6])), 3)
+            self.assertNotEqual(paths[2], paths[3])
 
     def test_profile_none_hook_disables_opening_hook_duration(self):
         with TemporaryDirectory() as tmp_dir:

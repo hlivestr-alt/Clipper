@@ -67,7 +67,6 @@ function copyFile(source, destination) {
 function stageAppPayload() {
   removeGenerated(appStage);
   fs.mkdirSync(appStage, { recursive: true });
-  fs.cpSync(path.join(projectRoot, "dist"), path.join(appStage, "dist"), { recursive: true });
   fs.cpSync(path.join(projectRoot, "electron"), path.join(appStage, "electron"), { recursive: true });
 
   const packageJson = readPackageJson();
@@ -100,6 +99,9 @@ async function createFallbackAppPackage(unpackedDir) {
   fs.mkdirSync(resourcesDir, { recursive: true });
   fs.rmSync(path.join(resourcesDir, "app.asar"), { force: true });
   removeGenerated(appDir);
+  const rendererDir = path.join(resourcesDir, "renderer");
+  fs.rmSync(rendererDir, { recursive: true, force: true });
+  fs.cpSync(path.join(projectRoot, "dist"), rendererDir, { recursive: true });
   stageAppPayload();
   fs.cpSync(appStage, appDir, { recursive: true });
   removeGenerated(appStage);

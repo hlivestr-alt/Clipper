@@ -36,6 +36,7 @@ log = logging.getLogger("proya.variation")
 
 _BROLL_VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi"}
 _TRANSITIONAL_HOOK_VIDEO_EXTS = _BROLL_VIDEO_EXTS
+_TRANSITIONAL_HOOK_SELECTOR_VERSION = 1
 
 
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -872,17 +873,77 @@ def _clear_transitional_hook_variant(variant: VariantConfig) -> None:
     variant.transitional_hook_path = ""
 
 
+class _TransitionalHookPool:
+    """Deterministic, source-scoped hook pool with no repeats per cycle."""
+
+    def __init__(self, assets: list[Path], seed: int, source_identity: str):
+        self._assets = list(assets)
+        self._seed = seed
+        self._source_identity = source_identity
+        self._cycle = 0
+        self._pool: list[Path] = []
+        self._position = 0
+        self._last_asset: Path | None = None
+
+    def _refill(self) -> None:
+        pool = list(self._assets)
+        picker = random.Random(
+            f"{self._seed}|{self._source_identity}|transitional_hook_pool|"
+            f"v{_TRANSITIONAL_HOOK_SELECTOR_VERSION}|{self._cycle}"
+        )
+        picker.shuffle(pool)
+        if self._last_asset is not None and len(pool) > 1 and pool[0] == self._last_asset:
+            swap_index = next(i for i, asset in enumerate(pool[1:], start=1) if asset != self._last_asset)
+            pool[0], pool[swap_index] = pool[swap_index], pool[0]
+        self._pool = pool
+        self._position = 0
+        self._cycle += 1
+
+    def next_asset(self) -> Path | None:
+        if not self._assets:
+            return None
+        if self._position >= len(self._pool):
+            self._refill()
+        asset = self._pool[self._position]
+        self._position += 1
+        self._last_asset = asset
+        return asset
+
+
+def _normalize_transitional_hook_source_identity(source_identity: str) -> str:
+    try:
+        return str(Path(source_identity).resolve()).casefold()
+    except OSError:
+        return str(source_identity).casefold()
+
+
+def _build_transitional_hook_pool(
+    base_cfg,
+    seed: int,
+    source_identity: str | None,
+) -> _TransitionalHookPool | None:
+    if not str(source_identity or "").strip():
+        return None
+    assets = _discover_transitional_hook_assets(base_cfg)
+    return _TransitionalHookPool(
+        assets,
+        seed,
+        _normalize_transitional_hook_source_identity(str(source_identity)),
+    )
+
+
 def _assign_transitional_hook_variants_for_moment(
     variants: list[VariantConfig],
     base_cfg,
     seed: int,
     base_clip_id: str,
+    hook_pool: _TransitionalHookPool | None = None,
 ) -> None:
     for variant in variants:
         _clear_transitional_hook_variant(variant)
 
-    assets = _discover_transitional_hook_assets(base_cfg)
-    if not assets:
+    assets = [] if hook_pool is not None else _discover_transitional_hook_assets(base_cfg)
+    if hook_pool is None and not assets:
         return
 
     for variant in variants:
@@ -890,9 +951,15 @@ def _assign_transitional_hook_variants_for_moment(
             continue
         if getattr(variant, "hook_type", "") != "transitional_hook":
             continue
-        picker = random.Random(f"{seed}|{base_clip_id}|{variant.variant_id}|transitional_hook")
+        if hook_pool is not None:
+            chosen = hook_pool.next_asset()
+            if chosen is None:
+                continue
+        else:
+            picker = random.Random(f"{seed}|{base_clip_id}|{variant.variant_id}|transitional_hook")
+            chosen = picker.choice(assets)
         variant.transitional_hook_enabled = True
-        variant.transitional_hook_path = str(picker.choice(assets))
+        variant.transitional_hook_path = str(chosen)
 
 
 def _broll_intro_rate_bounds(base_cfg) -> tuple[float, float]:
@@ -1348,6 +1415,7 @@ def expand_moments_with_variants(
     n_variants: int | None = None,
     seed: int = 42,
     selection_mode: str | None = None,
+    source_identity: str | None = None,
 ) -> list[dict]:
     """
     Expand the moments list so each moment appears N times â€” once per variant.
@@ -1357,6 +1425,7 @@ def expand_moments_with_variants(
         base_cfg:    Config module.
         n_variants:  How many variants per clip. Defaults to cfg.VARIANTS_PER_CLIP (or 4).
         seed:        RNG seed for variant generation.
+        source_identity: Stable source-video identity used to shuffle hook assets.
 
     Returns:
         Expanded list with (len(moments) * n_variants) entries.
@@ -1369,6 +1438,7 @@ def expand_moments_with_variants(
         seed=seed,
     )
     variants = profile_variants or []
+    transitional_hook_pool = _build_transitional_hook_pool(base_cfg, seed, source_identity)
 
     if n_variants <= 1:
         # No expansion â€” just tag every moment as v0_original
@@ -1389,6 +1459,7 @@ def expand_moments_with_variants(
                 base_cfg,
                 seed,
                 base_clip_id,
+                hook_pool=transitional_hook_pool,
             )
             m["_variant"] = moment_variants[0]
         return moments
@@ -1414,6 +1485,7 @@ def expand_moments_with_variants(
             base_cfg,
             seed,
             base_clip_id,
+            hook_pool=transitional_hook_pool,
         )
         broll_jobs += sum(1 for vc in moment_variants if vc.broll_intro_enabled)
         transitional_hook_jobs += sum(1 for vc in moment_variants if vc.transitional_hook_enabled)

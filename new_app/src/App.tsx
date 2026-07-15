@@ -100,11 +100,26 @@ import { buildExportOverview } from "./exportOverview";
 import { invalidateApiPrefix } from "./queryClient";
 import { useApiQuery } from "./useApiQuery";
 import { useDebouncedValue } from "./useDebouncedValue";
+import { useLiveUpdateStatus } from "./liveUpdates";
+import "./styles.css";
 
 type BadgeKind = "good" | "bad" | "warn" | "info" | "neutral";
 type ActionMessage = { kind: BadgeKind; text: string };
 type SortDirection = "asc" | "desc";
 type HealthPayload = { status: string; mode: string };
+type CatalogStatus = {
+  mode: string;
+  schema_version: number;
+  integrity: string;
+  queue_storage_mode: string;
+  dirty_source_count: number;
+  database_size: number;
+  wal_size: number;
+  table_counts: Record<string, number>;
+  revisions: Record<string, number>;
+  backfill?: { status?: string; duration_seconds?: number; error?: string };
+  shadow_comparison?: { mismatch_count?: number; checked?: boolean };
+};
 type WindowControlAction = "minimize" | "toggle-maximize" | "close";
 type ScoreGroup = {
   key: string;
@@ -698,6 +713,7 @@ function jobPollingInterval(page?: ControlJobPage): number {
 }
 
 function AppShell({ children }: { children: ReactNode }) {
+  const liveUpdates = useLiveUpdateStatus();
   const dashboard = useApiQuery<DashboardSummary>("/api/dashboard", dashboardPollingInterval, true);
   const systemQuery = useApiQuery<SystemStats>("/api/system", 15_000, true);
   const summary = dashboard.envelope?.data;
@@ -751,7 +767,9 @@ function AppShell({ children }: { children: ReactNode }) {
           <span className={`status-dot ${statusClass(healthText(summary))}`} />
           <div>
             <div className="rail-status-main">{healthText(summary)}</div>
-            <div className="rail-status-sub">{system?.gpu_label || "System metrics loading"}</div>
+            <div className="rail-status-sub">
+              {system?.gpu_label || "System metrics loading"} · {liveUpdates.mode === "live" ? "Live updates" : liveUpdates.mode === "connecting" ? "Connecting" : "Polling fallback"}
+            </div>
           </div>
         </div>
       </aside>
@@ -4500,7 +4518,10 @@ function LogsPage({ active }: { active: boolean }) {
 function SystemPage({ active }: { active: boolean }) {
   const health = useApiQuery<HealthPayload>("/api/health", 5_000, active);
   const system = useApiQuery<SystemStats>("/api/system", 5_000, active);
+  const catalog = useApiQuery<CatalogStatus>("/api/catalog/status", 30_000, active);
+  const liveUpdates = useLiveUpdateStatus();
   const data = system.envelope?.data;
+  const catalogData = catalog.envelope?.data;
   const [desktop, setDesktop] = useState<DesktopRuntimeStatus>();
   const [copyMessage, setCopyMessage] = useState("");
 
@@ -4517,12 +4538,12 @@ function SystemPage({ active }: { active: boolean }) {
   }, [active]);
 
   function copyDiagnostics() {
-    const payload = JSON.stringify({ health: health.envelope?.data, system: data, desktop }, null, 2);
+    const payload = JSON.stringify({ health: health.envelope?.data, system: data, catalog: catalogData, liveUpdates, desktop }, null, 2);
     void navigator.clipboard.writeText(payload).then(() => setCopyMessage("Diagnostics copied.")).catch(() => setCopyMessage("Could not copy diagnostics."));
   }
   return (
     <section className="page-stack">
-      <PageTitle title="Diagnostics" detail="API, desktop runtime, and local machine resource status." onRefresh={() => { health.refresh(); system.refresh(); refreshDesktop(); }}>
+      <PageTitle title="Diagnostics" detail="API, catalog, live updates, desktop runtime, and local machine resource status." onRefresh={() => { health.refresh(); system.refresh(); catalog.refresh(); refreshDesktop(); }}>
         <button className="secondary-button" onClick={copyDiagnostics}><ClipboardCheck size={15} aria-hidden="true" /> Copy diagnostics</button>
       </PageTitle>
       {copyMessage && <StateBlock kind={copyMessage.startsWith("Diagnostics") ? "good" : "bad"} detail={copyMessage} />}
@@ -4544,6 +4565,29 @@ function SystemPage({ active }: { active: boolean }) {
           <MetricCard label="GPU load" value={data?.gpu_percent == null ? "-" : `${data.gpu_percent.toFixed(0)}%`} hint="Utilization" icon={Gauge} />
           <MetricCard label="GPU memory" value={data?.gpu_mem_percent == null ? "-" : `${data.gpu_mem_percent.toFixed(0)}%`} hint="Memory usage" icon={Monitor} />
         </div>
+      </article>
+      <article className="panel">
+        <div className="panel-head">
+          <div>
+            <h2>Catalog and live updates</h2>
+            <p>Indexed read model, queue persistence, and renderer invalidation status.</p>
+          </div>
+          <Badge
+            value={liveUpdates.mode === "live" ? "Live" : liveUpdates.mode === "connecting" ? "Connecting" : "Polling fallback"}
+            kind={liveUpdates.mode === "live" ? "good" : liveUpdates.mode === "connecting" ? "info" : "warn"}
+          />
+        </div>
+        <div className="detail-list">
+          <DetailItem label="Catalog mode" value={catalogData?.mode ?? "Unavailable"} />
+          <DetailItem label="Queue storage" value={catalogData?.queue_storage_mode ?? "Unavailable"} />
+          <DetailItem label="Integrity" value={catalogData?.integrity ?? "Unavailable"} />
+          <DetailItem label="Backfill" value={catalogData?.backfill?.status ?? "Unavailable"} />
+          <DetailItem label="Dirty sources" value={catalogData?.dirty_source_count ?? 0} />
+          <DetailItem label="Shadow mismatches" value={catalogData?.shadow_comparison?.mismatch_count ?? 0} />
+          <DetailItem label="Event reconnects" value={liveUpdates.reconnects} />
+          <DetailItem label="Last event" value={liveUpdates.lastEventAt ? displayTime(new Date(liveUpdates.lastEventAt).toISOString()) : "None received"} />
+        </div>
+        {catalogData?.backfill?.error && <StateBlock kind="bad" title="Catalog backfill failed" detail={catalogData.backfill.error} />}
       </article>
       <article className="panel diagnostics-runtime-panel">
         <div className="panel-head">
@@ -4567,8 +4611,8 @@ function SystemPage({ active }: { active: boolean }) {
           </details>
         ) : null}
       </article>
-      {(health.error || system.error) && <StateBlock kind="bad" title="System read failed" detail={health.error || system.error} />}
-      <StateBlock kind="warn" warnings={[...(health.envelope?.warnings ?? []), ...(system.envelope?.warnings ?? [])]} />
+      {(health.error || system.error || catalog.error) && <StateBlock kind="bad" title="System read failed" detail={health.error || system.error || catalog.error} />}
+      <StateBlock kind="warn" warnings={[...(health.envelope?.warnings ?? []), ...(system.envelope?.warnings ?? []), ...(catalog.envelope?.warnings ?? [])]} />
     </section>
   );
 }

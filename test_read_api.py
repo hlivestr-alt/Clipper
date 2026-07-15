@@ -112,6 +112,17 @@ class ReadApiTests(unittest.TestCase):
         self.public_client.close()
         self.temp.cleanup()
 
+    def test_catalog_status_is_protected_and_reports_integrity(self):
+        unauthorized = self.public_client.get("/api/catalog/status")
+        self.assertEqual(unauthorized.status_code, 401)
+
+        response = self.client.get("/api/catalog/status")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()["data"]
+        self.assertEqual(payload["integrity"], "ok")
+        self.assertIn("schema_version", payload)
+        self.assertIn("shadow_comparison", payload)
+
     def test_auth_boundary_protects_sensitive_reads_and_all_mutations(self):
         for path in ("/api/settings/effective", "/api/logs"):
             missing = self.public_client.get(path)

@@ -1,7 +1,9 @@
+import { useSyncExternalStore } from "react";
 import { useQuery } from "@tanstack/react-query";
 import type { ApiEnvelope } from "./api";
 import { getJson } from "./api";
 import { apiQueryKey, normalizeApiPath, QUERY_GC_TIME_MS } from "./queryClient";
+import { getLiveUpdateSnapshot, shouldPollWhileLive, subscribeLiveUpdates } from "./liveUpdates";
 
 export type LoadState<T> = {
   envelope?: ApiEnvelope<T>;
@@ -25,12 +27,20 @@ export function useApiQuery<T>(
   options: ApiQueryOptions = {}
 ): LoadState<T> {
   const normalizedPath = normalizeApiPath(path);
+  const liveUpdates = useSyncExternalStore(
+    subscribeLiveUpdates,
+    getLiveUpdateSnapshot,
+    getLiveUpdateSnapshot
+  );
   const result = useQuery({
     queryKey: apiQueryKey(normalizedPath),
     queryFn: ({ signal }) => getJson<T>(normalizedPath, { signal }),
     enabled,
     gcTime: options.cache === false ? 0 : QUERY_GC_TIME_MS,
     refetchInterval: (queryState) => {
+      if (liveUpdates.connected && !shouldPollWhileLive(normalizedPath)) {
+        return false;
+      }
       const interval = typeof intervalMs === "function"
         ? intervalMs(queryState.state.data?.data)
         : intervalMs;

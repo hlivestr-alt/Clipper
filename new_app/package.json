@@ -41,12 +41,18 @@
       "output": "dist-desktop"
     },
     "files": [
-      "dist/**/*",
       "electron/main.cjs",
       "electron/preload.cjs",
       "electron/runtime.cjs",
       "package.json",
       "!node_modules/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "dist",
+        "to": "renderer",
+        "filter": ["**/*"]
+      }
     ],
     "win": {
       "target": [

@@ -8,9 +8,10 @@ import re
 import shutil
 import threading
 import time
+from copy import deepcopy
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -23,7 +24,9 @@ HASH_BYTES = 64 * 1024
 TIER_DIRS = {"export_ready", "review_needed", "rejected"}
 ROTATION_STRATEGY = "vod_clip_variant_rotation"
 SCORE_ROUND_ROBIN_STRATEGY = "score_round_robin_all_variants"
+DIVERSITY_STRATEGY = "diversity_first_rolling"
 ROTATION_LAYOUT_VERSION = 1
+DIVERSITY_STATE_VERSION = 2
 DEFAULT_VARIANT_COUNT = 6
 _EXPORT_STATUS_LOCK = threading.RLock()
 
@@ -52,6 +55,8 @@ class ExportCandidate:
     vod_group: int | None = None
     clip_number: int | None = None
     lane_key: str = ""
+    first_seen_at: str = ""
+    pending_path: Path | None = None
 
 
 def package_export_batches(
@@ -61,6 +66,7 @@ def package_export_batches(
     dry_run: bool = False,
     *,
     trigger: str = "direct",
+    source_output_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Package export-ready clips and persist a compact operational snapshot."""
     if cfg is None:
@@ -90,7 +96,14 @@ def package_export_batches(
         "eligible_count": None,
         "actionable_count": None,
         "packaged_count": 0,
+        "intake_count": 0,
+        "intake_error_count": 0,
         "pending_count": None,
+        "pending_vod_count": None,
+        "oldest_pending_at": None,
+        "diversity_target_vods": None,
+        "effective_max_per_vod": None,
+        "diversity_timeout_relaxed": False,
         "packaged_total": _nonnegative_int(previous.get("packaged_total")),
         "error_count": 0,
         "errors": [],
@@ -103,6 +116,7 @@ def package_export_batches(
             cfg=cfg,
             batch_size=batch_size,
             dry_run=dry_run,
+            source_output_dir=source_output_dir,
         )
     except Exception as exc:
         finished_at = datetime.now(timezone.utc).astimezone().isoformat(timespec="microseconds")
@@ -132,7 +146,14 @@ def package_export_batches(
         "eligible_count": _nonnegative_int(result.get("eligible_count")) or 0,
         "actionable_count": _nonnegative_int(result.get("actionable_count")) or 0,
         "packaged_count": 0 if dry_run else (_nonnegative_int(result.get("packaged_count")) or 0),
+        "intake_count": 0 if dry_run else (_nonnegative_int(result.get("intake_count")) or 0),
+        "intake_error_count": _nonnegative_int(result.get("intake_error_count")) or 0,
         "pending_count": _nonnegative_int(result.get("pending_count")) or 0,
+        "pending_vod_count": _nonnegative_int(result.get("pending_vod_count")) or 0,
+        "oldest_pending_at": result.get("oldest_pending_at"),
+        "diversity_target_vods": _nonnegative_int(result.get("diversity_target_vods")),
+        "effective_max_per_vod": _nonnegative_int(result.get("effective_max_per_vod")),
+        "diversity_timeout_relaxed": bool(result.get("diversity_timeout_relaxed", False)),
         "packaged_total": _nonnegative_int(result.get("packaged_total")) or 0,
         "error_count": error_count,
         "errors": [str(item) for item in result.get("errors", []) if item],
@@ -146,6 +167,7 @@ def _package_export_batches_impl(
     cfg=None,
     batch_size: int | None = None,
     dry_run: bool = False,
+    source_output_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Move export-ready clips into numbered affiliate batch folders."""
     if cfg is None:
@@ -156,6 +178,7 @@ def _package_export_batches_impl(
     batch_dir_name = str(getattr(cfg, "EXPORT_BATCH_DIR_NAME", "export_batches") or "export_batches")
     batch_root = resolve_within_root(root, batch_dir_name)
     manifest_path = resolve_within_root(batch_root, "_manifest.json")
+    diversity_state_path = resolve_within_root(batch_root, "_diversity_state.json")
     manifest = _load_packager_manifest(manifest_path)
     existing_items = [item for item in manifest.get("items", []) if isinstance(item, dict)]
     existing_source_keys = {
@@ -171,8 +194,16 @@ def _package_export_batches_impl(
     strategy = _export_batch_strategy(cfg)
     one_variant_per_clip = bool(getattr(cfg, "EXPORT_PACK_ONE_VARIANT_PER_CLIP", False))
 
-    raw_candidates = _discover_export_ready_candidates(root, batch_root)
-    existing_counts = _existing_batch_counts(batch_root, existing_items)
+    raw_candidates = _discover_export_ready_candidates(
+        root,
+        batch_root,
+        source_output_dir=source_output_dir,
+    )
+    existing_counts = (
+        _fast_existing_batch_counts(batch_root, existing_items, manifest.get("counts_by_batch"))
+        if strategy == DIVERSITY_STRATEGY
+        else _existing_batch_counts(batch_root, existing_items)
+    )
     legacy_batch_folder_cutoff, cutoff_needs_persist = _resolve_legacy_batch_folder_cutoff(
         manifest,
         existing_counts,
@@ -185,6 +216,16 @@ def _package_export_batches_impl(
         "excluded_legacy_vod_count": 0,
     }
     rotation_layout: dict[str, Any] | None = None
+    diversity_state: dict[str, Any] | None = None
+    diversity_stats = {
+        "pending_vod_count": 0,
+        "oldest_pending_at": None,
+        "diversity_target_vods": None,
+        "effective_max_per_vod": None,
+        "diversity_timeout_relaxed": False,
+    }
+    intake_errors: list[str] = []
+    intake_count = 0
     if strategy == ROTATION_STRATEGY:
         rotation_layout = _load_or_create_rotation_layout(
             manifest,
@@ -209,6 +250,44 @@ def _package_export_batches_impl(
             ),
         )
         candidates = candidate_pool
+    elif strategy == DIVERSITY_STRATEGY:
+        diversity_state = _load_or_create_diversity_state(
+            diversity_state_path,
+            existing_counts=existing_counts,
+            dry_run=dry_run,
+        )
+        pending_candidates = _pending_candidates_from_state(
+            diversity_state,
+            batch_root=batch_root,
+        )
+        deduped_raw_candidates, duplicate_stats = _dedupe_candidates(
+            raw_candidates,
+            existing_source_keys=existing_source_keys | {
+                candidate.source_clip_key for candidate in pending_candidates
+            },
+            existing_hashes=existing_hashes | {
+                candidate.content_md5_64k for candidate in pending_candidates
+            },
+        )
+        intaken_candidates, intake_errors = _intake_diversity_candidates(
+            deduped_raw_candidates,
+            diversity_state=diversity_state,
+            root=root,
+            batch_root=batch_root,
+            now_iso=_now_iso(),
+            dry_run=dry_run,
+        )
+        intake_count = len(intaken_candidates)
+        if not dry_run:
+            _write_json_atomic(diversity_state_path, diversity_state)
+        candidate_pool = [*pending_candidates, *intaken_candidates]
+        variant_stats = {
+            "one_variant_per_clip": False,
+            "excluded_variant_count": 0,
+            "excluded_existing_base_count": 0,
+            "excluded_legacy_vod_count": 0,
+        }
+        candidates = candidate_pool
     elif one_variant_per_clip:
         candidate_pool, variant_stats = _select_one_variant_per_base_clip(
             raw_candidates,
@@ -232,6 +311,26 @@ def _package_export_batches_impl(
             rotation_layout=rotation_layout or {},
             existing_counts=existing_counts,
         )
+    elif strategy == DIVERSITY_STRATEGY:
+        assignments, diversity_stats = _assign_diversity_batches(
+            candidates,
+            diversity_state=diversity_state or {},
+            existing_counts=existing_counts,
+            batch_size=size,
+            target_vods=max(
+                1,
+                int(getattr(cfg, "EXPORT_BATCH_MIN_DISTINCT_VODS", 5) or 5),
+            ),
+            max_per_vod=max(
+                1,
+                int(getattr(cfg, "EXPORT_BATCH_MAX_PER_VOD", 3) or 3),
+            ),
+            wait_hours=max(
+                0.0,
+                float(getattr(cfg, "EXPORT_BATCH_DIVERSITY_WAIT_HOURS", 2) or 0),
+            ),
+            now=datetime.now(timezone.utc),
+        )
     else:
         candidates.sort(
             key=lambda item: (
@@ -250,7 +349,7 @@ def _package_export_batches_impl(
         )
     planned_destinations: set[str] = set()
     moved_items: list[dict[str, Any]] = []
-    errors: list[str] = []
+    errors: list[str] = list(intake_errors)
     move_plans: list[tuple[ExportCandidate, Path, Path, str, dict[str, Any]]] = []
     now = _now_iso()
 
@@ -262,9 +361,8 @@ def _package_export_batches_impl(
         )
         planned_destinations.add(str(destination.resolve()).casefold())
         try:
+            source_path_before = _candidate_current_path(root, batch_root, candidate)
             source_dir = resolve_within_root(root, candidate.source_dir, kind="dir")
-            export_ready_root = resolve_within_root(source_dir, "export_ready", kind="dir")
-            source_path_before = resolve_within_root(export_ready_root, candidate.source_path, kind="file")
             destination = resolve_within_root(batch_root, destination)
             resolve_within_root(source_dir, "manifest.json")
             resolve_within_root(source_dir, "scores_summary.json")
@@ -314,23 +412,60 @@ def _package_export_batches_impl(
     if move_plans:
         batch_root.mkdir(parents=True, exist_ok=True)
 
-    for candidate, source_path_before, destination, relative_destination, item_payload in move_plans:
-        try:
-            source_dir = resolve_within_root(root, candidate.source_dir, kind="dir")
-            export_ready_root = resolve_within_root(source_dir, "export_ready", kind="dir")
-            source_path_before = resolve_within_root(export_ready_root, source_path_before, kind="file")
-            destination = resolve_within_root(batch_root, destination)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            source_path_before = resolve_within_root(export_ready_root, source_path_before, kind="file")
-            destination = resolve_within_root(batch_root, destination)
-            shutil.move(str(source_path_before), str(destination))
-        except Exception as exc:
-            errors.append(f"{source_path_before} -> {destination}: {exc}")
-            continue
+    if strategy == DIVERSITY_STRATEGY and not dry_run:
+        diversity_moved, diversity_errors = _execute_diversity_move_plans(
+            root=root,
+            batch_root=batch_root,
+            move_plans=move_plans,
+            batch_size=size,
+        )
+        moved_items.extend(diversity_moved)
+        errors.extend(diversity_errors)
+    else:
+        for candidate, source_path_before, destination, relative_destination, item_payload in move_plans:
+            try:
+                source_dir = resolve_within_root(root, candidate.source_dir, kind="dir")
+                export_ready_root = resolve_within_root(source_dir, "export_ready", kind="dir")
+                source_path_before = resolve_within_root(export_ready_root, source_path_before, kind="file")
+                destination = resolve_within_root(batch_root, destination)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                source_path_before = resolve_within_root(export_ready_root, source_path_before, kind="file")
+                destination = resolve_within_root(batch_root, destination)
+                shutil.move(str(source_path_before), str(destination))
+            except Exception as exc:
+                errors.append(f"{source_path_before} -> {destination}: {exc}")
+                continue
 
-        _update_source_manifest(candidate.source_dir, candidate.clip_id, relative_destination, item_payload)
-        _update_source_scores_summary(candidate.source_dir, candidate.clip_id, relative_destination, destination)
-        moved_items.append(item_payload)
+            _update_source_manifest(candidate.source_dir, candidate.clip_id, relative_destination, item_payload)
+            _update_source_scores_summary(candidate.source_dir, candidate.clip_id, relative_destination, destination)
+            moved_items.append(item_payload)
+
+    if diversity_state is not None and not dry_run:
+        pending = diversity_state.setdefault("pending", {})
+        for item in moved_items:
+            pending.pop(str(item.get("source_clip_key") or ""), None)
+        moved_folders = [
+            int(str(item.get("batch_folder") or "0"))
+            for item in moved_items
+            if str(item.get("batch_folder") or "").isdigit()
+        ]
+        diversity_state["next_folder_number"] = max(
+            int(diversity_state.get("started_at_folder") or 1),
+            max(existing_counts.keys(), default=0) + 1,
+            max(moved_folders, default=0) + 1,
+        )
+        _write_json_atomic(diversity_state_path, diversity_state)
+
+    if strategy == DIVERSITY_STRATEGY:
+        moved_source_keys = {str(item.get("source_clip_key") or "") for item in moved_items}
+        actual_pending = [
+            candidate for candidate in candidates if candidate.source_clip_key not in moved_source_keys
+        ]
+        pending_times = sorted(candidate.first_seen_at for candidate in actual_pending if candidate.first_seen_at)
+        diversity_stats["pending_vod_count"] = len(
+            {candidate.normalized_source_vod for candidate in actual_pending}
+        )
+        diversity_stats["oldest_pending_at"] = pending_times[0] if pending_times else None
 
     has_existing_batches = bool(existing_items) or manifest_path.exists() or (
         batch_root.exists()
@@ -351,7 +486,15 @@ def _package_export_batches_impl(
             "allocation_strategy": strategy,
             "append_only": True,
             "items": manifest_items,
-            "counts_by_batch": _counts_by_batch(manifest_items, batch_root),
+            "counts_by_batch": (
+                _fast_existing_batch_counts(
+                    batch_root,
+                    manifest_items,
+                    manifest.get("counts_by_batch"),
+                )
+                if strategy == DIVERSITY_STRATEGY
+                else _counts_by_batch(manifest_items, batch_root)
+            ),
         })
         if rotation_layout is not None:
             updated_manifest["rotation_layout"] = rotation_layout
@@ -371,8 +514,12 @@ def _package_export_batches_impl(
         "new_unique_count": len(candidates),
         "actionable_count": len(candidates),
         "packaged_count": len(moved_items),
+        "intake_count": intake_count,
+        "intake_error_count": len(intake_errors),
         "pending_count": (
-            len(candidates)
+            max(0, len(candidates) - len(moved_items))
+            if dry_run and strategy == DIVERSITY_STRATEGY
+            else len(candidates)
             if dry_run
             else max(0, len(candidates) - len(moved_items))
         ),
@@ -382,6 +529,7 @@ def _package_export_batches_impl(
         "excluded_variant_count": variant_stats["excluded_variant_count"],
         "excluded_existing_base_count": variant_stats["excluded_existing_base_count"],
         "excluded_legacy_vod_count": variant_stats.get("excluded_legacy_vod_count", 0),
+        **diversity_stats,
         "duplicate_existing_count": duplicate_stats["duplicate_existing_count"],
         "duplicate_candidate_count": duplicate_stats["duplicate_candidate_count"],
         "missing_count": duplicate_stats["missing_count"],
@@ -391,12 +539,22 @@ def _package_export_batches_impl(
     }
 
 
-def _discover_export_ready_candidates(root: Path, batch_root: Path) -> list[ExportCandidate]:
+def _discover_export_ready_candidates(
+    root: Path,
+    batch_root: Path,
+    source_output_dir: str | Path | None = None,
+) -> list[ExportCandidate]:
     if not root.exists():
         return []
     candidates: list[ExportCandidate] = []
     excluded_names = {batch_root.name.casefold(), *TIER_DIRS}
-    source_dirs = _source_dirs_for_packaging(root, excluded_names)
+    if source_output_dir is not None:
+        try:
+            source_dirs = [resolve_within_root(root, source_output_dir, kind="dir")]
+        except (OSError, UnsafePathError):
+            return []
+    else:
+        source_dirs = _source_dirs_for_packaging(root, excluded_names)
     for source_dir in source_dirs:
         if source_dir.name.casefold() in excluded_names:
             continue
@@ -433,6 +591,97 @@ def _discover_export_ready_candidates(root: Path, batch_root: Path) -> list[Expo
             if candidate is not None:
                 candidates.append(candidate)
     return candidates
+
+
+def _execute_diversity_move_plans(
+    root: Path,
+    batch_root: Path,
+    move_plans: list[tuple[ExportCandidate, Path, Path, str, dict[str, Any]]],
+    batch_size: int,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    moved_items: list[dict[str, Any]] = []
+    errors: list[str] = []
+    plans_by_folder: dict[int, list[tuple[ExportCandidate, Path, Path, str, dict[str, Any]]]] = {}
+    for plan in move_plans:
+        try:
+            folder_number = int(plan[2].parent.name)
+        except (TypeError, ValueError):
+            errors.append(f"invalid diversity batch destination: {plan[2]}")
+            continue
+        plans_by_folder.setdefault(folder_number, []).append(plan)
+
+    for folder_number in sorted(plans_by_folder):
+        plans = plans_by_folder[folder_number]
+        if len(plans) != batch_size:
+            errors.append(
+                f"diversity batch {folder_number} planned {len(plans)} of {batch_size} required clips"
+            )
+            continue
+        final_folder = resolve_within_root(batch_root, batch_root / str(folder_number))
+        staging_folder = resolve_within_root(
+            batch_root,
+            batch_root / f".staging-{folder_number}-{uuid4().hex}",
+        )
+        if final_folder.exists():
+            errors.append(f"diversity batch destination already exists: {final_folder}")
+            continue
+        staging_folder.mkdir(parents=True, exist_ok=False)
+        staged: list[tuple[Path, Path]] = []
+        failed = False
+        for candidate, source_path_before, destination, _relative_destination, _item_payload in plans:
+            staged_destination = resolve_within_root(staging_folder, staging_folder / destination.name)
+            try:
+                source_path = _candidate_current_path(root, batch_root, candidate)
+                shutil.move(str(source_path), str(staged_destination))
+                staged.append((staged_destination, source_path))
+            except Exception as exc:
+                errors.append(f"{source_path_before} -> {staged_destination}: {exc}")
+                failed = True
+                break
+        if failed:
+            for staged_path, source_path in reversed(staged):
+                try:
+                    shutil.move(str(staged_path), str(source_path))
+                except Exception as exc:
+                    errors.append(f"rollback {staged_path} -> {source_path}: {exc}")
+            try:
+                staging_folder.rmdir()
+            except OSError:
+                pass
+            continue
+        try:
+            staging_folder.rename(final_folder)
+        except Exception as exc:
+            errors.append(f"publish {staging_folder} -> {final_folder}: {exc}")
+            for staged_path, source_path in reversed(staged):
+                published_path = final_folder / staged_path.name if final_folder.exists() else staged_path
+                try:
+                    shutil.move(str(published_path), str(source_path))
+                except Exception as rollback_exc:
+                    errors.append(f"rollback {published_path} -> {source_path}: {rollback_exc}")
+            try:
+                (final_folder if final_folder.exists() else staging_folder).rmdir()
+            except OSError:
+                pass
+            continue
+
+        for candidate, _source_path_before, destination, relative_destination, item_payload in plans:
+            try:
+                _update_source_manifest(candidate.source_dir, candidate.clip_id, relative_destination, item_payload)
+                _update_source_scores_summary(candidate.source_dir, candidate.clip_id, relative_destination, destination)
+            except Exception as exc:
+                errors.append(f"source metadata update for {candidate.clip_id}: {exc}")
+            moved_items.append(item_payload)
+    return moved_items, errors
+
+
+def _candidate_current_path(root: Path, batch_root: Path, candidate: ExportCandidate) -> Path:
+    if candidate.pending_path is not None:
+        pending_root = resolve_within_root(batch_root, batch_root / "_pending")
+        return resolve_within_root(pending_root, candidate.pending_path, kind="file")
+    source_dir = resolve_within_root(root, candidate.source_dir, kind="dir")
+    export_ready_root = resolve_within_root(source_dir, "export_ready", kind="dir")
+    return resolve_within_root(export_ready_root, candidate.source_path, kind="file")
 
 
 def _source_dirs_for_packaging(root: Path, excluded_names: set[str]) -> list[Path]:
@@ -574,15 +823,339 @@ def _select_one_variant_per_base_clip(
 
 
 def _export_batch_strategy(cfg) -> str:
-    value = str(getattr(cfg, "EXPORT_BATCH_STRATEGY", ROTATION_STRATEGY) or ROTATION_STRATEGY)
+    value = str(getattr(cfg, "EXPORT_BATCH_STRATEGY", DIVERSITY_STRATEGY) or DIVERSITY_STRATEGY)
     normalized = value.casefold().strip()
     aliases = {
         "score_round_robin": SCORE_ROUND_ROBIN_STRATEGY,
         "all_variants": SCORE_ROUND_ROBIN_STRATEGY,
         SCORE_ROUND_ROBIN_STRATEGY: SCORE_ROUND_ROBIN_STRATEGY,
         ROTATION_STRATEGY: ROTATION_STRATEGY,
+        "diversity": DIVERSITY_STRATEGY,
+        DIVERSITY_STRATEGY: DIVERSITY_STRATEGY,
     }
-    return aliases.get(normalized, ROTATION_STRATEGY)
+    return aliases.get(normalized, DIVERSITY_STRATEGY)
+
+
+def _load_or_create_diversity_state(
+    path: Path,
+    existing_counts: dict[int, int],
+    dry_run: bool,
+) -> dict[str, Any]:
+    state: dict[str, Any] | None = None
+    if path.exists():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict) and int(payload.get("version") or 0) == DIVERSITY_STATE_VERSION:
+                state = payload
+        except Exception:
+            state = None
+    if state is None:
+        state = {
+            "version": DIVERSITY_STATE_VERSION,
+            "strategy": DIVERSITY_STRATEGY,
+            "strategy_started_at": _now_iso(),
+            "started_at_folder": max(existing_counts.keys(), default=0) + 1,
+            "next_folder_number": max(existing_counts.keys(), default=0) + 1,
+            "vod_order": [],
+            "pending": {},
+        }
+    else:
+        state = deepcopy(state)
+        state["vod_order"] = [
+            _normalize_source_vod(value)
+            for value in state.get("vod_order", [])
+            if str(value).strip()
+        ]
+        state["pending"] = {
+            str(key): dict(value)
+            for key, value in dict(state.get("pending") or {}).items()
+            if str(key).strip() and isinstance(value, dict)
+        }
+        state["started_at_folder"] = max(
+            1,
+            int(state.get("started_at_folder") or (max(existing_counts.keys(), default=0) + 1)),
+        )
+        state["next_folder_number"] = max(
+            int(state.get("next_folder_number") or state["started_at_folder"]),
+            max(existing_counts.keys(), default=0) + 1,
+        )
+    return deepcopy(state) if dry_run else state
+
+
+def _pending_candidates_from_state(
+    diversity_state: dict[str, Any],
+    batch_root: Path,
+) -> list[ExportCandidate]:
+    pending = diversity_state.setdefault("pending", {})
+    candidates: list[ExportCandidate] = []
+    for key, item in list(pending.items()):
+        try:
+            pending_path = resolve_within_root(
+                batch_root / "_pending",
+                str(item.get("pending_path") or ""),
+                kind="file",
+            )
+            candidate = ExportCandidate(
+                source_dir=Path(str(item["source_dir"])),
+                source_vod=str(item["source_vod"]),
+                normalized_source_vod=str(item["normalized_source_vod"]),
+                clip_id=str(item["clip_id"]),
+                base_clip_id=str(item["base_clip_id"]),
+                variant_id=str(item["variant_id"]),
+                base_clip_key=str(item["base_clip_key"]),
+                source_clip_key=str(item["source_clip_key"]),
+                source_path=pending_path,
+                source_output_file=str(item.get("source_output_file") or ""),
+                total_score=float(item.get("total_score") or 0.0),
+                content_md5_64k=str(item["content_md5_64k"]),
+                product=str(item.get("product") or ""),
+                clip_type=str(item.get("clip_type") or ""),
+                allocation_strategy=DIVERSITY_STRATEGY,
+                selection_reason="all_variants_included",
+                clip_number=_coerce_nonnegative_int(item.get("clip_number")),
+                first_seen_at=str(item.get("first_seen_at") or _now_iso()),
+                pending_path=pending_path,
+            )
+        except (KeyError, TypeError, ValueError, OSError, UnsafePathError):
+            pending.pop(key, None)
+            continue
+        candidates.append(candidate)
+    return candidates
+
+
+def _intake_diversity_candidates(
+    candidates: list[ExportCandidate],
+    diversity_state: dict[str, Any],
+    root: Path,
+    batch_root: Path,
+    now_iso: str,
+    dry_run: bool,
+) -> tuple[list[ExportCandidate], list[str]]:
+    pending_root = resolve_within_root(batch_root, batch_root / "_pending")
+    pending = diversity_state.setdefault("pending", {})
+    errors: list[str] = []
+    intaken: list[ExportCandidate] = []
+    planned_destinations: set[str] = set()
+    if pending_root.exists():
+        planned_destinations = {
+            str(path.resolve()).casefold()
+            for path in pending_root.rglob("*.mp4")
+            if path.is_file()
+        }
+    for candidate in sorted(
+        candidates,
+        key=lambda item: (
+            item.normalized_source_vod,
+            item.base_clip_id.casefold(),
+            _variant_sort_key(item),
+        ),
+    ):
+        candidate.allocation_strategy = DIVERSITY_STRATEGY
+        candidate.selection_reason = "all_variants_included"
+        candidate.clip_number = _clip_number(candidate.base_clip_id)
+        candidate.first_seen_at = now_iso
+        vod_pending_dir = pending_root / (_safe_filename(candidate.normalized_source_vod) or "source")
+        destination = _destination_for_candidate(candidate, vod_pending_dir, planned_destinations)
+        planned_destinations.add(str(destination.resolve()).casefold())
+        if dry_run:
+            intaken.append(candidate)
+            continue
+        try:
+            source_dir = resolve_within_root(root, candidate.source_dir, kind="dir")
+            export_ready_root = resolve_within_root(source_dir, "export_ready", kind="dir")
+            source_path = resolve_within_root(export_ready_root, candidate.source_path, kind="file")
+            destination = resolve_within_root(pending_root, destination)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source_path), str(destination))
+        except Exception as exc:
+            errors.append(f"pending intake {candidate.source_path} -> {destination}: {exc}")
+            continue
+        candidate.source_path = destination
+        candidate.pending_path = destination
+        relative_pending = _relative_path(destination, candidate.source_dir)
+        pending[candidate.source_clip_key] = _pending_state_item(candidate, now_iso)
+        try:
+            _update_source_manifest(
+                candidate.source_dir,
+                candidate.clip_id,
+                relative_pending,
+                {
+                    "batch_folder": "_pending",
+                    "destination_file": destination.name,
+                    "destination_path": str(destination.resolve()),
+                    "packaged_at": now_iso,
+                },
+            )
+            _update_source_scores_summary(
+                candidate.source_dir,
+                candidate.clip_id,
+                relative_pending,
+                destination,
+            )
+        except Exception as exc:
+            errors.append(f"pending metadata update for {candidate.clip_id}: {exc}")
+        intaken.append(candidate)
+    return intaken, errors
+
+
+def _pending_state_item(candidate: ExportCandidate, first_seen_at: str) -> dict[str, Any]:
+    return {
+        "source_dir": str(candidate.source_dir.resolve()),
+        "source_vod": candidate.source_vod,
+        "normalized_source_vod": candidate.normalized_source_vod,
+        "clip_id": candidate.clip_id,
+        "base_clip_id": candidate.base_clip_id,
+        "variant_id": candidate.variant_id,
+        "base_clip_key": candidate.base_clip_key,
+        "source_clip_key": candidate.source_clip_key,
+        "pending_path": str((candidate.pending_path or candidate.source_path).resolve()),
+        "source_output_file": candidate.source_output_file,
+        "total_score": candidate.total_score,
+        "content_md5_64k": candidate.content_md5_64k,
+        "product": candidate.product,
+        "clip_type": candidate.clip_type,
+        "clip_number": candidate.clip_number,
+        "first_seen_at": first_seen_at,
+    }
+
+
+def _assign_diversity_batches(
+    candidates: list[ExportCandidate],
+    diversity_state: dict[str, Any],
+    existing_counts: dict[int, int],
+    batch_size: int,
+    target_vods: int,
+    max_per_vod: int,
+    wait_hours: float,
+    now: datetime,
+) -> tuple[list[tuple[ExportCandidate, int]], dict[str, Any]]:
+    pool = list(candidates)
+    assignments: list[tuple[ExportCandidate, int]] = []
+    configured_cap = max(1, min(batch_size, max_per_vod))
+    target_vods = max(1, min(batch_size, target_vods))
+    next_folder = max(
+        int(diversity_state.get("next_folder_number") or diversity_state.get("started_at_folder") or 1),
+        max(existing_counts.keys(), default=0) + 1,
+    )
+    timeout_relaxed = False
+    largest_effective_cap = configured_cap
+
+    while len(pool) >= batch_size:
+        cap = configured_cap
+        feasible = _diversity_capacity(pool, cap) >= batch_size
+        distinct_vods = len({candidate.normalized_source_vod for candidate in pool})
+        normal_ready = feasible and distinct_vods >= target_vods
+        if not normal_ready:
+            oldest = min((_parse_iso(candidate.first_seen_at) for candidate in pool), default=now)
+            if now - oldest < timedelta(hours=wait_hours):
+                break
+            cap = _minimum_feasible_vod_cap(pool, batch_size, configured_cap)
+            if cap is None:
+                break
+            timeout_relaxed = cap > configured_cap or distinct_vods < target_vods
+        batch = _build_diverse_batch(pool, batch_size, cap)
+        if len(batch) != batch_size:
+            break
+        for candidate in batch:
+            assignments.append((candidate, next_folder))
+            pool.remove(candidate)
+        largest_effective_cap = max(largest_effective_cap, cap)
+        next_folder += 1
+
+    diversity_state["next_folder_number"] = next_folder
+    pending_times = sorted(candidate.first_seen_at for candidate in pool if candidate.first_seen_at)
+    return assignments, {
+        "pending_vod_count": len({candidate.normalized_source_vod for candidate in pool}),
+        "oldest_pending_at": pending_times[0] if pending_times else None,
+        "diversity_target_vods": target_vods,
+        "effective_max_per_vod": largest_effective_cap,
+        "diversity_timeout_relaxed": timeout_relaxed,
+    }
+
+
+def _diversity_capacity(candidates: list[ExportCandidate], cap: int) -> int:
+    bases_by_vod: dict[str, set[str]] = {}
+    for candidate in candidates:
+        bases_by_vod.setdefault(candidate.normalized_source_vod, set()).add(candidate.base_clip_key)
+    return sum(min(len(base_keys), cap) for base_keys in bases_by_vod.values())
+
+
+def _minimum_feasible_vod_cap(
+    candidates: list[ExportCandidate],
+    batch_size: int,
+    starting_cap: int,
+) -> int | None:
+    for cap in range(max(1, starting_cap), batch_size + 1):
+        if _diversity_capacity(candidates, cap) >= batch_size:
+            return cap
+    return None
+
+
+def _build_diverse_batch(
+    candidates: list[ExportCandidate],
+    batch_size: int,
+    cap: int,
+) -> list[ExportCandidate]:
+    chosen: list[ExportCandidate] = []
+    source_counts: Counter[str] = Counter()
+    variants: set[int | str] = set()
+    products: set[str] = set()
+    clip_types: set[str] = set()
+    clip_numbers: set[int] = set()
+    base_clip_keys: set[str] = set()
+    remaining = list(candidates)
+    while len(chosen) < batch_size:
+        eligible = [
+            candidate
+            for candidate in remaining
+            if source_counts[candidate.normalized_source_vod] < cap
+            and candidate.base_clip_key not in base_clip_keys
+        ]
+        if not eligible:
+            break
+        candidate = min(
+            eligible,
+            key=lambda item: (
+                -int(item.normalized_source_vod not in source_counts),
+                -int(_variant_diversity_key(item) not in variants),
+                -int(bool(item.product) and item.product.casefold() not in products),
+                -int(bool(item.clip_type) and item.clip_type.casefold() not in clip_types),
+                -int(item.clip_number is not None and item.clip_number not in clip_numbers),
+                source_counts[item.normalized_source_vod],
+                item.first_seen_at,
+                -item.total_score,
+                item.normalized_source_vod,
+                item.base_clip_key,
+                item.source_clip_key,
+            ),
+        )
+        chosen.append(candidate)
+        remaining.remove(candidate)
+        source_counts[candidate.normalized_source_vod] += 1
+        variants.add(_variant_diversity_key(candidate))
+        if candidate.product:
+            products.add(candidate.product.casefold())
+        if candidate.clip_type:
+            clip_types.add(candidate.clip_type.casefold())
+        if candidate.clip_number is not None:
+            clip_numbers.add(candidate.clip_number)
+        base_clip_keys.add(candidate.base_clip_key)
+    return chosen
+
+
+def _variant_diversity_key(candidate: ExportCandidate) -> int | str:
+    number = _variant_number(candidate)
+    return number if number is not None else candidate.variant_id.casefold()
+
+
+def _parse_iso(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(str(value or ""))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return datetime.now(timezone.utc)
 
 
 def _load_or_create_rotation_layout(
@@ -1107,6 +1680,39 @@ def _existing_batch_counts(batch_root: Path, existing_items: list[dict[str, Any]
             actual_count = len([path for path in folder.glob("*.mp4") if path.is_file()])
             folder_number = int(folder.name)
             counts[folder_number] = max(counts[folder_number], actual_count)
+    return dict(counts)
+
+
+def _fast_existing_batch_counts(
+    batch_root: Path,
+    existing_items: list[dict[str, Any]],
+    stored_counts: Any = None,
+) -> dict[int, int]:
+    """Read historical counts without enumerating every MP4 in every old folder."""
+    counts: Counter[int] = Counter()
+    if isinstance(stored_counts, dict):
+        for key, value in stored_counts.items():
+            try:
+                folder_number = int(str(key))
+                count = max(0, int(value or 0))
+            except (TypeError, ValueError):
+                continue
+            if folder_number > 0:
+                counts[folder_number] = max(counts[folder_number], count)
+    item_counts: Counter[int] = Counter()
+    for item in existing_items:
+        try:
+            folder_number = int(str(item.get("batch_folder") or ""))
+        except (TypeError, ValueError):
+            continue
+        if folder_number > 0:
+            item_counts[folder_number] += 1
+    for folder_number, count in item_counts.items():
+        counts[folder_number] = max(counts[folder_number], count)
+    if batch_root.exists():
+        for folder in batch_root.iterdir():
+            if folder.is_dir() and folder.name.isdigit():
+                counts.setdefault(int(folder.name), 0)
     return dict(counts)
 
 

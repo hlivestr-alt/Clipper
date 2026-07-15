@@ -10,7 +10,7 @@ YOLO_WEIGHTS       = "models/proya_best.pt"    # your trained YOLO weights
 YOLO_PRETRAIN      = "yolov8n.pt"              # base model for training
 DATASET_YAML       = "dataset/proya.yaml"      # YOLO dataset config
 LOGO_PATH          = None                      # disable watermark for max throughput
-RENDER_STYLE_VERSION = 6                       # bump when opening-hook/render styling changes
+RENDER_STYLE_VERSION = 7                       # bump when opening-hook/render styling changes
 
 # Queue runner defaults. The PowerShell launchers and video_queue.py read these
 # so routine queue tuning can live here instead of in long terminal commands.
@@ -541,10 +541,13 @@ SCORER_SIMILARITY_MAX_FRAMES = 24
 EXPORT_BATCHES_ENABLED = True
 EXPORT_BATCH_DIR_NAME = "export_batches"
 EXPORT_BATCH_SIZE = 15
-# Default layout: one export-ready variant per base clip, rotated by persisted
-# VOD order and clip number into folders containing at most 15 VODs.
-EXPORT_BATCH_STRATEGY = "vod_clip_variant_rotation"
+# Default layout: move every export-ready variant into a rolling pending pool,
+# then emit full, diversity-balanced folders without touching older partials.
+EXPORT_BATCH_STRATEGY = "diversity_first_rolling"
 EXPORT_BATCH_VARIANT_COUNT = 6
+EXPORT_BATCH_MIN_DISTINCT_VODS = 5
+EXPORT_BATCH_MAX_PER_VOD = 3
+EXPORT_BATCH_DIVERSITY_WAIT_HOURS = 2
 # Used only by the legacy score_round_robin_all_variants strategy.
 EXPORT_PACK_ONE_VARIANT_PER_CLIP = False
 

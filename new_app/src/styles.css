@@ -1,3 +1,6 @@
+@layer reset, tokens, base, shell, components, features, utilities;
+
+@layer features {
 :root {
   color-scheme: dark;
   font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
@@ -4099,6 +4102,7 @@ input::placeholder {
   .secondary-nav {
     margin-top: 0;
   }
+}
 }
 
 @media (max-width: 959px) {

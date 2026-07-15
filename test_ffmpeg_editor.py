@@ -15,6 +15,7 @@ from ffmpeg_editor import (
     _cpu_encode_fallback_cmd,
     _hook_layout_settings,
     _letterbox_bar_heights,
+    _prepare_karaoke_words,
     _resolve_subtitle_font,
     _subtitle_line_centers,
     _subtitle_row_centers,
@@ -180,6 +181,13 @@ class FfmpegEditorFallbackTests(unittest.TestCase):
         self.assertEqual(len(centers), 3)
         self.assertEqual(centers[1] - centers[0], gap)
         self.assertEqual(centers[2] - centers[1], gap)
+
+    def test_karaoke_words_preserve_space_for_hyphenated_repetition(self):
+        words = [{"word": "bener-bener", "start": 0.0, "end": 0.8}]
+
+        prepared = _prepare_karaoke_words(words)
+
+        self.assertEqual(prepared[0]["word"], "bener bener")
 
     def test_ass_subtitles_disable_auto_wrap_and_emit_three_explicit_rows(self):
         cfg = types.SimpleNamespace(

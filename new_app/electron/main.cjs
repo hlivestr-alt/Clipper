@@ -16,6 +16,7 @@ const {
   parseArgs,
   portableRestartCommand,
   readRuntimeConfig,
+  rendererDirectory,
   resolvePythonExe,
   runtimeConfigPath,
   writeRuntimeConfig
@@ -239,6 +240,11 @@ function startBackend(runtime) {
       CLIPPER_CONTROL_TOKEN: runtime.controlToken,
       CLIPPER_CONTROL_ACTOR: runtime.controlActor,
       CLIPPER_MIGRATE_JOB_STORAGE: "1",
+      CLIPPER_STATIC_DIR: rendererDirectory({
+        isPackaged: app.isPackaged,
+        resourcesPath: process.resourcesPath,
+        projectRoot: runtime.projectRoot
+      }),
       PYTHONUNBUFFERED: "1"
     },
     windowsHide: true

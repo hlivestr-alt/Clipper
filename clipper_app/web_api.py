@@ -3,9 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import asyncio
+import threading
+import time
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
+
+import portalocker
 
 from clipper_app.application.control_services import (
     ControlJobService,
@@ -17,6 +23,8 @@ from clipper_app.application.control_services import (
     SettingsService,
 )
 from clipper_app.application.api_security import ApiSecuritySettings, origin_allowed, requires_control_auth
+from clipper_app.application.catalog import CatalogDatabase, CatalogIndexer, ChangeEventRepository
+from clipper_app.application.container import ApplicationServiceContainer
 from clipper_app.application.read_services import ReadDashboardService, ReadServiceResult
 from clipper_app.application.services import (
     ComplianceService,
@@ -56,13 +64,20 @@ from clipper_app.contracts.read_models import SettingsReadEntry, SettingsReadSna
 try:
     from fastapi import FastAPI, HTTPException, Query, Request, Response, status
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import FileResponse, JSONResponse
+    from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
     from fastapi.staticfiles import StaticFiles
     from starlette.middleware.trustedhost import TrustedHostMiddleware
 except ImportError as exc:  # pragma: no cover - exercised only when runtime deps are missing.
     raise RuntimeError(
         "FastAPI is required for the control app. Install requirements.txt first."
     ) from exc
+
+
+class ImmutableStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope: dict[str, Any]):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return response
 
 
 def _envelope(result: ReadServiceResult) -> dict[str, Any]:
@@ -78,7 +93,7 @@ def _envelope(result: ReadServiceResult) -> dict[str, Any]:
 def _read_response(result: ReadServiceResult, request: Request) -> Response:
     payload = _envelope(result)
     data = result.data
-    revision = str(getattr(data, "revision", "") or "")
+    revision = str(result.revision or getattr(data, "revision", "") or "")
     signature_payload = [
         (item.path, item.exists, item.mtime_ns, item.size)
         for item in result.source_signatures
@@ -218,9 +233,24 @@ def _execute_with_invalidation(
     execute: Callable[[], Any],
 ) -> Any:
     try:
-        return execute()
+        result = execute()
+        catalog_indexer = getattr(read_service, "catalog_indexer", None)
+        if catalog_indexer is not None and read_service.catalog_mode in {"shadow", "catalog"}:
+            if set(domains) & {"outputs", "scores", "compliance", "modules"}:
+                try:
+                    catalog_indexer.backfill()
+                except Exception as exc:
+                    catalog_indexer.record_repair(
+                        ",".join(sorted(domains)),
+                        "post-mutation projection",
+                        exc,
+                    )
+        return result
     finally:
         read_service.invalidate(*domains)
+        event_repository = getattr(read_service, "change_events", None)
+        if event_repository is not None:
+            event_repository.publish(domains)
 
 
 def _conflict_response(exc: JobConflictError) -> HTTPException:
@@ -255,23 +285,44 @@ def create_app(
     export_service: ExportPackagingService | None = None,
     security_settings: ApiSecuritySettings | None = None,
 ) -> FastAPI:
-    read_service = service or ReadDashboardService()
-    provider = read_service.settings_provider
     migrate_legacy_jobs = os.getenv("CLIPPER_MIGRATE_JOB_STORAGE", "").strip().casefold() in {
         "1",
         "true",
         "yes",
     }
-    jobs = job_service or ControlJobService(
-        read_service.cfg,
-        auto_migrate_legacy=migrate_legacy_jobs,
+    container = ApplicationServiceContainer.build(
+        service,
+        jobs=job_service,
+        settings=settings_service,
+        queue_controls=queue_control_service,
+        scoring=scoring_service,
+        compliance=compliance_service,
+        modules=module_service,
+        exports=export_service,
+        migrate_legacy_jobs=migrate_legacy_jobs,
     )
-    settings_writer = settings_service or SettingsService(provider)
-    queue_controls = queue_control_service or QueueControlService(provider)
-    scorer = scoring_service or ScoringService(provider)
-    compliance_runner = compliance_service or ComplianceService(provider)
-    modules = module_service or ModuleService(provider)
-    exporter = export_service or ExportPackagingService(provider)
+    read_service = container.reads
+    provider = read_service.settings_provider
+    jobs = container.jobs
+    settings_writer = container.settings
+    queue_controls = container.queue_controls
+    scorer = container.scoring
+    compliance_runner = container.compliance
+    modules = container.modules
+    exporter = container.exports
+    catalog = CatalogDatabase.from_config(read_service.cfg)
+    change_events = ChangeEventRepository(catalog)
+    read_service.change_events = change_events
+    read_service.catalog_database = catalog
+    read_service.catalog_indexer = CatalogIndexer(catalog, read_service.cfg)
+    previous_job_change = jobs.on_change
+
+    def publish_job_change(job: ControlJob) -> None:
+        if previous_job_change is not None:
+            previous_job_change(job)
+        change_events.publish(("jobs",))
+
+    jobs.on_change = publish_job_change
     security = security_settings or ApiSecuritySettings.from_environment()
     if security.desktop and security.token is None:
         raise RuntimeError("CLIPPER_DESKTOP=1 requires CLIPPER_CONTROL_TOKEN")
@@ -288,6 +339,103 @@ def create_app(
         allow_headers=["Authorization", "Content-Type", "If-None-Match"],
     )
     api.add_middleware(TrustedHostMiddleware, allowed_hosts=list(security.allowed_hosts))
+
+    catalog_mode = os.getenv("CLIPPER_CATALOG_MODE", "legacy").strip().casefold() or "legacy"
+    catalog_stop = threading.Event()
+    signal_stop = threading.Event()
+    api.state.sse_metrics = {
+        "active_clients": 0,
+        "peak_clients": 0,
+        "events_sent": 0,
+        "resets_sent": 0,
+        "dropped_events": 0,
+    }
+
+    def start_signal_monitor() -> None:
+        if os.getenv("CLIPPER_PUSH_INVALIDATION", "1").strip().casefold() in {"0", "false", "no"}:
+            return
+
+        configured = (
+            ("logs", Path.cwd() / "pipeline.log"),
+            ("queue", Path(str(getattr(read_service.cfg, "QUEUE_INPUT_DIR", "D:/VOD")))),
+            ("queue", Path(str(getattr(read_service.cfg, "QUEUE_STATE_FILE", "working/video_queue_state.json")))),
+            ("queue", Path(str(getattr(read_service.cfg, "QUEUE_CONTROL_FILE", "working/queue_control.json")))),
+            ("queue", Path(str(getattr(read_service.cfg, "QUEUE_FOREVER_STATE_FILE", "working/queue_forever_state.json")))),
+        )
+
+        def signature(path: Path) -> tuple[int, int] | None:
+            try:
+                stat = path.stat()
+                return stat.st_mtime_ns, stat.st_size
+            except OSError:
+                return None
+
+        def run() -> None:
+            previous = {(topic, str(path)): signature(path) for topic, path in configured}
+            while not signal_stop.wait(1.0):
+                changed: set[str] = set()
+                for topic, path in configured:
+                    key = (topic, str(path))
+                    current = signature(path)
+                    if current != previous.get(key):
+                        previous[key] = current
+                        changed.add(topic)
+                if changed:
+                    try:
+                        change_events.publish(changed)
+                    except Exception:
+                        # Signal monitoring is advisory; canonical reads remain authoritative.
+                        pass
+
+        threading.Thread(target=run, name="clipper-signal-monitor", daemon=True).start()
+
+    def stop_signal_monitor() -> None:
+        signal_stop.set()
+
+    if catalog_mode in {"shadow", "catalog"}:
+        def start_catalog_indexer() -> None:
+            api.state.catalog_backfill = {"status": "starting"}
+
+            def run() -> None:
+                lock_path = Path(f"{catalog.path}.index.lock")
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    with portalocker.Lock(str(lock_path), mode="a", timeout=0.1):
+                        while not catalog_stop.is_set():
+                            started_at = time.monotonic()
+                            try:
+                                result = CatalogIndexer(catalog, read_service.cfg).backfill()
+                                api.state.catalog_backfill = {
+                                    "status": "ready",
+                                    "duration_seconds": round(time.monotonic() - started_at, 3),
+                                    **result,
+                                }
+                            except Exception as exc:
+                                api.state.catalog_backfill = {"status": "error", "error": str(exc)}
+                            catalog_stop.wait(300.0)
+                except portalocker.exceptions.LockException:
+                    api.state.catalog_backfill = {"status": "standby"}
+
+            threading.Thread(target=run, name="clipper-catalog-indexer", daemon=True).start()
+
+        def stop_catalog_indexer() -> None:
+            catalog_stop.set()
+
+    @asynccontextmanager
+    async def lifespan(_application: FastAPI):
+        signal_stop.clear()
+        catalog_stop.clear()
+        start_signal_monitor()
+        if catalog_mode in {"shadow", "catalog"}:
+            start_catalog_indexer()
+        try:
+            yield
+        finally:
+            stop_signal_monitor()
+            if catalog_mode in {"shadow", "catalog"}:
+                stop_catalog_indexer()
+
+    api.router.lifespan_context = lifespan
 
     @api.middleware("http")
     async def enforce_control_boundary(request: Request, call_next):
@@ -312,6 +460,75 @@ def create_app(
     @api.get("/api/health")
     def health() -> dict[str, Any]:
         return _envelope(ReadServiceResult({"status": "ok", "mode": "control"}))
+
+    @api.get("/api/catalog/status")
+    def catalog_status() -> dict[str, Any]:
+        status_payload = catalog.status()
+        status_payload["backfill"] = getattr(api.state, "catalog_backfill", {"status": "disabled"})
+        status_payload["sse"] = dict(api.state.sse_metrics)
+        status_payload["queue_storage_mode"] = os.getenv(
+            "CLIPPER_QUEUE_STORAGE_MODE", "json"
+        ).strip().casefold() or "json"
+        return _envelope(ReadServiceResult(status_payload, revision=json.dumps(status_payload["revisions"], sort_keys=True)))
+
+    @api.get("/api/events")
+    async def events(request: Request) -> StreamingResponse:
+        if os.getenv("CLIPPER_PUSH_INVALIDATION", "1").strip().casefold() in {"0", "false", "no"}:
+            raise HTTPException(status_code=404, detail="Push invalidation is disabled")
+        async def stream():
+            metrics = api.state.sse_metrics
+            metrics["active_clients"] += 1
+            metrics["peak_clients"] = max(metrics["peak_clients"], metrics["active_clients"])
+            try:
+                cursor = request.headers.get("last-event-id") or request.query_params.get("last_event_id")
+                last_heartbeat = 0.0
+                while not await request.is_disconnected():
+                    reset, pending = change_events.after(cursor, limit=64)
+                    if reset:
+                        payload = {
+                            "schema_version": 1,
+                            "topics": ["*"],
+                            "occurred_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                        }
+                        cursor = None
+                        metrics["resets_sent"] += 1
+                        yield f"retry: 5000\nevent: reset\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n"
+                    elif pending:
+                        topics = sorted({topic for event in pending for topic in event.topics})
+                        revisions: dict[str, int] = {}
+                        for event in pending:
+                            revisions.update({key: int(value) for key, value in event.revisions.items()})
+                        newest = pending[-1]
+                        cursor = newest.event_id
+                        payload = {
+                            "schema_version": 1,
+                            "topics": topics,
+                            "revisions": revisions,
+                            "occurred_at": newest.occurred_at,
+                        }
+                        metrics["events_sent"] += len(pending)
+                        yield (
+                            f"id: {cursor}\nretry: 5000\nevent: invalidate\n"
+                            f"data: {json.dumps(payload, separators=(',', ':'))}\n\n"
+                        )
+                    else:
+                        now = asyncio.get_running_loop().time()
+                        if now - last_heartbeat >= 15.0:
+                            last_heartbeat = now
+                            yield ": heartbeat\n\n"
+                    await asyncio.sleep(0.25)
+            finally:
+                metrics["active_clients"] = max(0, metrics["active_clients"] - 1)
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
+        )
 
     @api.get("/api/dashboard")
     def dashboard(request: Request) -> Response:
@@ -790,11 +1007,18 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return FileResponse(artifact.path, media_type=artifact.media_type)
 
-    static_dir = Path(__file__).resolve().parent.parent / "new_app" / "dist"
+    configured_static_dir = os.getenv("CLIPPER_STATIC_DIR", "").strip()
+    static_dir = (
+        Path(configured_static_dir).expanduser().resolve()
+        if configured_static_dir
+        else Path(__file__).resolve().parent.parent / "new_app" / "dist"
+    )
+    if configured_static_dir and not (static_dir / "index.html").is_file():
+        raise RuntimeError(f"CLIPPER_STATIC_DIR does not contain index.html: {static_dir}")
     if static_dir.exists():
         assets_dir = static_dir / "assets"
         if assets_dir.exists():
-            api.mount("/assets", StaticFiles(directory=assets_dir), name="new_app_assets")
+            api.mount("/assets", ImmutableStaticFiles(directory=assets_dir), name="new_app_assets")
 
         @api.get("/")
         @api.get("/{full_path:path}")
@@ -807,8 +1031,9 @@ def create_app(
             except ValueError as exc:
                 raise HTTPException(status_code=404, detail="Not Found") from exc
             if requested.exists() and requested.is_file():
-                return FileResponse(requested)
-            return FileResponse(static_dir / "index.html")
+                headers = {"Cache-Control": "private, no-cache"} if requested.name == "index.html" else {}
+                return FileResponse(requested, headers=headers)
+            return FileResponse(static_dir / "index.html", headers={"Cache-Control": "private, no-cache"})
 
     return api
 

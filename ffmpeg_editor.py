@@ -2322,6 +2322,10 @@ def _chunk_words(clip_words: list, words_per_chunk: int = 4) -> list[list]:
 
 
 def _strip_karaoke_word_punctuation(text: str) -> str:
+    # Alignment can return repeated speech as one hyphenated token (for
+    # example, "bener-bener"). Preserve that boundary when subtitles remove
+    # punctuation so the displayed words do not collapse into "benerbener".
+    text = re.sub(r"(?<=\w)[\-\u2010-\u2015]+(?=\w)", " ", str(text), flags=re.UNICODE)
     text = re.sub(r"[^\w\s]", "", str(text), flags=re.UNICODE)
     text = re.sub(r"\s+", " ", text).strip()
     rupiah_match = re.fullmatch(r"(?:rp|idr|rupiah)\s*(\d+)", text, flags=re.IGNORECASE)

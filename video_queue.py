@@ -37,6 +37,7 @@ from clipper_app.application.logging_utils import (
     PIPELINE_LOG_BACKUP_COUNT,
     PIPELINE_LOG_MAX_BYTES,
 )
+from clipper_app.application.queue_repository import QueueStateRepository
 from stage_cache import stage_fingerprint_matches, write_stage_fingerprint
 
 
@@ -180,6 +181,7 @@ class VideoQueueRunner:
         )
         self.input_dir = Path(input_dir)
         self.state_path = Path(state_path)
+        self.queue_repository = QueueStateRepository(self.state_path)
         self.max_retries = max(0, int(max_retries))
         self.max_active_analysis_videos = max(1, int(max_inflight_videos))
         self.ffmpeg_max_parallel_clips = (
@@ -339,6 +341,7 @@ class VideoQueueRunner:
         return 0 if failed == 0 else 2
 
     def _load_state(self) -> dict:
+        legacy_state: dict = {}
         if self.state_path.exists():
             try:
                 with open(self.state_path, "r", encoding="utf-8") as f:
@@ -347,7 +350,19 @@ class VideoQueueRunner:
                 log.warning(f"Ignoring unreadable queue state {self.state_path}: {exc}")
             else:
                 if isinstance(state.get("videos"), dict):
-                    return self._migrate_state(state)
+                    legacy_state = state
+
+        try:
+            stored_state = self.queue_repository.load(
+                legacy_state,
+                include_history=self.queue_repository.mode != "sqlite",
+            )
+        except Exception as exc:
+            if self.queue_repository.mode != "json":
+                raise RuntimeError(f"Could not load authoritative queue state: {exc}") from exc
+            stored_state = legacy_state
+        if isinstance(stored_state.get("videos"), dict):
+            return self._migrate_state(stored_state)
 
         return {
             "schema_version": STATE_SCHEMA_VERSION,
@@ -398,19 +413,17 @@ class VideoQueueRunner:
 
     def _save_state_locked(self) -> None:
         self.state["updated_at"] = self._now_iso()
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
-        for attempt in range(1, 4):
-            try:
-                with open(temp_path, "w", encoding="utf-8") as f:
-                    json.dump(self.state, f, ensure_ascii=False, indent=2)
-                os.replace(temp_path, self.state_path)
-                return
-            except Exception as exc:
-                if attempt >= 3:
-                    log.exception(f"Failed to persist queue state to {self.state_path}: {exc}")
-                    raise
-                time.sleep(0.2 * attempt)
+        lifecycle = str(self.state.get("queue_status") or "").casefold() in {
+            "completed",
+            "failed",
+            "paused",
+            "stopped",
+        }
+        try:
+            self.queue_repository.save(self.state, lifecycle=lifecycle)
+        except Exception as exc:
+            log.exception(f"Failed to persist queue state to {self.state_path}: {exc}")
+            raise
 
     def _discover_videos(self) -> list[Path]:
         if self.video_path is not None:
@@ -562,6 +575,12 @@ class VideoQueueRunner:
                     pass
         for thread in self.workers:
             thread.join(timeout=5.0)
+        try:
+            from main import wait_for_export_batch_packaging
+
+            wait_for_export_batch_packaging()
+        except Exception as exc:
+            log.warning("Could not wait for export batch packaging during queue shutdown: %s", exc)
 
     def _worker_loop(self, worker_name: str, queue_obj: Queue) -> None:
         while not self.stop_event.is_set():

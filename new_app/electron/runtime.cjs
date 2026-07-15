@@ -198,6 +198,12 @@ function desktopStartDirs({ appPath, execPath, dirname, cwd } = {}) {
   ].filter(Boolean);
 }
 
+function rendererDirectory({ isPackaged, resourcesPath, projectRoot } = {}) {
+  return isPackaged
+    ? path.join(path.resolve(resourcesPath || "."), "renderer")
+    : path.join(path.resolve(projectRoot || "."), "new_app", "dist");
+}
+
 function portableRestartCommand({ portableExecutableFile, argv = [] } = {}) {
   if (typeof portableExecutableFile !== "string" || !portableExecutableFile.trim()) {
     return null;
@@ -228,6 +234,7 @@ module.exports = {
   parseArgs,
   portableRestartCommand,
   readRuntimeConfig,
+  rendererDirectory,
   resolvePythonExe,
   runtimeConfigPath,
   writeRuntimeConfig

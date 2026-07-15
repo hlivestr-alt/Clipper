@@ -610,6 +610,47 @@ class VideoQueueSchedulingTests(unittest.TestCase):
             release.set()
             self.assertTrue(finished.wait(timeout=2.0))
 
+    def test_queue_shutdown_waits_for_export_packaging_worker(self):
+        import main
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            input_dir = temp_path / "input"
+            input_dir.mkdir()
+            runner = VideoQueueRunner(
+                input_dir=str(input_dir),
+                state_path=str(temp_path / "state.json"),
+                max_retries=0,
+                max_inflight_videos=1,
+                poll_interval=0.5,
+            )
+            packaging_started = threading.Event()
+            release_packaging = threading.Event()
+            packaging_finished = threading.Event()
+            shutdown_finished = threading.Event()
+
+            def fake_run_export(*_args, **_kwargs):
+                packaging_started.set()
+                self.assertTrue(release_packaging.wait(timeout=5.0))
+                packaging_finished.set()
+                return {}
+
+            with mock.patch("main._run_export_batch_packaging", side_effect=fake_run_export):
+                export_thread = main._start_export_batch_packaging_thread(object())
+                self.assertFalse(export_thread.daemon)
+                self.assertTrue(packaging_started.wait(timeout=1.0))
+
+                shutdown_thread = threading.Thread(
+                    target=lambda: (runner._stop_workers(), shutdown_finished.set()),
+                    daemon=True,
+                )
+                shutdown_thread.start()
+                self.assertFalse(shutdown_finished.wait(timeout=0.1))
+                release_packaging.set()
+                self.assertTrue(shutdown_finished.wait(timeout=2.0))
+                self.assertTrue(packaging_finished.is_set())
+                export_thread.join(timeout=1.0)
+
     def test_manual_max_clips_run_skips_synchronous_export_batch_packaging(self):
         import main
 

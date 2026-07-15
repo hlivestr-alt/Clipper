@@ -1,7 +1,9 @@
 import json
 import os
+import shutil
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -504,6 +506,210 @@ class ExportPackagerTest(unittest.TestCase):
             self.assertEqual(status["pending_count"], 0)
             self.assertEqual(status["packaged_total"], 2)
 
+    def test_diversity_strategy_moves_all_variants_into_full_diverse_batches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for vod_number in range(1, 6):
+                write_source(root, f"vod_{vod_number:02d}", rotation_specs(clip_count=3))
+
+            result = package_export_batches(root, cfg=make_diversity_cfg())
+
+            self.assertEqual(result["allocation_strategy"], "diversity_first_rolling")
+            self.assertEqual(result["packaged_count"], 90)
+            self.assertEqual(result["pending_count"], 0)
+            self.assertEqual(batch_counts(root), {str(index): 15 for index in range(1, 7)})
+            items = package_items(root)
+            for folder_number in range(1, 7):
+                folder_items = [item for item in items if item["batch_folder"] == str(folder_number)]
+                by_vod = Counter(item["normalized_source_vod"] for item in folder_items)
+                self.assertEqual(len(by_vod), 5)
+                self.assertEqual(set(by_vod.values()), {3})
+                self.assertEqual(len({item["base_clip_key"] for item in folder_items}), 15)
+            for base_key in {item["base_clip_key"] for item in items}:
+                base_items = [item for item in items if item["base_clip_key"] == base_key]
+                self.assertEqual(len(base_items), 6)
+                self.assertEqual(len({item["batch_folder"] for item in base_items}), 6)
+            self.assertEqual(len(list(root.glob("vod_*/export_ready/**/*.mp4"))), 0)
+            self.assertEqual(len(list((root / "export_batches" / "_pending").rglob("*.mp4"))), 0)
+
+    def test_diversity_strategy_uses_more_than_minimum_vods_when_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for vod_number in range(1, 16):
+                write_source(root, f"vod_{vod_number:02d}", rotation_specs(clip_count=1))
+
+            result = package_export_batches(root, cfg=make_diversity_cfg())
+
+            self.assertEqual(result["packaged_count"], 90)
+            for folder_number in range(1, 7):
+                folder_items = [
+                    item for item in package_items(root) if item["batch_folder"] == str(folder_number)
+                ]
+                self.assertEqual(len({item["normalized_source_vod"] for item in folder_items}), 15)
+
+    def test_diversity_strategy_emits_multiple_full_batches_and_keeps_remainder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for vod_number in range(1, 11):
+                write_source(root, f"vod_{vod_number:02d}", rotation_specs(clip_count=3))
+            write_source(root, "vod_11", rotation_specs(clip_count=2))
+
+            result = package_export_batches(root, cfg=make_diversity_cfg())
+
+            self.assertEqual(result["packaged_count"], 180)
+            self.assertEqual(result["pending_count"], 12)
+            self.assertEqual(batch_counts(root), {str(index): 15 for index in range(1, 13)})
+            self.assertEqual(len(list(root.glob("vod_*/export_ready/**/*.mp4"))), 0)
+            self.assertEqual(len(list((root / "export_batches" / "_pending").rglob("*.mp4"))), 12)
+
+    def test_diversity_strategy_moves_every_available_variant_without_selection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fallback_specs = [
+                {"clip_id": "clip_0001_v1_first_available", "score": 8.0, "version": "v1"},
+                {"clip_id": "clip_0001_v3_later_available", "score": 7.0, "version": "v3"},
+                *[spec for spec in rotation_specs(clip_count=3) if not spec["clip_id"].startswith("clip_0001_")],
+            ]
+            write_source(root, "vod_01", fallback_specs)
+            for vod_number in range(2, 6):
+                write_source(root, f"vod_{vod_number:02d}", rotation_specs(clip_count=3))
+
+            result = package_export_batches(root, cfg=make_diversity_cfg())
+
+            self.assertEqual(result["packaged_count"], 30)
+            self.assertEqual(result["pending_count"], 56)
+            all_items = [
+                *package_items(root),
+                *json.loads(
+                    (root / "export_batches" / "_diversity_state.json").read_text(encoding="utf-8")
+                )["pending"].values(),
+            ]
+            vod_01_clip_01_variants = {
+                item["selected_variant"] if "selected_variant" in item else item["variant_id"]
+                for item in all_items
+                if item["normalized_source_vod"] == "vod_01" and item["base_clip_id"] == "clip_0001"
+            }
+            self.assertEqual(vod_01_clip_01_variants, {"v1_first_available", "v3_later_available"})
+            self.assertEqual(result["excluded_variant_count"], 0)
+            self.assertFalse(result["one_variant_per_clip"])
+            self.assertEqual(len(list(root.glob("vod_*/export_ready/**/*.mp4"))), 0)
+
+    def test_diversity_strategy_waits_then_relaxes_minimum_cap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for vod_number in range(1, 5):
+                write_source(root, f"vod_{vod_number:02d}", rotation_specs(clip_count=4))
+
+            first = package_export_batches(root, cfg=make_diversity_cfg())
+            self.assertEqual(first["packaged_count"], 0)
+            self.assertEqual(first["pending_count"], 96)
+            self.assertEqual(batch_counts(root), {})
+            self.assertEqual(len(list(root.glob("vod_*/export_ready/**/*.mp4"))), 0)
+            self.assertEqual(len(list((root / "export_batches" / "_pending").rglob("*.mp4"))), 96)
+
+            state_path = root / "export_batches" / "_diversity_state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            for pending in state["pending"].values():
+                pending["first_seen_at"] = "2000-01-01T00:00:00+00:00"
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            second = package_export_batches(root, cfg=make_diversity_cfg())
+
+            self.assertEqual(second["packaged_count"], 90)
+            self.assertEqual(second["pending_count"], 6)
+            self.assertTrue(second["diversity_timeout_relaxed"])
+            self.assertEqual(second["effective_max_per_vod"], 4)
+            for folder_number in range(1, 7):
+                counts = Counter(
+                    item["normalized_source_vod"]
+                    for item in package_items(root)
+                    if item["batch_folder"] == str(folder_number)
+                )
+                self.assertEqual(sorted(counts.values()), [3, 4, 4, 4])
+
+    def test_diversity_strategy_starts_after_existing_partial_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_legacy_batch(root, folder_number=7, count=4)
+            before = sorted((root / "export_batches" / "7").glob("*.mp4"))
+            before_payloads = [path.read_bytes() for path in before]
+            for vod_number in range(1, 6):
+                write_source(root, f"vod_{vod_number:02d}", rotation_specs(clip_count=3))
+
+            result = package_export_batches(root, cfg=make_diversity_cfg())
+
+            self.assertEqual(result["packaged_count"], 90)
+            self.assertEqual(
+                batch_counts(root),
+                {"7": 4, **{str(index): 15 for index in range(8, 14)}},
+            )
+            self.assertEqual([path.read_bytes() for path in before], before_payloads)
+            state = json.loads(
+                (root / "export_batches" / "_diversity_state.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(state["started_at_folder"], 8)
+
+    def test_diversity_strategy_rolls_back_failed_staging_batch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for vod_number in range(1, 6):
+                write_source(root, f"vod_{vod_number:02d}", single_variant_specs(clip_count=3))
+            real_move = shutil.move
+            call_count = 0
+
+            def fail_second_staging_move(source, destination):
+                nonlocal call_count
+                call_count += 1
+                if call_count == 17:
+                    raise OSError("locked")
+                return real_move(source, destination)
+
+            with mock.patch("export_packager.shutil.move", side_effect=fail_second_staging_move):
+                result = package_export_batches(root, cfg=make_diversity_cfg())
+
+            self.assertEqual(result["packaged_count"], 0)
+            self.assertEqual(result["pending_count"], 15)
+            self.assertGreaterEqual(result["error_count"], 1)
+            self.assertEqual(batch_counts(root), {})
+            self.assertEqual(len(list(root.glob("vod_*/export_ready/**/*.mp4"))), 0)
+            self.assertEqual(len(list((root / "export_batches" / "_pending").rglob("*.mp4"))), 15)
+            self.assertEqual(list((root / "export_batches").glob(".staging-*")), [])
+
+    def test_diversity_dry_run_reports_full_batches_without_state_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for vod_number in range(1, 6):
+                write_source(root, f"vod_{vod_number:02d}", rotation_specs(clip_count=3))
+
+            result = package_export_batches(root, cfg=make_diversity_cfg(), dry_run=True)
+
+            self.assertEqual(result["packaged_count"], 90)
+            self.assertEqual(result["pending_count"], 0)
+            self.assertEqual(len(result["assignments"]), 90)
+            self.assertFalse((root / "export_batches" / "_diversity_state.json").exists())
+            self.assertFalse((root / "export_batches" / "_manifest.json").exists())
+            self.assertEqual(len(list(root.glob("vod_*/export_ready/**/*.mp4"))), 90)
+
+    def test_diversity_intake_can_be_scoped_to_just_finished_vod(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_source(root, "vod_finished", rotation_specs(clip_count=4))
+            write_source(root, "vod_historical", rotation_specs(clip_count=4))
+
+            result = package_export_batches(
+                root,
+                cfg=make_diversity_cfg(),
+                source_output_dir=root / "vod_finished",
+            )
+
+            self.assertEqual(result["eligible_count"], 24)
+            self.assertEqual(result["packaged_count"], 0)
+            self.assertEqual(result["pending_count"], 24)
+            self.assertEqual(len(list((root / "vod_finished" / "export_ready").rglob("*.mp4"))), 0)
+            self.assertEqual(len(list((root / "vod_historical" / "export_ready").rglob("*.mp4"))), 24)
+            self.assertEqual(len(list((root / "export_batches" / "_pending").rglob("*.mp4"))), 24)
+            self.assertEqual(batch_counts(root), {})
+
     def test_dry_run_records_preflight_without_counting_planned_moves_as_packaged(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -744,6 +950,19 @@ def make_rotation_cfg():
     )
 
 
+def make_diversity_cfg(wait_hours: float = 2):
+    return SimpleNamespace(
+        EXPORT_BATCH_DIR_NAME="export_batches",
+        EXPORT_BATCH_SIZE=15,
+        EXPORT_BATCH_STRATEGY="diversity_first_rolling",
+        EXPORT_BATCH_VARIANT_COUNT=6,
+        EXPORT_BATCH_MIN_DISTINCT_VODS=5,
+        EXPORT_BATCH_MAX_PER_VOD=3,
+        EXPORT_BATCH_DIVERSITY_WAIT_HOURS=wait_hours,
+        EXPORT_PACK_ONE_VARIANT_PER_CLIP=False,
+    )
+
+
 def rotation_specs(clip_count: int) -> list[dict]:
     return [
         {
@@ -753,6 +972,17 @@ def rotation_specs(clip_count: int) -> list[dict]:
         }
         for clip_number in range(1, clip_count + 1)
         for variant_number in range(6)
+    ]
+
+
+def single_variant_specs(clip_count: int) -> list[dict]:
+    return [
+        {
+            "clip_id": f"clip_{clip_number:04d}_v0_original",
+            "score": 9.0,
+            "version": "v0",
+        }
+        for clip_number in range(1, clip_count + 1)
     ]
 
 
@@ -813,7 +1043,7 @@ def batch_counts(root: Path) -> dict[str, int]:
     return {
         folder.name: len(list(folder.glob("*.mp4")))
         for folder in sorted((root / "export_batches").iterdir(), key=lambda path: path.name)
-        if folder.is_dir()
+        if folder.is_dir() and folder.name.isdigit()
     }
 
 

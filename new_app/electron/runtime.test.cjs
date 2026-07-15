@@ -17,6 +17,7 @@ const {
   parseArgs,
   portableRestartCommand,
   readRuntimeConfig,
+  rendererDirectory,
   resolvePythonExe,
   runtimeConfigPath,
   writeRuntimeConfig
@@ -57,6 +58,17 @@ test("python resolver respects CLI, environment, saved config, then python", () 
   assert.equal(resolvePythonExe({ envPython: "env", savedPython: "saved" }), "env");
   assert.equal(resolvePythonExe({ savedPython: "saved" }), "saved");
   assert.equal(resolvePythonExe({}), "python");
+});
+
+test("renderer directory is packaged independently from the external project", () => {
+  assert.equal(
+    rendererDirectory({ isPackaged: true, resourcesPath: "C:\\portable\\resources", projectRoot: "D:\\project" }),
+    path.resolve("C:\\portable\\resources", "renderer")
+  );
+  assert.equal(
+    rendererDirectory({ isPackaged: false, resourcesPath: "C:\\portable\\resources", projectRoot: "D:\\project" }),
+    path.resolve("D:\\project", "new_app", "dist")
+  );
 });
 
 test("runtime config read and write handles missing and corrupt files safely", () => {

@@ -53,7 +53,13 @@ class ApiSecuritySettings:
 
 def is_sensitive_read(path: str) -> bool:
     normalized = str(path or "").rstrip("/") or "/"
-    if normalized in {"/api/artifacts", "/api/logs", "/api/settings", "/api/settings/effective"}:
+    if normalized in {
+        "/api/artifacts",
+        "/api/catalog/status",
+        "/api/logs",
+        "/api/settings",
+        "/api/settings/effective",
+    }:
         return True
     if normalized.startswith("/api/control/jobs/"):
         return True
