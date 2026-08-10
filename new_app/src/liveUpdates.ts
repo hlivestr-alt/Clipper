@@ -26,6 +26,7 @@ const topicPrefixes: Record<string, string[]> = {
   outputs: ["/api/scores", "/api/compliance", "/api/overview"],
   settings: ["/api/settings", "/api/system", "/api/dashboard", "/api/queue"],
   variations: ["/api/variations"],
+  trends: ["/api/trends"],
   system: ["/api/system"],
   logs: ["/api/logs"]
 };
@@ -124,7 +125,7 @@ export function useLiveUpdateStatus(): LiveUpdateSnapshot {
 }
 
 export function shouldPollWhileLive(path: string): boolean {
-  return ["/api/health", "/api/system", "/api/logs", "/api/queue/vods"].some((prefix) =>
+  return ["/api/health", "/api/system", "/api/logs", "/api/queue/vods", "/api/trends"].some((prefix) =>
     path.startsWith(prefix)
   );
 }

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from clipper_app.application.control_services import ControlJobService, SettingsService
 from clipper_app.application.read_services import ReadDashboardService
+from clipper_app.application.whatsapp_delivery import WhatsAppDeliveryService
 from clipper_app.application.services import (
     ComplianceService,
     ExportPackagingService,
@@ -23,6 +24,7 @@ class ApplicationServiceContainer:
     compliance: ComplianceService
     modules: ModuleService
     exports: ExportPackagingService
+    whatsapp_delivery: WhatsAppDeliveryService
 
     @classmethod
     def build(
@@ -36,6 +38,7 @@ class ApplicationServiceContainer:
         compliance: ComplianceService | None = None,
         modules: ModuleService | None = None,
         exports: ExportPackagingService | None = None,
+        whatsapp_delivery: WhatsAppDeliveryService | None = None,
         migrate_legacy_jobs: bool = False,
     ) -> "ApplicationServiceContainer":
         read_service = reads or ReadDashboardService()
@@ -52,4 +55,7 @@ class ApplicationServiceContainer:
             compliance=compliance or ComplianceService(provider),
             modules=modules or ModuleService(provider),
             exports=exports or ExportPackagingService(provider),
+            whatsapp_delivery=whatsapp_delivery or WhatsAppDeliveryService.from_config(
+                read_service.cfg
+            ),
         )

@@ -15,7 +15,7 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 from uuid import uuid4
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 12
 DEFAULT_EVENT_RETENTION_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_EVENT_RETENTION_ROWS = 50_000
 
@@ -99,12 +99,15 @@ class CatalogDatabase:
                         "INSERT INTO catalog_meta(key, value) VALUES('instance_id', ?)",
                         (uuid4().hex,),
                     )
+                connection.commit()
+                self._ensure_columns(connection)
+                self._migrate_trend_media_downloads(connection)
+                self._backfill_trend_final_ranks(connection)
                 connection.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(?, ?)",
                     (SCHEMA_VERSION, utc_now()),
                 )
                 connection.commit()
-                self._ensure_columns(connection)
             finally:
                 connection.close()
             self._migrated = True
@@ -119,12 +122,89 @@ class CatalogDatabase:
             ),
             "compliance_violations": (("ordinal", "INTEGER NOT NULL DEFAULT 0"),),
             "modules": (("ordinal", "INTEGER NOT NULL DEFAULT 0"),),
+            "trend_videos": (
+                ("final_rank", "INTEGER"),
+                ("media_type", "TEXT NOT NULL DEFAULT 'unknown'"),
+                ("is_available", "INTEGER NOT NULL DEFAULT 0"),
+                ("classification_evidence", "TEXT NOT NULL DEFAULT 'legacy record; no media evidence'"),
+                ("availability_evidence", "TEXT NOT NULL DEFAULT 'not probed'"),
+                ("video_duration_seconds", "REAL"),
+                ("image_count", "INTEGER"),
+                ("playable_url_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("provider_aweme_type", "INTEGER"),
+                ("exclusion_reason", "TEXT"),
+            ),
+            "trend_hashtags": (
+                ("normalized_name", "TEXT NOT NULL DEFAULT ''"),
+                ("source", "TEXT NOT NULL DEFAULT 'tiktok_discovery_trending'"),
+                ("source_category", "TEXT NOT NULL DEFAULT ''"),
+                ("original_rank", "INTEGER NOT NULL DEFAULT 0"),
+                ("display_rank", "INTEGER NOT NULL DEFAULT 0"),
+                ("relevance_type", "TEXT NOT NULL DEFAULT ''"),
+                ("matched_brand", "TEXT"),
+                ("classification_reason", "TEXT NOT NULL DEFAULT ''"),
+            ),
         }
         for table, definitions in additions.items():
             columns = {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")}
             for name, sql_type in definitions:
                 if name not in columns:
                     connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS trend_hashtags_display_rank_idx "
+            "ON trend_hashtags(snapshot_id, display_rank)"
+        )
+        connection.commit()
+
+    @staticmethod
+    def _migrate_trend_media_downloads(connection: sqlite3.Connection) -> None:
+        """Change legacy global video downloads into snapshot/hashtag download records."""
+        table_info = list(connection.execute("PRAGMA table_info(trend_media_downloads)"))
+        primary_key = [
+            str(row[1])
+            for row in sorted((row for row in table_info if int(row[5]) > 0), key=lambda row: int(row[5]))
+        ]
+        expected_primary_key = ["snapshot_id", "hashtag_id", "video_id"]
+        if primary_key == expected_primary_key:
+            return
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute("DROP INDEX IF EXISTS trend_media_downloads_status_idx")
+            connection.execute("ALTER TABLE trend_media_downloads RENAME TO trend_media_downloads_legacy_v10")
+            connection.execute(_TREND_MEDIA_DOWNLOADS_TABLE_SQL)
+            connection.execute(
+                "INSERT INTO trend_media_downloads("
+                "snapshot_id,hashtag_id,video_id,hashtag_name,normalized_hashtag,final_rank,run_id,source_url,"
+                "relative_path,file_sha256,file_size,file_mtime_ns,duration_seconds,status,error,"
+                "extractor_version,attempt_count,started_at,completed_at,updated_at"
+                ") SELECT snapshot_id,'',video_id,'','',NULL,run_id,source_url,relative_path,file_sha256,"
+                "file_size,file_mtime_ns,duration_seconds,status,error,extractor_version,attempt_count,"
+                "started_at,completed_at,updated_at FROM trend_media_downloads_legacy_v10"
+            )
+            connection.execute("DROP TABLE trend_media_downloads_legacy_v10")
+            connection.execute(
+                "CREATE INDEX trend_media_downloads_status_idx "
+                "ON trend_media_downloads(snapshot_id, status, updated_at)"
+            )
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _backfill_trend_final_ranks(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            "WITH ranked AS ("
+            "SELECT rowid AS target_rowid,ROW_NUMBER() OVER ("
+            "PARTITION BY snapshot_id,hashtag_id ORDER BY provider_ordinal,video_id"
+            ") AS video_rank FROM trend_videos "
+            "WHERE media_type='video' AND is_available=1"
+            ") UPDATE trend_videos SET final_rank=("
+            "SELECT video_rank FROM ranked WHERE ranked.target_rowid=trend_videos.rowid"
+            ") WHERE final_rank IS NULL AND rowid IN ("
+            "SELECT target_rowid FROM ranked WHERE video_rank<=20"
+            ")"
+        )
         connection.commit()
 
     @contextmanager
@@ -218,6 +298,13 @@ class CatalogDatabase:
                 "queue_run_history",
                 "change_events",
                 "catalog_repairs",
+                "trend_snapshots",
+                "trend_hashtags",
+                "trend_videos",
+                "trend_media_downloads",
+                "trend_media_links",
+                "trend_fingerprints",
+                "trend_patterns",
             )
         }
         wal_path = Path(f"{self.path}-wal")
@@ -1143,6 +1230,33 @@ def _file_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
+_TREND_MEDIA_DOWNLOADS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS trend_media_downloads (
+    snapshot_id TEXT NOT NULL,
+    hashtag_id TEXT NOT NULL,
+    video_id TEXT NOT NULL,
+    hashtag_name TEXT NOT NULL,
+    normalized_hashtag TEXT NOT NULL,
+    final_rank INTEGER,
+    run_id TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    relative_path TEXT,
+    file_sha256 TEXT,
+    file_size INTEGER,
+    file_mtime_ns INTEGER,
+    duration_seconds REAL,
+    status TEXT NOT NULL,
+    error TEXT,
+    extractor_version TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    started_at TEXT,
+    completed_at TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(snapshot_id, hashtag_id, video_id)
+);
+"""
+
+
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -1292,6 +1406,93 @@ CREATE TABLE IF NOT EXISTS queue_run_history (
     payload_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS queue_history_video_idx ON queue_run_history(video_key, archived_at DESC);
+CREATE TABLE IF NOT EXISTS trend_snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    retrieved_at TEXT NOT NULL,
+    country_code TEXT NOT NULL,
+    date_range TEXT NOT NULL,
+    category_name TEXT NOT NULL,
+    provider_request_id TEXT,
+    payload_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS trend_snapshots_query_idx ON trend_snapshots(country_code, date_range, category_name, retrieved_at DESC);
+CREATE TABLE IF NOT EXISTS trend_hashtags (
+    snapshot_id TEXT NOT NULL REFERENCES trend_snapshots(snapshot_id) ON DELETE CASCADE,
+    hashtag_id TEXT NOT NULL,
+    hashtag_name TEXT NOT NULL,
+    normalized_name TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'tiktok_discovery_trending',
+    source_category TEXT NOT NULL DEFAULT '',
+    original_rank INTEGER NOT NULL DEFAULT 0,
+    display_rank INTEGER NOT NULL DEFAULT 0,
+    relevance_type TEXT NOT NULL DEFAULT '',
+    matched_brand TEXT,
+    classification_reason TEXT NOT NULL DEFAULT '',
+    rank_position INTEGER NOT NULL,
+    rank_change TEXT,
+    views INTEGER,
+    posts INTEGER,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY(snapshot_id, hashtag_id)
+);
+CREATE INDEX IF NOT EXISTS trend_hashtags_rank_idx ON trend_hashtags(snapshot_id, rank_position);
+CREATE TABLE IF NOT EXISTS trend_videos (
+    snapshot_id TEXT NOT NULL REFERENCES trend_snapshots(snapshot_id) ON DELETE CASCADE,
+    hashtag_id TEXT NOT NULL,
+    video_id TEXT NOT NULL,
+    hashtag_name TEXT NOT NULL,
+    provider_ordinal INTEGER NOT NULL,
+    final_rank INTEGER,
+    share_url TEXT NOT NULL,
+    embed_url TEXT NOT NULL,
+    media_type TEXT NOT NULL DEFAULT 'unknown',
+    is_available INTEGER NOT NULL DEFAULT 0,
+    classification_evidence TEXT NOT NULL DEFAULT 'legacy record; no media evidence',
+    availability_evidence TEXT NOT NULL DEFAULT 'not probed',
+    video_duration_seconds REAL,
+    image_count INTEGER,
+    playable_url_count INTEGER NOT NULL DEFAULT 0,
+    provider_aweme_type INTEGER,
+    exclusion_reason TEXT,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY(snapshot_id, hashtag_id, video_id)
+);
+CREATE INDEX IF NOT EXISTS trend_videos_query_idx ON trend_videos(snapshot_id, hashtag_id, provider_ordinal);
+""" + _TREND_MEDIA_DOWNLOADS_TABLE_SQL + """
+CREATE INDEX IF NOT EXISTS trend_media_downloads_status_idx ON trend_media_downloads(snapshot_id, status, updated_at);
+CREATE TABLE IF NOT EXISTS trend_media_links (
+    video_id TEXT PRIMARY KEY,
+    relative_path TEXT NOT NULL,
+    file_sha256 TEXT NOT NULL,
+    file_size INTEGER NOT NULL,
+    file_mtime_ns INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    approved_at TEXT NOT NULL,
+    approved_by TEXT NOT NULL,
+    error TEXT,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS trend_fingerprints (
+    fingerprint_id TEXT PRIMARY KEY,
+    snapshot_id TEXT NOT NULL REFERENCES trend_snapshots(snapshot_id) ON DELETE CASCADE,
+    video_id TEXT NOT NULL,
+    hashtag_id TEXT NOT NULL,
+    file_sha256 TEXT NOT NULL,
+    analyzer_version TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE(snapshot_id, video_id, file_sha256, analyzer_version)
+);
+CREATE INDEX IF NOT EXISTS trend_fingerprints_query_idx ON trend_fingerprints(snapshot_id, video_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS trend_patterns (
+    pattern_id TEXT PRIMARY KEY,
+    snapshot_id TEXT NOT NULL REFERENCES trend_snapshots(snapshot_id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    base_profile_revision TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS trend_patterns_query_idx ON trend_patterns(snapshot_id, created_at DESC);
 CREATE TRIGGER IF NOT EXISTS queue_history_no_update BEFORE UPDATE ON queue_run_history
 BEGIN SELECT RAISE(ABORT, 'queue history is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS queue_history_no_delete BEFORE DELETE ON queue_run_history

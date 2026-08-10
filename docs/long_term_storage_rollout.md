@@ -1,24 +1,37 @@
-# Long-term storage and desktop rollout
+# Long-Term Storage and Desktop Rollout
 
-The catalog and queue migrations are deliberately feature-flagged. The default
-runtime continues to read legacy files and write the legacy queue state until a
-rollout stage is selected explicitly.
+The catalog and queue migrations are deliberately feature-flagged. The current defaults still read legacy output artifacts and use JSON queue state. Do not change a mode without completing its verification and rollback gate.
 
-## Storage locations
+## Storage Map
 
-- SQLite catalog: `working/catalog/clipper.sqlite3`
-- Queue history: `working/queue_history/YYYY-MM.jsonl`
-- Queue state compatibility snapshot: `working/video_queue_state.json`
-- Migration backups: `working/queue_migration_backups/`
+- Shared SQLite catalog: `working/catalog/clipper.sqlite3` or `CLIPPER_CATALOG_PATH`.
+- Queue history journals: `working/queue_history/YYYY-MM.jsonl`.
+- Queue compatibility snapshot: `working/video_queue_state.json`.
+- Queue migration backups: `working/queue_migration_backups/`.
+- Control-job metadata: `working/app_control_jobs/`.
+- Control-job results: `working/app_control_job_results/`.
+- Control audit: `working/app_control_audit.jsonl`.
+- Settings overrides: `working/settings_overrides.json`.
+- TikTok encrypted credentials: `working/secrets/tiktok_oauth.tokens` by default; this is separate from the catalog.
+- WhatsApp delivery database: `D:\output_clips\export_batches_whatsapp\_whatsapp_state.sqlite3` by current configuration; this is a separate authoritative store.
 
-SQLite uses WAL mode, foreign keys, a busy timeout, and bounded retries. Queue
-history records are append-only and carry checksums. The compatibility snapshot
-contains active queue state only in schema v3; a schema v2 export with history
-can be generated for rollback or external tools.
+The shared catalog currently uses schema version 12. It contains rebuildable sources/revisions/snapshots/repairs; outputs, clips, scores, compliance, modules, and export status; optional queue active/history state; durable change events; and TikTok snapshots, hashtags, videos, downloads, media links, fingerprints, and patterns.
 
-## Maintenance commands
+SQLite uses WAL mode, foreign keys, a busy timeout, and bounded retries. Queue journals are append-only and checksummed. In SQLite queue mode, the compatibility JSON snapshot contains active state in schema version 3; a schema-version-2 export with embedded history can be generated for rollback or external legacy tools.
 
-Run commands from the repository root:
+## Current Default Modes
+
+```text
+CLIPPER_CATALOG_MODE=legacy
+CLIPPER_QUEUE_STORAGE_MODE=json
+CLIPPER_PUSH_INVALIDATION=1
+```
+
+The catalog can be populated even while legacy reads remain authoritative. On 2026-08-10, `catalog_cli status` reported schema 12, integrity `ok`, zero recorded repair rows, runtime queue mode `json`, and stored successful trend fingerprints/patterns. Treat counts and revision numbers as operational state, not documentation contracts.
+
+## Maintenance Commands
+
+Run from the repository root:
 
 ```powershell
 python -m clipper_app.catalog_cli status
@@ -28,74 +41,57 @@ python -m clipper_app.catalog_cli reconcile
 python -m clipper_app.catalog_cli backup
 ```
 
-Queue migration and compatibility export:
+Queue migration and legacy export:
 
 ```powershell
 python -m clipper_app.catalog_cli migrate-queue
 python -m clipper_app.catalog_cli export-legacy-queue working\video_queue_state.v2.json
 ```
 
-If catalog verification cannot be repaired in place, `rebuild` quarantines the
-current database before creating and indexing a replacement:
+If verification cannot be repaired in place, `rebuild` quarantines the current database before creating and indexing a replacement:
 
 ```powershell
 python -m clipper_app.catalog_cli rebuild
 ```
 
-## Rollout stages
+Always record the backup/export location and verify the replacement before deleting any quarantine or migration backup.
 
-1. Backfill and shadow verification
+## Rollout Stages
 
-   Keep `CLIPPER_CATALOG_MODE=legacy` and
-   `CLIPPER_QUEUE_STORAGE_MODE=json`. Run `backfill`, then `verify`. The API
-   status endpoint reports source counts, dirty sources, repairs, and shadow
-   comparison results.
+1. **Backfill and shadow verification**
 
-2. Queue dual write
+   Keep catalog reads in `legacy` and queue storage in `json`. Run `backfill`, then `verify`. Check source counts, dirty/repair rows, integrity, and shadow comparisons. A historical zero-mismatch result is not proof that current artifacts are still synchronized.
 
-   Set `CLIPPER_QUEUE_STORAGE_MODE=dual`. JSON remains the read source while
-   every save also updates SQLite and the checksummed history journal. Compare
-   active and historical counts across normal starts, stage transitions,
-   completion, cancellation, and recovery.
+2. **Queue dual write**
 
-3. Catalog read cutover
+   Set `CLIPPER_QUEUE_STORAGE_MODE=dual`. JSON remains the read authority while every lifecycle write also updates SQLite and the monthly history journal. Exercise registration, progress, retries, stage failure, completion, cancellation, pause/restart, and recovery. Verify both active state and history checksums.
 
-   Set `CLIPPER_CATALOG_MODE=catalog`. Scores, compliance, modules, overview,
-   and output reads use the indexed read model. Revert the variable to `legacy`
-   for immediate rollback; the legacy artifacts are not modified by catalog
-   reads.
+3. **Catalog read cutover**
 
-4. Queue read cutover
+   Set `CLIPPER_CATALOG_MODE=shadow` for a soak, then `catalog` after comparisons remain clean. Scores, compliance, modules, overview, and supported output reads use the indexed model. Revert immediately to `legacy` if a query or count disagrees; catalog reads do not modify legacy artifacts.
 
-   Set `CLIPPER_QUEUE_STORAGE_MODE=sqlite`. SQLite becomes authoritative and an
-   active-only compatibility snapshot is refreshed on lifecycle writes and at
-   most every ten seconds during progress updates. Revert to `dual` or `json`
-   and, if necessary, restore a migration backup or schema v2 export.
+4. **Queue read cutover**
 
-5. Push invalidation
+   Set `CLIPPER_QUEUE_STORAGE_MODE=sqlite`. SQLite becomes authoritative and refreshes the active-only JSON compatibility snapshot on lifecycle writes and at most every ten seconds during progress updates. Roll back to `dual` or `json` with a verified backup/schema-2 export if needed.
 
-   `CLIPPER_PUSH_INVALIDATION=1` is the default. `/api/events` supplies durable
-   SSE event IDs, replay, reset notices after retention gaps, and heartbeats.
-   The renderer falls back to polling if a live connection is unavailable.
-   Set the flag to `0` to force polling-only operation.
+5. **Push invalidation**
 
-## Desktop packaging
+   `/api/events` is enabled by default and provides durable SSE IDs, replay, reset notices after retention gaps, and heartbeats. The React client falls back to polling. Set `CLIPPER_PUSH_INVALIDATION=0` only to force polling during diagnosis.
 
-The Electron archive contains only the shell files. The compiled renderer is an
-external packaged resource and `CLIPPER_STATIC_DIR` is injected into the managed
-backend. The backend serves hashed assets with immutable caching and serves the
-SPA entry with `no-cache`.
+## Job-Result Migration
 
-Build and verify the portable artifact with:
+Control jobs use schema-version-2 metadata and separate bounded result files. `CLIPPER_MIGRATE_JOB_STORAGE=1` atomically migrates legacy embedded results, retains rollback backups, and applies current result expiration/truncation rules. Electron and `run_new_app.ps1` enable this migration on startup. This is independent of catalog and queue cutover.
+
+## Desktop Packaging Gate
+
+The Electron archive contains the shell and compiled renderer only. The renderer is packaged under `resources/renderer`; `CLIPPER_STATIC_DIR` points the managed backend at it.
 
 ```powershell
 cd new_app
-pnpm test
-pnpm build
-pnpm desktop:test
-pnpm desktop:portable
+pnpm.cmd test
+pnpm.cmd build
+pnpm.cmd desktop:test
+pnpm.cmd desktop:portable
 ```
 
-Before advancing a stage, require a clean catalog verification, zero shadow
-count mismatches, valid queue journal checksums, passing automated suites, and a
-successful portable startup/navigation smoke test.
+The current artifact is `new_app/dist-desktop/Clipper-0.4.1-portable.exe`. Before a rollout, require passing automated suites, a clean catalog verification, valid queue journal checksums, proven rollback exports, and a real portable startup/navigation/control smoke against the intended Python/project runtime.
