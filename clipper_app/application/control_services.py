@@ -66,6 +66,7 @@ COMPUTE_HEAVY_OPERATIONS = {
     ControlOperation.RESCORE,
     ControlOperation.COMPLIANCE_SCAN,
     ControlOperation.MODULE_ASSEMBLY,
+    ControlOperation.TREND_ANALYSIS,
 }
 
 

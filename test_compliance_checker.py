@@ -212,6 +212,20 @@ class ComplianceCheckerTest(unittest.TestCase):
         self.assertEqual(cleaned_hook["headline"], "KULIT TAMPAK LEBIH CERAH")
         self.assertEqual(cleaned_hook["subtext"], "kulit terasa lebih halus")
 
+    def test_dynamic_overlay_text_has_distinct_evidence_field(self):
+        result = check_compliance(
+            "Toner ini digunakan setelah membersihkan wajah.",
+            "Toner",
+            hook_text={"headline": "INFO TONER"},
+            overlay_text="100% AMPUH menyembuhkan jerawat",
+            cfg=_cfg(),
+            call_lm=False,
+        )
+
+        self.assertIn("overlay", result["checked_fields"])
+        self.assertTrue(any(item.get("source_field") == "overlay" for item in result["violations"]))
+        self.assertIn("cleaned_overlay_text", result)
+
 
 def _cfg():
     return SimpleNamespace(

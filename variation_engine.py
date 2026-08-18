@@ -251,8 +251,16 @@ class VariantConfig:
     subtitle_y_frac: float = 0.80
     subtitle_size: str = "medium"
     subtitle_font_size: int = 0
+    subtitle_animation: str = "current"
+    subtitle_highlight_enabled: bool = True
 
     # Hook
+    headline_font_id: str = ""
+    headline_animation: str = "current"
+    headline_shadow_color: str = "#000000"
+    headline_shadow_x: int = 3
+    headline_shadow_y: int = 3
+    headline_rotation_degrees: float = 0.0
     hook_color: str = "white"
     hook_stroke_color: str = "black"
     hook_stroke_w: int = 5
@@ -295,7 +303,11 @@ class VariantConfig:
     hook_type: str = "text"
     visual_mode: str = "host"
     random_broll_enabled: bool = False
+    text_style_id: str = "current"
     font_id: str = ""
+    caption_font_id: str = ""
+    caption_animation: str = "current"
+    caption_stroke_width: int = 4
     font_color: str = "#FFFFFF"
     highlight_color: str = "#FFD600"
     subtitle_position: str = "bottom"
@@ -306,6 +318,9 @@ class VariantConfig:
     zoom_intensity: str = "normal"
     product_zoom_enabled: bool = True
     subtitle_enabled: bool = True
+    dynamic_text_mode: str = "balanced"
+    dynamic_text_roles: tuple[str, ...] = ("ingredients", "benefits", "usage", "cta")
+    dynamic_text_settings: dict[str, dict[str, Any]] | None = None
     letterbox_enabled: bool = False
     letterbox_top_frac: float = 0.0
     letterbox_bottom_frac: float = 0.0
@@ -344,9 +359,15 @@ def apply_variant_to_cfg(base_cfg, variant: VariantConfig):
     if variant.font_subtitle:
         patched.FONT_SUBTITLE = variant.font_subtitle
         patched.SUBTITLE_FONT_RANDOMIZE = False
+    if variant.headline_font_id:
+        patched.FONT_HOOK = variant.headline_font_id
+    if variant.caption_font_id:
+        patched.FONT_PRODUCT = variant.caption_font_id
     patched.SUBTITLE_BASE_COLOR = variant.subtitle_base_color
-    if variant.karaoke_active_color:
+    if variant.karaoke_active_color and variant.subtitle_highlight_enabled:
         patched.KARAOKE_ACTIVE_COLOR = variant.karaoke_active_color
+    elif not variant.subtitle_highlight_enabled:
+        patched.KARAOKE_ACTIVE_COLOR = variant.subtitle_base_color
     if variant.highlight_color:
         patched.HOOK_ACCENT_COLOR = variant.highlight_color
     patched.KARAOKE_INACTIVE_OPACITY = variant.karaoke_inactive_opacity
@@ -358,6 +379,7 @@ def apply_variant_to_cfg(base_cfg, variant: VariantConfig):
     patched.HOOK_COLOR = variant.hook_color
     patched.HOOK_STROKE_COLOR = variant.hook_stroke_color
     patched.HOOK_STROKE_W = variant.hook_stroke_w
+    patched.HOOK_SHADOW_COLOR = variant.headline_shadow_color
     patched.HOOK_FONTSIZE = int(getattr(base_cfg, "HOOK_FONTSIZE", 130) * variant.hook_fontsize_mult)
     patched.HOOK_DURATION = variant.hook_duration
     patched.ZOOM_SCALE = variant.zoom_scale
@@ -388,6 +410,15 @@ def apply_variant_to_cfg(base_cfg, variant: VariantConfig):
     patched._visual_mode = variant.visual_mode
     patched._variant_visual_mode = variant.visual_mode
     patched._random_broll_enabled = bool(variant.random_broll_enabled) and variant.visual_mode != "broll_audio"
+    patched._text_style_id = variant.text_style_id
+    patched._subtitle_animation = variant.subtitle_animation
+    patched._subtitle_highlight_enabled = variant.subtitle_highlight_enabled
+    patched._headline_animation = variant.headline_animation
+    patched._headline_shadow_x = variant.headline_shadow_x
+    patched._headline_shadow_y = variant.headline_shadow_y
+    patched._headline_rotation_degrees = variant.headline_rotation_degrees
+    patched._caption_animation = variant.caption_animation
+    patched._caption_stroke_width = variant.caption_stroke_width
     patched._variant_font_id = variant.font_id
     patched._variant_font_color = variant.font_color
     patched._variant_highlight_color = variant.highlight_color
@@ -402,6 +433,9 @@ def apply_variant_to_cfg(base_cfg, variant: VariantConfig):
     patched._variant_zoom_intensity = variant.zoom_intensity
     patched._variant_product_zoom_enabled = variant.product_zoom_enabled
     patched._variant_subtitle_enabled = variant.subtitle_enabled
+    patched._dynamic_text_mode = variant.dynamic_text_mode
+    patched._dynamic_text_roles = tuple(variant.dynamic_text_roles)
+    patched._dynamic_text_settings = copy.deepcopy(variant.dynamic_text_settings or {})
     patched._letterbox_enabled = variant.letterbox_enabled
     patched._letterbox_top_frac = variant.letterbox_top_frac
     patched._letterbox_bottom_frac = variant.letterbox_bottom_frac
@@ -668,15 +702,23 @@ def _profile_variants(base_cfg, seed: int | None = None) -> list[VariantConfig] 
                 subtitle_base_color=font_color,
                 karaoke_active_color=highlight_color,
                 karaoke_inactive_opacity=float(getattr(base_cfg, "KARAOKE_INACTIVE_OPACITY", 1.0)),
-                subtitle_stroke=str(getattr(base_cfg, "SUBTITLE_STROKE", "#000000")),
-                subtitle_stroke_w=int(getattr(base_cfg, "SUBTITLE_STROKE_W", 3)),
+                subtitle_stroke=str(raw.get("subtitle_stroke_color") or getattr(base_cfg, "SUBTITLE_STROKE", "#000000")),
+                subtitle_stroke_w=int(raw.get("subtitle_stroke_width", getattr(base_cfg, "SUBTITLE_STROKE_W", 3))),
                 subtitle_y_pos=subtitle_y_frac,
                 subtitle_y_frac=subtitle_y_frac,
                 subtitle_size=subtitle_size,
                 subtitle_font_size=subtitle_font_size,
+                subtitle_animation=str(raw.get("subtitle_animation") or "current"),
+                subtitle_highlight_enabled=bool(raw.get("subtitle_highlight_enabled", True)),
+                headline_font_id=str(raw.get("headline_font_id") or raw.get("font_id") or getattr(base_cfg, "FONT_HOOK", "")),
+                headline_animation=str(raw.get("headline_animation") or "current"),
+                headline_shadow_color=str(raw.get("headline_shadow_color") or getattr(base_cfg, "HOOK_SHADOW_COLOR", "#000000")),
+                headline_shadow_x=int(raw.get("headline_shadow_x", 3)),
+                headline_shadow_y=int(raw.get("headline_shadow_y", 3)),
+                headline_rotation_degrees=float(raw.get("headline_rotation_degrees", 0.0)),
                 hook_color=font_color,
                 hook_stroke_color=str(getattr(base_cfg, "HOOK_STROKE_COLOR", "black")),
-                hook_stroke_w=int(getattr(base_cfg, "HOOK_STROKE_W", 5)),
+                hook_stroke_w=int(raw.get("headline_stroke_width", getattr(base_cfg, "HOOK_STROKE_W", 5))),
                 hook_fontsize_mult=1.0,
                 hook_duration=hook_duration,
                 zoom_scale=_profile_zoom_scale(zoom_intensity, base_cfg),
@@ -697,7 +739,11 @@ def _profile_variants(base_cfg, seed: int | None = None) -> list[VariantConfig] 
                 hook_type=hook_type,
                 visual_mode=visual_mode,
                 random_broll_enabled=random_broll_enabled,
+                text_style_id=str(raw.get("text_style_id") or "current"),
                 font_id=str(raw.get("font_id") or ""),
+                caption_font_id=str(raw.get("caption_font_id") or raw.get("font_id") or getattr(base_cfg, "FONT_PRODUCT", "")),
+                caption_animation=str(raw.get("caption_animation") or "current"),
+                caption_stroke_width=int(raw.get("caption_stroke_width", getattr(base_cfg, "ZOOM_CAPTION_STROKE_WIDTH", 4))),
                 font_color=font_color,
                 highlight_color=highlight_color,
                 subtitle_position=subtitle_position,
@@ -708,6 +754,20 @@ def _profile_variants(base_cfg, seed: int | None = None) -> list[VariantConfig] 
                 zoom_intensity=zoom_intensity,
                 product_zoom_enabled=product_zoom_enabled,
                 subtitle_enabled=subtitle_enabled,
+                dynamic_text_mode=str(raw.get("dynamic_text_mode") or "balanced"),
+                dynamic_text_roles=tuple(
+                    role
+                    for role in ("ingredients", "benefits", "usage", "cta")
+                    if role in set(raw.get(
+                        "dynamic_text_roles",
+                        ("ingredients", "benefits", "usage", "cta"),
+                    ))
+                ),
+                dynamic_text_settings=copy.deepcopy(
+                    raw.get("dynamic_text_settings")
+                    if isinstance(raw.get("dynamic_text_settings"), dict)
+                    else {}
+                ),
                 letterbox_enabled=letterbox_enabled,
                 letterbox_top_frac=letterbox_top_frac,
                 letterbox_bottom_frac=letterbox_bottom_frac,

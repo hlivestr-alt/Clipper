@@ -67,6 +67,7 @@ STATE_SCHEMA_VERSION = 2
 PAUSED_EXIT_CODE = 10
 STOPPED_EXIT_CODE = 11
 TERMINAL_VIDEO_STATUSES = {"completed", "failed", "stopped"}
+STOPPABLE_STAGE_STATUSES = {"pending", "queued", "running", "paused"}
 PIPELINE_MODE_STAGES = {
     "full": STAGES,
     "clips_only": (EDIT_STAGE,),
@@ -95,6 +96,43 @@ CLIP_PROGRESS_DEFAULTS = {
     "active_clip_renders": 0,
     "render_paused": False,
 }
+
+
+def _normalize_stopped_entry(entry: dict, now_iso: str) -> int:
+    """Make a stopped video terminal at both the video and stage levels."""
+    changed = 0
+    if entry.get("status") != "stopped":
+        entry["status"] = "stopped"
+        changed += 1
+    if entry.get("current_stage") is not None:
+        entry["current_stage"] = None
+        changed += 1
+    if not entry.get("completed_at"):
+        entry["completed_at"] = now_iso
+        changed += 1
+
+    stages = entry.get("stages") if isinstance(entry.get("stages"), dict) else {}
+    for stage_state in stages.values():
+        if not isinstance(stage_state, dict):
+            continue
+        status = str(stage_state.get("status") or "pending").strip().lower()
+        if status in STOPPABLE_STAGE_STATUSES:
+            if stage_state.get("status") != "skipped":
+                stage_state["status"] = "skipped"
+                changed += 1
+            if not stage_state.get("finished_at"):
+                stage_state["finished_at"] = now_iso
+                changed += 1
+        for key, default in (
+            ("queued", False),
+            ("queued_at", None),
+            ("active_clip_renders", 0),
+            ("render_paused", False),
+        ):
+            if stage_state.get(key) != default:
+                stage_state[key] = default
+                changed += 1
+    return changed
 
 
 @dataclass(frozen=True)
@@ -390,6 +428,8 @@ class VideoQueueRunner:
                 entry.setdefault("run_history", [])
                 self._ensure_stage_shapes(entry)
                 self._apply_stage_plan_locked(entry)
+                if entry.get("status") == "stopped":
+                    _normalize_stopped_entry(entry, self._now_iso())
         state["schema_version"] = STATE_SCHEMA_VERSION
         return state
 
@@ -612,16 +652,7 @@ class VideoQueueRunner:
                 return
             stage_state = entry["stages"][job.stage]
             if self._stop_requested():
-                stage_state["queued"] = False
-                stage_state["queued_at"] = None
-                if stage_state.get("status") in {"pending", "queued", "paused"}:
-                    stage_state["status"] = "skipped"
-                    stage_state["finished_at"] = self._now_iso()
-                if entry.get("current_stage") == job.stage:
-                    entry["current_stage"] = None
-                if entry.get("status") not in TERMINAL_VIDEO_STATUSES:
-                    entry["status"] = "stopped"
-                    entry["completed_at"] = self._now_iso()
+                _normalize_stopped_entry(entry, self._now_iso())
                 self._save_state_locked()
                 return
             if self._pause_requested():
@@ -1011,8 +1042,13 @@ class VideoQueueRunner:
         self.state.pop("paused_at", None)
 
     def _mark_queue_stopped_locked(self) -> None:
+        now_iso = self._now_iso()
+        for video_path in sorted(self._active_video_keys_locked()):
+            entry = self.state["videos"].get(video_path)
+            if entry and entry.get("status") not in {"completed", "failed"}:
+                _normalize_stopped_entry(entry, now_iso)
         self.state["queue_status"] = "stopped"
-        self.state["stopped_at"] = self._now_iso()
+        self.state["stopped_at"] = now_iso
         self.state.pop("paused_at", None)
         self._save_state_locked()
 
@@ -1029,23 +1065,9 @@ class VideoQueueRunner:
 
         for video_path in sorted(self._active_video_keys_locked()):
             entry = self.state["videos"].get(video_path)
-            if not entry or entry.get("status") in TERMINAL_VIDEO_STATUSES:
+            if not entry or entry.get("status") in {"completed", "failed"}:
                 continue
-            stages = entry.get("stages") if isinstance(entry.get("stages"), dict) else {}
-            for stage in STAGES:
-                stage_state = stages.get(stage) if isinstance(stages.get(stage), dict) else None
-                if not stage_state:
-                    continue
-                if stage_state.get("status") in {"pending", "queued", "paused"} or stage_state.get("queued"):
-                    stage_state["status"] = "skipped"
-                    stage_state["queued"] = False
-                    stage_state["queued_at"] = None
-                    stage_state["finished_at"] = stage_state.get("finished_at") or self._now_iso()
-                    stage_state["active_clip_renders"] = 0
-                    stage_state["render_paused"] = False
-            entry["status"] = "stopped"
-            entry["current_stage"] = None
-            entry["completed_at"] = entry.get("completed_at") or self._now_iso()
+            _normalize_stopped_entry(entry, self._now_iso())
         self._save_state_locked()
 
     def _repair_stuck_stages_locked(self, reason: str) -> int:
@@ -1325,6 +1347,10 @@ class VideoQueueRunner:
         return False
 
     def _refresh_stage_status_from_disk(self, entry: dict) -> None:
+        if entry.get("status") == "stopped":
+            _normalize_stopped_entry(entry, self._now_iso())
+            return
+
         working_dir = Path(entry["working_dir"])
         output_dir = Path(entry["output_dir"])
         cache_checks = {
@@ -2469,7 +2495,12 @@ def clear_pending_queue_state(state_path: str | Path | None = None) -> dict:
     now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     videos = state.get("videos") if isinstance(state.get("videos"), dict) else {}
     for entry in videos.values():
-        if not isinstance(entry, dict) or entry.get("status") in TERMINAL_VIDEO_STATUSES:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("status") == "stopped":
+            changed += _normalize_stopped_entry(entry, now_iso)
+            continue
+        if entry.get("status") in {"completed", "failed"}:
             continue
         stages = entry.get("stages") if isinstance(entry.get("stages"), dict) else {}
         has_running = False
@@ -2492,10 +2523,7 @@ def clear_pending_queue_state(state_path: str | Path | None = None) -> dict:
                 stage_state["render_paused"] = False
                 changed += 1
         if not has_running:
-            entry["status"] = "stopped"
-            entry["current_stage"] = None
-            entry["completed_at"] = entry.get("completed_at") or now_iso
-            changed += 1
+            changed += _normalize_stopped_entry(entry, now_iso)
 
     if changed:
         state["queue_status"] = "stopped"

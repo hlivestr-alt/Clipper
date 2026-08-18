@@ -1,43 +1,47 @@
 # Cloudflare Dashboard Access
 
-This runbook publishes the local FastAPI + React dashboard at:
+This runbook describes the existing intended hostname:
 
 ```text
 https://dashboard.proyaofficial.com
 ```
 
-The production app should be bound to the remote PC at `http://127.0.0.1:8000`.
-Cloudflare Tunnel carries traffic out from the PC, and Cloudflare Access blocks
-users before they reach the app.
+Cloudflare Tunnel can publish a FastAPI process that remains bound to `127.0.0.1`, and Cloudflare Access can provide an external identity perimeter. Clipper still enforces its own Bearer-token boundary for every mutation and sensitive read.
 
-## Local Dashboard
+## Important Current Limitation
 
-Start from the project root:
+The compiled browser client does not expose or persist `CLIPPER_CONTROL_TOKEN`. Automatic token forwarding exists only in:
+
+- Electron, which injects a fresh token for its exact managed loopback origin.
+- `run_new_app.ps1` development mode, where the Vite proxy injects the shared token.
+
+Therefore a plain built SPA served through Cloudflare can load public read endpoints, but protected pages/actions will return `401` or `503`. Cloudflare Access identity is not currently translated into Clipper's Bearer token.
+
+Do not put a shared control token in frontend JavaScript, local storage, a public URL, or Cloudflare-visible static configuration. Treat the remote browser deployment as read-limited until an approved server-side identity-to-actor/token integration is implemented. Electron remains the supported complete control experience.
+
+## Local Backend
+
+Build and start the same-origin app from the repository root:
 
 ```powershell
-pnpm --dir new_app build
+pnpm.cmd --dir new_app build
+$env:CLIPPER_CONTROL_TOKEN = '<strong value for authenticated API clients>'
+$env:CLIPPER_CONTROL_ACTOR = 'remote:operator'
+$env:CLIPPER_ALLOWED_HOSTS = 'dashboard.proyaofficial.com'
 python -m uvicorn clipper_app.web_api:app --host 127.0.0.1 --port 8000
 ```
 
-Quick local check on the remote PC:
+Local health check:
 
 ```powershell
 Invoke-WebRequest http://127.0.0.1:8000/api/health -UseBasicParsing
 ```
 
-## Tunnel Update
+The token permits authenticated API clients but, by itself, does not make the compiled browser UI send that token.
 
-Update the existing Cloudflare tunnel manually:
+## Tunnel Configuration
 
-1. Open Cloudflare Zero Trust.
-2. Go to Networks > Tunnels.
-3. Open the existing dashboard tunnel.
-4. Edit the public hostname for `dashboard.proyaofficial.com`.
-5. Set the service type to `HTTP`.
-6. Set the service URL to `127.0.0.1:8000`.
-7. Save the hostname and confirm the connector is healthy.
-
-Public hostname settings:
+In Cloudflare Zero Trust, edit the existing tunnel/public hostname:
 
 ```text
 Subdomain: dashboard
@@ -46,20 +50,15 @@ Type: HTTP
 URL: 127.0.0.1:8000
 ```
 
-Do not add router port forwarding or inbound firewall rules for the app.
+Do not add router port forwarding or inbound firewall rules. Keep Uvicorn on loopback.
 
 ## Access Policy
 
-Create a self-hosted Access application:
+Create or retain a self-hosted Access application for `dashboard.proyaofficial.com`, with an appropriate session duration and an allow policy for approved `@proyaofficial.com` identities. Deny everyone else.
 
-```text
-Application name: PROYA Dashboard
-Application domain: dashboard.proyaofficial.com
-Session duration: 8h to 24h
-Allowed email domain: proyaofficial.com
-```
+Access protects the site perimeter but does not replace Clipper's Bearer auth. Users admitted by Access can see whatever unauthenticated read endpoints expose, so review that read boundary before enabling remote access.
 
-Allow users with `@proyaofficial.com` email addresses and deny everyone else. Treat all admitted users as operators because the dashboard includes queue and review controls.
+TikTok OAuth callbacks require separate care. The configured `/callback` or `/api/integrations/tiktok/oauth/callback` path must reach the same Clipper instance and bypass an interactive Access challenge, while all other app paths remain protected. Do not log callback query strings.
 
 ## Operations
 
@@ -70,14 +69,22 @@ Start-Service ProyaDashboardCloudflared
 Stop-Service ProyaDashboardCloudflared
 ```
 
-To temporarily disable external access, disable the Cloudflare Access application, set the policy to deny all users, or stop `ProyaDashboardCloudflared`.
+To disable external access, stop the dedicated tunnel service or change the Access application to deny all. Confirm the exact Windows service name before acting.
 
 ## Troubleshooting
 
-- Dashboard loads forever: confirm the app is running on `127.0.0.1:8000` and the tunnel service targets `http://127.0.0.1:8000`.
-- Tunnel offline: check the Windows service and confirm the `proya-dashboard` connector is online in Cloudflare Zero Trust.
-- Access denied: confirm the user email ends with `@proyaofficial.com` and the Access application domain is exactly `dashboard.proyaofficial.com`.
+- `400 Invalid host header`: add the exact public hostname to `CLIPPER_ALLOWED_HOSTS` and restart the backend.
+- Public page loads but actions fail: expected for the current compiled browser client; verify Electron/Vite locally or use an authenticated API client.
+- `401`: the route requires a valid Bearer token.
+- `503 Control authentication is not configured`: the backend was started without `CLIPPER_CONTROL_TOKEN`.
+- Tunnel offline: verify the Windows service and connector health in Cloudflare Zero Trust.
+- Access denied: verify the identity policy and application domain.
+- TikTok callback shows an Access login: create the narrowly scoped callback bypass and verify exact redirect-URI equality.
 
 ## Security
 
-Keep the app bound to `127.0.0.1`. Do not expose port `8000` directly to the internet.
+- Keep port 8000 off the public network and Uvicorn on `127.0.0.1`.
+- Keep Access in front of all non-callback routes.
+- Never expose the control token to browser code or logs.
+- Add only the exact required trusted hostname/origin values.
+- Treat callback bypasses and query-string logging as security-sensitive configuration.

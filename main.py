@@ -156,7 +156,7 @@ def _clip_version_dir(moment: dict, clip_id: str) -> str | None:
 
 
 def _process_clip_job(job: dict, video_path: str, transcript_words: list, product_events: list, cut_only: bool, cfg) -> dict:
-    from ffmpeg_editor import cut_raw_clip, edit_clip, get_words_for_clip
+    from ffmpeg_editor import cut_raw_clip, get_words_for_clip
     from vision_scanner import get_events_for_clip
 
     output_path = job["output_path"]
@@ -167,6 +167,11 @@ def _process_clip_job(job: dict, video_path: str, transcript_words: list, produc
     if clip_words is None:
         clip_words = get_words_for_clip(transcript_words, job["start"], job["end"])
 
+    clip_product_events = job.get("clip_product_events")
+    if clip_product_events is None:
+        clip_product_events = get_events_for_clip(product_events, job["start"], job["end"])
+
+    _ensure_job_dynamic_text_plan(job, clip_words, clip_product_events, cfg)
     compliance_result = _prepare_job_compliance(job, clip_words, cfg)
     if compliance_result is not None:
         if compliance_result.get("blocked"):
@@ -183,10 +188,6 @@ def _process_clip_job(job: dict, video_path: str, transcript_words: list, produc
         except Exception as exc:
             log.warning(f"Compliance subtitle auto-fix failed for {job['clip_id']}: {exc}")
 
-    clip_product_events = job.get("clip_product_events")
-    if clip_product_events is None:
-        clip_product_events = get_events_for_clip(product_events, job["start"], job["end"])
-
     silence_plan = _build_job_silence_trim_plan(job, clip_words, cfg)
     if silence_plan.get("trimmed"):
         from silence_trimmer import (
@@ -196,6 +197,15 @@ def _process_clip_job(job: dict, video_path: str, transcript_words: list, produc
 
         clip_words = remap_words_to_compacted_timeline(clip_words, silence_plan)
         clip_product_events = remap_events_to_compacted_timeline(clip_product_events, silence_plan)
+        try:
+            from dynamic_text import remap_dynamic_plan_for_silence
+
+            job["dynamic_text_plan"] = remap_dynamic_plan_for_silence(
+                job.get("dynamic_text_plan") or {},
+                silence_plan,
+            )
+        except Exception as exc:
+            log.warning("Dynamic text silence remap failed for %s: %s", job["clip_id"], exc)
 
     job["clip_words"] = clip_words
     job["clip_product_events"] = clip_product_events
@@ -212,16 +222,29 @@ def _process_clip_job(job: dict, video_path: str, transcript_words: list, produc
 
     force_render_existing = bool(job.get("force_render_existing"))
     if Path(output_path).exists() and not force_render_existing:
-        return {
-            "clip_id": job["clip_id"],
-            "status": "skipped",
-            "output_filename": job["output_filename"],
-            "manifest": _build_manifest_row(
-                job,
-                len(job.get("clip_product_events") or []),
-                "skipped",
-            ),
-        }
+        from whatsapp_media import MediaPolicy, ProcessingAction, validate_delivery
+
+        existing_delivery = validate_delivery(
+            output_path,
+            policy=MediaPolicy.from_config(cfg),
+            action=ProcessingAction.DIRECT_RENDERED,
+            require_target_size=False,
+            decode=True,
+        )
+        if not existing_delivery.compliant:
+            job["force_render_existing"] = True
+        else:
+            job["delivery_compliance"] = existing_delivery.to_dict()
+            return {
+                "clip_id": job["clip_id"],
+                "status": "skipped",
+                "output_filename": job["output_filename"],
+                "manifest": _build_manifest_row(
+                    job,
+                    len(job.get("clip_product_events") or []),
+                    "skipped",
+                ),
+            }
 
     # Variant-aware cut — applies mirror/speed/grade/crop at cut time via FFmpeg
     if Path(output_path).exists() and force_render_existing:
@@ -275,14 +298,50 @@ def _process_clip_job(job: dict, video_path: str, transcript_words: list, produc
         }
 
     if cut_only:
-        shutil.copy2(raw_path, output_path)
+        from uuid import uuid4
+        from whatsapp_media import (
+            MediaPolicy,
+            ProcessingAction,
+            transcode_media,
+            validate_delivery,
+        )
+
+        cut_stage = Path(output_path).parent / "_tmp" / "cut_only"
+        cut_stage.mkdir(parents=True, exist_ok=True)
+        staged_cut = cut_stage / f"{Path(output_path).stem}.{uuid4().hex}.mp4"
+        transcode_result, _plan = transcode_media(
+            raw_path,
+            staged_cut,
+            policy=MediaPolicy.from_config(cfg),
+        )
+        delivery = validate_delivery(
+            staged_cut,
+            policy=MediaPolicy.from_config(cfg),
+            action=ProcessingAction.DIRECT_RENDERED,
+            require_target_size=True,
+            decode=True,
+        ) if transcode_result.returncode == 0 else None
+        if transcode_result.returncode == 0 and delivery and delivery.compliant:
+            os.replace(staged_cut, output_path)
+            job["delivery_compliance"] = delivery.to_dict()
+            cut_status = "ok"
+        else:
+            staged_cut.unlink(missing_ok=True)
+            job["render_failure_stage"] = "delivery_compliance"
+            job["render_error_code"] = "cut_only_delivery_failed"
+            job["render_error_message"] = (
+                transcode_result.stderr
+                if transcode_result.returncode
+                else ",".join(delivery.failure_codes if delivery else [])
+            )
+            cut_status = "failed"
         if Path(raw_path).exists():
             os.remove(raw_path)
         return {
             "clip_id": job["clip_id"],
-            "status": "ok",
+            "status": cut_status,
             "output_filename": job["output_filename"],
-            "manifest": _build_manifest_row(job, len(clip_product_events), "ok"),
+            "manifest": _build_manifest_row(job, len(clip_product_events), cut_status),
         }
 
     # Apply variant style overrides (font/color/zoom/y-pos) to cfg
@@ -312,26 +371,50 @@ def _process_clip_job(job: dict, video_path: str, transcript_words: list, produc
     if abs(speed_ramp - 1.0) > 0.02:
         clip_words = _remap_words_for_speed_ramp(clip_words, speed_ramp)
         clip_product_events = _remap_events_for_speed_ramp(clip_product_events, speed_ramp)
+        try:
+            from dynamic_text import remap_dynamic_plan_for_speed
+
+            job["dynamic_text_plan"] = remap_dynamic_plan_for_speed(
+                job.get("dynamic_text_plan") or {},
+                speed_ramp,
+            )
+        except Exception as exc:
+            log.warning("Dynamic text speed remap failed for %s: %s", job["clip_id"], exc)
         job["clip_words"] = clip_words
         job["clip_product_events"] = clip_product_events
 
-    edit_ok = edit_clip(
+    from ffmpeg_editor import render_clip
+
+    render_result = render_clip(
         raw_clip_path=raw_path,
         output_path=output_path,
         moment=job["moment"],
         clip_words=clip_words,
         product_events=clip_product_events,
+        dynamic_text_plan=job.get("dynamic_text_plan"),
         cfg=edit_cfg,
     )
 
     if Path(raw_path).exists():
         os.remove(raw_path)
 
+    job["delivery_compliance"] = (
+        render_result.delivery_compliance.to_dict()
+        if render_result.delivery_compliance
+        else None
+    )
+    job["render_failure_stage"] = render_result.failure_stage
+    job["render_error_code"] = render_result.error_code
+    job["render_error_message"] = render_result.error_message
     return {
         "clip_id": job["clip_id"],
-        "status": "ok" if edit_ok else "failed",
+        "status": "ok" if render_result.ok else "failed",
         "output_filename": job["output_filename"],
-        "manifest": _build_manifest_row(job, len(clip_product_events), "ok" if edit_ok else "failed"),
+        "manifest": _build_manifest_row(
+            job,
+            len(clip_product_events),
+            "ok" if render_result.ok else "failed",
+        ),
     }
 
 
@@ -351,6 +434,44 @@ def _ensure_job_hook_payload(job: dict) -> dict:
         }
     job["hook_payload"] = payload
     return payload
+
+
+def _ensure_job_dynamic_text_plan(
+    job: dict,
+    clip_words: list,
+    product_events: list,
+    cfg,
+) -> dict:
+    try:
+        from dynamic_text import PLAN_SCHEMA_VERSION, build_dynamic_text_plan
+
+        existing = job.get("dynamic_text_plan")
+        if (
+            isinstance(existing, dict)
+            and int(existing.get("schema_version") or 0) == PLAN_SCHEMA_VERSION
+        ):
+            return existing
+        variant = job.get("moment", {}).get("_variant")
+        plan = build_dynamic_text_plan(
+            job.get("moment", {}),
+            clip_words or [],
+            product_events or [],
+            float(job.get("end", 0.0)) - float(job.get("start", 0.0)),
+            cfg,
+            variant=variant,
+        )
+    except Exception as exc:
+        log.warning("Dynamic text planning failed for %s: %s", job.get("clip_id"), exc)
+        plan = {
+            "schema_version": 7,
+            "mode": "off",
+            "eligible": False,
+            "items": [],
+            "dropped": [],
+            "skip_reason": f"planner_error: {exc}",
+        }
+    job["dynamic_text_plan"] = plan
+    return plan
 
 
 def _build_job_silence_trim_plan(job: dict, clip_words: list, cfg) -> dict:
@@ -397,6 +518,11 @@ def _prepare_job_compliance(job: dict, clip_words: list, cfg) -> dict | None:
             should_block_result,
             write_compliance_result,
         )
+        from dynamic_text import (
+            apply_compliance_to_dynamic_plan,
+            compliance_blocking_result,
+            dynamic_plan_text,
+        )
     except Exception as exc:
         log.warning(f"Compliance checker unavailable; failing closed for {job.get('clip_id')}: {exc}")
         result = _compliance_unavailable_result(exc)
@@ -406,15 +532,26 @@ def _prepare_job_compliance(job: dict, clip_words: list, cfg) -> dict | None:
     try:
         result = copy.deepcopy(job.get("compliance_result")) if job.get("compliance_result") else None
         hook_payload = _ensure_job_hook_payload(job)
+        overlay_text = dynamic_plan_text(job.get("dynamic_text_plan") or {})
         if result is None:
             result = check_compliance(
                 clip_words,
                 job.get("product", "general"),
                 hook_text=hook_payload,
+                overlay_text=overlay_text,
                 cfg=cfg,
             )
 
-        result["blocked"] = should_block_result(result, cfg)
+        job["dynamic_text_plan"] = apply_compliance_to_dynamic_plan(
+            job.get("dynamic_text_plan") or {},
+            result,
+        )
+        result["overlay_removed_count"] = len((job.get("dynamic_text_plan") or {}).get("dropped", []) or [])
+        blocking_result = compliance_blocking_result(result)
+        if result["overlay_removed_count"]:
+            result["overlay_filtered"] = True
+            result["passed"] = bool(blocking_result.get("passed", False))
+        result["blocked"] = should_block_result(blocking_result, cfg)
         if not result.get("blocked"):
             patched_hook = apply_compliance_to_hook_payload(hook_payload, result)
             if patched_hook != hook_payload:
@@ -488,6 +625,7 @@ def _build_manifest_row(job: dict, product_event_count: int, status: str) -> dic
         "score": job["score"],
         "hook": moment.get("hook", ""),
         "hook_overlay": moment.get("hook_overlay", {}),
+        "dynamic_text_plan": copy.deepcopy(job.get("dynamic_text_plan") or {}),
         "product": job["product"],
         "clip_type": job["clip_type"],
         "reason": moment.get("reason", ""),
@@ -510,6 +648,22 @@ def _build_manifest_row(job: dict, product_event_count: int, status: str) -> dic
         row["compliance_summary"] = str(compliance_result.get("compliance_summary") or "")
         if job.get("compliance_json_path"):
             row["compliance_file"] = job["compliance_json_path"]
+    delivery = job.get("delivery_compliance")
+    if isinstance(delivery, dict):
+        row["delivery_compliance"] = copy.deepcopy(delivery)
+        row["delivery_compliant"] = bool(delivery.get("compliant", False))
+        row["delivery_policy_revision"] = str(delivery.get("policy_revision") or "")
+        row["processing_action"] = str(delivery.get("action") or "")
+        row["delivery_diagnostics"] = copy.deepcopy(delivery.get("diagnostics") or {})
+        row["delivery_failure_codes"] = list(delivery.get("failure_codes") or [])
+    else:
+        row["delivery_compliant"] = False
+    if job.get("render_failure_stage"):
+        row["failure_stage"] = job["render_failure_stage"]
+    if job.get("render_error_code"):
+        row["error_code"] = job["render_error_code"]
+    if job.get("render_error_message"):
+        row["error_message"] = job["render_error_message"]
     variant = moment.get("_variant")
     if variant is not None:
         row.update({
@@ -529,6 +683,8 @@ def _build_manifest_row(job: dict, product_event_count: int, status: str) -> dic
             "zoom_intensity": str(getattr(variant, "zoom_intensity", "normal") or "normal"),
             "product_zoom_enabled": bool(getattr(variant, "product_zoom_enabled", True)),
             "subtitle_enabled": bool(getattr(variant, "subtitle_enabled", True)),
+            "dynamic_text_mode": str(getattr(variant, "dynamic_text_mode", "balanced") or "balanced"),
+            "dynamic_text_roles": list(getattr(variant, "dynamic_text_roles", ()) or ()),
             "letterbox_enabled": bool(getattr(variant, "letterbox_enabled", False)),
             "letterbox_top_frac": float(getattr(variant, "letterbox_top_frac", 0.0) or 0.0),
             "letterbox_bottom_frac": float(getattr(variant, "letterbox_bottom_frac", 0.0) or 0.0),
@@ -694,7 +850,15 @@ def _attach_precomputed_compliance(jobs: list, cfg) -> None:
     qwen_calls = 0
     for job in jobs:
         clip_words = job.get("clip_words") or []
+        clip_product_events = job.get("clip_product_events") or []
+        dynamic_plan = _ensure_job_dynamic_text_plan(job, clip_words, clip_product_events, cfg)
         hook_payload = _ensure_job_hook_payload(job)
+        try:
+            from dynamic_text import dynamic_plan_text
+
+            overlay_text = dynamic_plan_text(dynamic_plan)
+        except Exception:
+            overlay_text = ""
         transcript_text, _spans = transcript_to_text_with_spans(clip_words)
         key = (
             round(float(job.get("start", 0.0)), 3),
@@ -702,6 +866,7 @@ def _attach_precomputed_compliance(jobs: list, cfg) -> None:
             str(job.get("product", "general")).casefold(),
             transcript_text,
             str(hook_payload),
+            overlay_text,
         )
         result = result_cache.get(key)
         if result is None:
@@ -709,6 +874,7 @@ def _attach_precomputed_compliance(jobs: list, cfg) -> None:
                 clip_words,
                 job.get("product", "general"),
                 hook_text=hook_payload,
+                overlay_text=overlay_text,
                 cfg=cfg,
             )
             result_cache[key] = result
@@ -743,7 +909,11 @@ def _score_rendered_clips(jobs: list, manifest: list, output_dir: str, cfg, prog
     score_jobs = []
     for job in jobs:
         row = manifest_by_clip.get(job.get("clip_id"))
-        if not row or row.get("status") in {"failed", "compliance_blocked"}:
+        if (
+            not row
+            or row.get("status") in {"failed", "compliance_blocked"}
+            or not bool(row.get("delivery_compliant", False))
+        ):
             continue
         output_path = Path(job["output_path"])
         if output_path.exists():
@@ -1237,11 +1407,27 @@ def _product_broll_asset_fingerprint_for_render(cfg) -> str:
 
 
 def _render_fingerprint_extra(cfg, max_clips: int | None, cut_only: bool) -> dict:
+    try:
+        from product_information import product_information_revision
+
+        information_revision = product_information_revision(cfg)
+    except Exception as exc:
+        log.warning("Could not fingerprint product information sources: %s", exc)
+        information_revision = ""
+    try:
+        from dynamic_text import PLAN_SCHEMA_VERSION
+
+        dynamic_text_plan_schema = PLAN_SCHEMA_VERSION
+    except Exception as exc:
+        log.warning("Could not fingerprint dynamic text planner: %s", exc)
+        dynamic_text_plan_schema = 0
     return {
         "max_clips": max_clips,
         "cut_only": cut_only,
         "variation_profile_revision": _variation_profile_revision_for_render(cfg),
         "product_broll_asset_fingerprint": _product_broll_asset_fingerprint_for_render(cfg),
+        "product_information_revision": information_revision,
+        "dynamic_text_plan_schema": dynamic_text_plan_schema,
     }
 
 
@@ -1274,7 +1460,9 @@ def _manifest_rows_by_clip(manifest: list) -> dict[str, dict]:
     }
 
 
-def _completed_resume_rows(jobs: list, manifest: list, output_dir: Path) -> list[dict]:
+def _completed_resume_rows(
+    jobs: list, manifest: list, output_dir: Path, cfg=None
+) -> list[dict]:
     rows_by_clip = _manifest_rows_by_clip(manifest)
     completed_rows: list[dict] = []
     for job in jobs:
@@ -1287,8 +1475,24 @@ def _completed_resume_rows(jobs: list, manifest: list, output_dir: Path) -> list
             continue
         if status in {"ok", "skipped", "filtered_low_score", "filtered_low_variant"}:
             output_file = str(row.get("output_file") or "").strip()
-            if not output_file or not _resolve_manifest_output_path(output_dir, output_file).exists():
+            output_path = (
+                _resolve_manifest_output_path(output_dir, output_file)
+                if output_file
+                else None
+            )
+            if not output_path or not output_path.exists():
                 continue
+            if bool(getattr(cfg, "WHATSAPP_DELIVERY_ENABLED", False)):
+                from whatsapp_media import MediaPolicy
+
+                policy = MediaPolicy.from_config(cfg)
+                if not bool(row.get("delivery_compliant", False)):
+                    continue
+                if str(row.get("delivery_policy_revision") or "") != policy.revision:
+                    continue
+                diagnostics = row.get("delivery_diagnostics") or {}
+                if int(diagnostics.get("final_size_bytes") or diagnostics.get("size_bytes") or -1) != output_path.stat().st_size:
+                    continue
         completed_rows.append(row)
     return completed_rows
 
@@ -2370,7 +2574,11 @@ def _run_pipeline_impl(
                 f"type={job['clip_type']} | product={job['product']}"
             )
 
-    completed_rows = [] if force_render_existing else _completed_resume_rows(jobs, existing_manifest, Path(output_dir))
+    completed_rows = (
+        []
+        if force_render_existing
+        else _completed_resume_rows(jobs, existing_manifest, Path(output_dir), cfg)
+    )
     manifest_rows = _manifest_rows_by_clip(completed_rows)
     completed_clip_ids = set(manifest_rows)
     pending_jobs = [job for job in jobs if str(job.get("clip_id") or "") not in completed_clip_ids]

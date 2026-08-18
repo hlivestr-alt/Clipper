@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import os
 import asyncio
@@ -10,6 +11,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import parse_qs
+from uuid import uuid4
 
 import portalocker
 
@@ -26,6 +29,14 @@ from clipper_app.application.api_security import ApiSecuritySettings, origin_all
 from clipper_app.application.catalog import CatalogDatabase, CatalogIndexer, ChangeEventRepository
 from clipper_app.application.container import ApplicationServiceContainer
 from clipper_app.application.read_services import ReadDashboardService, ReadServiceResult
+from clipper_app.application.trends import TrendService, TrendServiceError
+from clipper_app.application.tiktok_oauth import TikTokOAuthError, TikTokOAuthService
+from clipper_app.application.whatsapp_delivery import (
+    WhatsAppConflict,
+    WhatsAppDeliveryError,
+    WhatsAppDeliveryService,
+    WhatsAppNotFound,
+)
 from clipper_app.application.services import (
     ComplianceService,
     ExportPackagingService,
@@ -48,6 +59,11 @@ from clipper_app.contracts.control_models import (
     VariationPresetWriteRequest,
     VariationPreviewRequest,
     VariationProfileWriteRequest,
+    TrendAnalysisRequest,
+    TrendDownloadRequest,
+    TrendMediaLinkRequest,
+    TrendRefreshRequest,
+    TikTokAdvertiserSelectionRequest,
 )
 from clipper_app.contracts.models import (
     ComplianceScanCommand,
@@ -60,11 +76,17 @@ from clipper_app.contracts.models import (
     ScoringCommand,
 )
 from clipper_app.contracts.read_models import SettingsReadEntry, SettingsReadSnapshot
+from clipper_app.contracts.whatsapp_delivery_models import (
+    WhatsAppAssignmentActionRequest,
+    WhatsAppClaimRequest,
+    WhatsAppDeliveryItemRequest,
+    WhatsAppOutboxAckRequest,
+)
 
 try:
     from fastapi import FastAPI, HTTPException, Query, Request, Response, status
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
     from fastapi.staticfiles import StaticFiles
     from starlette.middleware.trustedhost import TrustedHostMiddleware
 except ImportError as exc:  # pragma: no cover - exercised only when runtime deps are missing.
@@ -273,6 +295,20 @@ def _capacity_response(exc: JobCapacityError) -> HTTPException:
     )
 
 
+def _oauth_result_html(success: bool, detail: str) -> str:
+    title = "TikTok connected" if success else "TikTok authorization failed"
+    color = "#4ade80" if success else "#fb7185"
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
+        "<meta http-equiv='Cache-Control' content='no-store'><title>" + html.escape(title) + "</title>"
+        "<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b0d12;color:#f4f6fa;"
+        "font-family:Inter,Segoe UI,sans-serif}main{max-width:560px;margin:24px;padding:28px;border:1px solid #353c49;"
+        "border-radius:14px;background:#11141a}h1{color:" + color + ";font-size:1.45rem}p{color:#b7bfcc;line-height:1.6}</style>"
+        "</head><body><main><h1>" + html.escape(title) + "</h1><p>" + html.escape(detail) + "</p>"
+        "<p>This window can now be closed.</p></main></body></html>"
+    )
+
+
 def create_app(
     service: ReadDashboardService | None = None,
     *,
@@ -284,6 +320,8 @@ def create_app(
     module_service: ModuleService | None = None,
     export_service: ExportPackagingService | None = None,
     security_settings: ApiSecuritySettings | None = None,
+    tiktok_oauth_service: TikTokOAuthService | None = None,
+    whatsapp_delivery_service: WhatsAppDeliveryService | None = None,
 ) -> FastAPI:
     migrate_legacy_jobs = os.getenv("CLIPPER_MIGRATE_JOB_STORAGE", "").strip().casefold() in {
         "1",
@@ -299,6 +337,7 @@ def create_app(
         compliance=compliance_service,
         modules=module_service,
         exports=export_service,
+        whatsapp_delivery=whatsapp_delivery_service,
         migrate_legacy_jobs=migrate_legacy_jobs,
     )
     read_service = container.reads
@@ -310,7 +349,10 @@ def create_app(
     compliance_runner = container.compliance
     modules = container.modules
     exporter = container.exports
+    whatsapp_delivery = container.whatsapp_delivery
     catalog = CatalogDatabase.from_config(read_service.cfg)
+    tiktok_oauth = tiktok_oauth_service or TikTokOAuthService.from_environment(read_service.cfg)
+    trends = TrendService(catalog, read_service.cfg, oauth_service=tiktok_oauth)
     change_events = ChangeEventRepository(catalog)
     read_service.change_events = change_events
     read_service.catalog_database = catalog
@@ -457,9 +499,156 @@ def create_app(
             request.state.actor = "local-operator"
         return await call_next(request)
 
+    @api.middleware("http")
+    async def redact_oauth_callback_query(request: Request, call_next):
+        normalized = request.url.path.rstrip("/") or "/"
+        if normalized in {"/callback", "/api/integrations/tiktok/oauth/callback"}:
+            raw = request.scope.get("query_string", b"").decode("utf-8", errors="replace")
+            request.state.tiktok_oauth_callback = parse_qs(raw, keep_blank_values=True)
+            request.scope["query_string"] = b""
+        return await call_next(request)
+
     @api.get("/api/health")
     def health() -> dict[str, Any]:
         return _envelope(ReadServiceResult({"status": "ok", "mode": "control"}))
+
+    def _delivery_call(callback: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+        try:
+            return _envelope(ReadServiceResult(callback()))
+        except WhatsAppNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except WhatsAppConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (ValueError, WhatsAppDeliveryError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @api.get("/api/whatsapp-delivery/status")
+    def whatsapp_delivery_status(limit: int = Query(default=100, ge=1, le=1000)) -> dict[str, Any]:
+        return _delivery_call(lambda: whatsapp_delivery.status(limit=limit))
+
+    @api.post("/api/whatsapp-delivery/claims")
+    def whatsapp_delivery_claim(
+        claim: WhatsAppClaimRequest, request: Request
+    ) -> dict[str, Any]:
+        return _delivery_call(
+            lambda: whatsapp_delivery.claim(
+                claim, actor=str(getattr(request.state, "actor", "local-operator"))
+            )
+        )
+
+    @api.get("/api/whatsapp-delivery/sheet-outbox")
+    def whatsapp_delivery_sheet_outbox(
+        limit: int = Query(default=100, ge=1, le=1000)
+    ) -> dict[str, Any]:
+        return _delivery_call(lambda: whatsapp_delivery.pending_outbox(limit=limit))
+
+    @api.post("/api/whatsapp-delivery/sheet-outbox/{outbox_id}/ack")
+    def whatsapp_delivery_sheet_outbox_ack(
+        outbox_id: str, payload: WhatsAppOutboxAckRequest
+    ) -> dict[str, Any]:
+        return _delivery_call(
+            lambda: whatsapp_delivery.acknowledge_outbox(
+                outbox_id, success=payload.success, error=payload.error
+            )
+        )
+
+    @api.post("/api/whatsapp-delivery/assignments/{assignment_id}/{action}")
+    def whatsapp_delivery_transition(
+        assignment_id: str,
+        action: str,
+        payload: WhatsAppAssignmentActionRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        targets = {
+            "start": "sending",
+            "sent": "sent",
+            "fail": "delivery_failed",
+            "cancel": "cancelled",
+            "release": "unassigned",
+            "retry": "sending",
+        }
+        target = targets.get(action.casefold())
+        if target is None:
+            raise HTTPException(status_code=400, detail="Unknown assignment action")
+        return _delivery_call(
+            lambda: whatsapp_delivery.transition(
+                assignment_id,
+                target,
+                expected_version=payload.expected_version,
+                actor=str(getattr(request.state, "actor", "local-operator")),
+                idempotency_key=payload.idempotency_key,
+                error=payload.error,
+                drive_or_media_reference=payload.drive_or_media_reference,
+                operator_reason=payload.operator_reason,
+            )
+        )
+
+    @api.put("/api/whatsapp-delivery/assignments/{assignment_id}/items")
+    def whatsapp_delivery_item(
+        assignment_id: str, payload: WhatsAppDeliveryItemRequest
+    ) -> dict[str, Any]:
+        return _delivery_call(
+            lambda: whatsapp_delivery.update_item(
+                assignment_id,
+                payload.relative_path,
+                status=payload.status,
+                whatsapp_media_id=payload.whatsapp_media_id,
+                whatsapp_message_id=payload.whatsapp_message_id,
+                drive_or_media_reference=payload.drive_or_media_reference,
+                error=payload.error,
+            )
+        )
+
+    @api.get("/api/integrations/tiktok/oauth/status")
+    def tiktok_oauth_status() -> dict[str, Any]:
+        return _envelope(ReadServiceResult(tiktok_oauth.status()))
+
+    @api.post("/api/integrations/tiktok/oauth/start")
+    def tiktok_oauth_start() -> dict[str, Any]:
+        try:
+            return _envelope(ReadServiceResult(tiktok_oauth.authorization_url()))
+        except TikTokOAuthError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @api.put("/api/integrations/tiktok/oauth/advertiser")
+    def tiktok_oauth_select_advertiser(request: TikTokAdvertiserSelectionRequest) -> dict[str, Any]:
+        try:
+            payload = tiktok_oauth.select_advertiser(request.advertiser_id)
+            change_events.publish(("trends",))
+            return _envelope(ReadServiceResult(payload))
+        except TikTokOAuthError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @api.get("/callback", response_class=HTMLResponse)
+    @api.get("/api/integrations/tiktok/oauth/callback", response_class=HTMLResponse)
+    def tiktok_oauth_callback(http_request: Request) -> HTMLResponse:
+        params = getattr(http_request.state, "tiktok_oauth_callback", {})
+        error = str((params.get("error") or [""])[0])
+        if error:
+            return HTMLResponse(
+                _oauth_result_html(False, "TikTok authorization was cancelled or rejected."),
+                status_code=400,
+                headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+            )
+        auth_code = str((params.get("auth_code") or params.get("code") or [""])[0])
+        state = str((params.get("state") or [""])[0])
+        try:
+            result = tiktok_oauth.exchange_callback(auth_code, state)
+            change_events.publish(("trends",))
+            selected = result.get("selected_advertiser_id")
+            detail = "Authorization saved. You may return to Clipper."
+            if not selected:
+                detail = "Authorization saved. Return to Clipper and select an advertiser account."
+            return HTMLResponse(
+                _oauth_result_html(True, detail),
+                headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+            )
+        except TikTokOAuthError as exc:
+            return HTMLResponse(
+                _oauth_result_html(False, str(exc)),
+                status_code=400,
+                headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+            )
 
     @api.get("/api/catalog/status")
     def catalog_status() -> dict[str, Any]:
@@ -665,6 +854,25 @@ def create_app(
     def settings_effective() -> dict[str, Any]:
         return _envelope(ReadServiceResult(_settings_read_snapshot(settings_writer)))
 
+    @api.get("/api/product-information")
+    def product_information() -> dict[str, Any]:
+        try:
+            from product_information import product_information_status
+
+            return _envelope(ReadServiceResult(product_information_status(read_service.cfg)))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @api.post("/api/product-information/rescan")
+    def product_information_rescan() -> dict[str, Any]:
+        try:
+            from product_information import product_information_status, scan_product_information
+
+            scan_product_information(read_service.cfg, force=True)
+            return _envelope(ReadServiceResult(product_information_status(read_service.cfg)))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @api.get("/api/variations")
     def variations() -> dict[str, Any]:
         try:
@@ -702,6 +910,7 @@ def create_app(
                 read_service.cfg,
                 request.profile,
                 variant_index=request.variant_index,
+                product_key=request.product_key,
             )))
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -727,6 +936,111 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @api.get("/api/trends")
+    def trend_page(
+        country_code: str = Query(default="ID", min_length=2, max_length=2),
+        date_range: str = Query(default="1DAY"),
+        category_name: str = Query(default="BEAUTY_AND_PERSONAL_CARE"),
+    ) -> dict[str, Any]:
+        try:
+            return _envelope(ReadServiceResult(trends.page(country_code, date_range, category_name)))
+        except TrendServiceError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @api.get("/api/trends/media-files")
+    def trend_media_files() -> dict[str, Any]:
+        return _envelope(ReadServiceResult(trends.media_files()))
+
+    @api.get("/api/trends/patterns/{pattern_id}")
+    def trend_pattern(pattern_id: str) -> dict[str, Any]:
+        try:
+            return _envelope(ReadServiceResult(trends.pattern(pattern_id)))
+        except TrendServiceError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @api.put("/api/trends/videos/{video_id}/media")
+    def trend_media_link(
+        video_id: str,
+        request: TrendMediaLinkRequest,
+        http_request: Request,
+    ) -> dict[str, Any]:
+        try:
+            payload = trends.link_media(video_id, request.relative_path, http_request.state.actor)
+            change_events.publish(("trends",))
+            return _envelope(ReadServiceResult(payload))
+        except TrendServiceError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @api.post("/api/operations/trend-refresh")
+    def trend_refresh(request: TrendRefreshRequest, response: Response, http_request: Request) -> dict[str, Any]:
+        try:
+            job = jobs.submit(
+                operation=ControlOperation.TREND_REFRESH,
+                request=request,
+                executor=lambda: _execute_with_invalidation(
+                    read_service, ("trends",), lambda: trends.refresh(request)
+                ),
+                actor=http_request.state.actor,
+                conflict_key=f"trend_refresh:{request.country_code.upper()}:{request.date_range.upper()}:{request.category_name.upper()}",
+            )
+        except JobConflictError as exc:
+            raise _conflict_response(exc) from exc
+        except JobCapacityError as exc:
+            raise _capacity_response(exc) from exc
+        except TrendServiceError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _job_envelope(job, response)
+
+    @api.post("/api/operations/trend-download")
+    def trend_download(request: TrendDownloadRequest, response: Response, http_request: Request) -> dict[str, Any]:
+        if request.rights_confirmed is not True:
+            raise HTTPException(
+                status_code=400,
+                detail="Permission to download and store these videos must be confirmed.",
+            )
+        run_id = uuid4().hex
+        actor = http_request.state.actor
+        try:
+            job = jobs.submit(
+                operation=ControlOperation.TREND_DOWNLOAD,
+                request=request,
+                executor=lambda: _execute_with_invalidation(
+                    read_service,
+                    ("trends",),
+                    lambda: trends.download_all(request, run_id=run_id, actor=actor),
+                ),
+                actor=actor,
+                conflict_key="trend_download",
+            )
+        except JobConflictError as exc:
+            raise _conflict_response(exc) from exc
+        except JobCapacityError as exc:
+            raise _capacity_response(exc) from exc
+        except TrendServiceError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _job_envelope(job, response)
+
+    @api.post("/api/operations/trend-analysis")
+    def trend_analysis(request: TrendAnalysisRequest, response: Response, http_request: Request) -> dict[str, Any]:
+        video_key = hashlib.sha256("\n".join(sorted(set(request.video_ids))).encode("utf-8")).hexdigest()[:16]
+        try:
+            job = jobs.submit(
+                operation=ControlOperation.TREND_ANALYSIS,
+                request=request,
+                executor=lambda: _execute_with_invalidation(
+                    read_service, ("trends",), lambda: trends.analyze(request)
+                ),
+                actor=http_request.state.actor,
+                conflict_key=f"trend_analysis:{request.snapshot_id}:{video_key}",
+            )
+        except JobConflictError as exc:
+            raise _conflict_response(exc) from exc
+        except JobCapacityError as exc:
+            raise _capacity_response(exc) from exc
+        except TrendServiceError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _job_envelope(job, response)
 
     @api.put("/api/settings/overrides")
     def settings_overrides(request: SettingsOverrideWriteRequest, response: Response, http_request: Request) -> dict[str, Any]:

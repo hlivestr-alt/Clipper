@@ -1,91 +1,83 @@
-# Read-First App
+# Read and Control API
 
-Phase 2 added the read-first FastAPI + React application for production
-visibility. The same application has since become the production control
-surface.
+This document began as the Phase 2 “read-first” design. The same FastAPI + React application is now the production control surface, so the original read-only guarantees are historical rather than current.
 
 ## Architecture
 
-- `clipper_app.application.read_services.ReadDashboardService` reads current
-  JSON and filesystem artifacts and returns typed contracts.
-- `clipper_app.web_api` exposes those contracts through FastAPI under `/api`.
-- `new_app/` contains the React/Vite/TypeScript frontend.
-- Queue JSON, manifests, score summaries, compliance files, module indexes,
-  logs, and media artifacts remain the source of truth.
+- `clipper_app.application.read_services.ReadDashboardService` returns typed data from legacy artifacts or the feature-flagged SQLite catalog.
+- `clipper_app.application.container.ApplicationServiceContainer` composes reads, settings, jobs, queue controls, scoring, compliance, modules, exports, and WhatsApp delivery.
+- `clipper_app.web_api` exposes the services under `/api`, enforces auth/origin/host rules, serves artifacts safely, emits SSE invalidation, and serves the built SPA when available.
+- `new_app/` contains the React/Vite/TypeScript operator app and Electron shell.
 
-Every API response uses the same envelope:
+The default read authorities remain queue JSON, manifests, score summaries, compliance files, module indexes, logs, job files, variation/product-information files, and media artifacts. `CLIPPER_CATALOG_MODE=catalog` moves supported indexed reads to SQLite only after the rollout procedure.
+
+Every JSON read uses this envelope:
 
 ```json
 {
   "data": {},
-  "generated_at": "2026-06-24T13:00:00+08:00",
+  "generated_at": "2026-08-10T11:00:00+08:00",
   "source_signatures": [],
   "warnings": []
 }
 ```
 
-## Original Read-Only Guarantees
+Read responses can include ETags/revisions. List endpoints use bounded pagination and validated filters/sorts. Unsupported sorts return `400`; explicit missing artifacts return `404`; paths outside allowed roots return `403`.
 
-Phase 2 intentionally had no queue controls, no module review mutations, no
-settings persistence, no config writes, no pipeline launch controls, and no
-database. Later phases added production mutation endpoints while keeping JSON
-and filesystem artifacts as the source of truth.
+## Current Read Groups
 
-Artifact serving is restricted to files under configured read roots:
+- Health, catalog status, and `/api/events` live invalidation.
+- Dashboard, overview, queue detail, and queue VOD discovery.
+- Score index/detail and compliance index/detail.
+- Module readiness, library, and detail.
+- Logs, configured/effective settings, system statistics, and safe artifacts.
+- Product-information status.
+- Variation profile/options and presets.
+- Trend page/media/patterns and TikTok OAuth status.
+- Control-job list/detail/result preview/download.
+- WhatsApp delivery status and Sheet outbox.
 
-- `OUTPUT_DIR`
-- `WORKING_DIR`
-- `MODULE_LIBRARY_DIR`
+`clipper_app/web_api.py` is the authoritative route list.
 
-`pipeline.log` tailing is bounded to 1,000 lines.
+## Mutations Added After the Read-First Phase
 
-## Endpoints
+The application now supports queue start/continue/stop, settings overrides, rescore, compliance scans, module assembly/review, export packaging, product-information rescan, variation saves/previews/presets, TikTok OAuth and advertiser selection, trend refresh/download/analysis/media linking, and WhatsApp assignment/item/outbox transitions.
 
-- `GET /api/dashboard`
-- `GET /api/queue`
-- `GET /api/scores`
-- `GET /api/scores/{score_key}`
-- `GET /api/compliance`
-- `GET /api/compliance/detail?output_dir=...`
-- `GET /api/modules/readiness`
-- `GET /api/modules/library`
-- `GET /api/logs?lines=200`
-- `GET /api/settings`
-- `GET /api/system`
-- `GET /api/artifacts?path=...`
+These actions use typed requests, path containment, revision/conflict checks, job/audit persistence where appropriate, and query/SSE invalidation. `config.py` is never written by the app.
 
-List endpoints support bounded pagination and filtering. Unsupported sort
-fields return `400`. Artifact requests outside configured roots return `403`.
-Missing explicit artifacts return `404`.
+## Authentication and Artifact Roots
+
+All mutations and sensitive reads require `Authorization: Bearer <CLIPPER_CONTROL_TOKEN>`. Without a configured token they return `503`; invalid credentials return `401`. The TikTok callback endpoints are the deliberate unauthenticated exception.
+
+Artifact serving is restricted to configured roots such as:
+
+- `OUTPUT_DIR`.
+- `WORKING_DIR`.
+- `MODULE_LIBRARY_DIR`.
+- approved trend media beneath `TREND_MEDIA_DIR` when returned through the normal artifact model.
+
+Log tailing is bounded to 1,000 lines. User-supplied queue state and log paths are rejected by the web routes.
 
 ## Running Locally
 
-Install Python dependencies first:
-
 ```powershell
 python -m pip install -r requirements.txt
+.\run_new_app.ps1 -PnpmExe pnpm.cmd -InstallFrontendDeps
+.\run_new_app.ps1 -PnpmExe pnpm.cmd
 ```
 
-Install frontend dependencies once:
+Default development URLs:
 
-```powershell
-.\run_new_app.ps1 -InstallFrontendDeps
-```
+- React: `http://127.0.0.1:5173`.
+- FastAPI: `http://127.0.0.1:8765`.
 
-Run the read API and React app side by side:
+The launcher generates `CLIPPER_CONTROL_TOKEN`, sets an actor, enables legacy job-result migration, and shares the token with both the backend and Vite proxy. Running `pnpm.cmd dev` alone requires a matching token/backend environment for protected API calls.
 
-```powershell
-.\run_new_app.ps1
-```
+For desktop operation, use [desktop_app.md](desktop_app.md). For mutation details, use [control_app.md](control_app.md). For storage modes, use [long_term_storage_rollout.md](long_term_storage_rollout.md).
 
-Default URLs:
+## Remaining Boundaries
 
-- React app: `http://127.0.0.1:5173`
-- FastAPI: `http://127.0.0.1:8765`
-
-## Phase 2 Deferred Work
-
-- Start, Continue, Stop, review, rescore, compliance scan, module mutation
-  actions, and persistent settings UI were moved into the production app.
-- Websocket event streaming.
-- SQLite or another read model store.
+- No websocket layer is used; live invalidation is SSE with polling fallback.
+- SQLite catalog and queue authority remain staged, not default.
+- Database-backed control-job metadata is not implemented; jobs/results remain bounded files.
+- The API has no social-publishing endpoint.

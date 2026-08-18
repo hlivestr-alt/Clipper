@@ -153,10 +153,14 @@ def queue_run_terminal(
             continue
 
         status = str(entry.get("status") or "").lower()
-        if status in {"completed", "stopped"}:
+        if status == "stopped":
             summary.completed += 1
-        elif status == "failed":
+            continue
+        if status == "failed":
             summary.failed += 1
+            continue
+        if status == "completed":
+            summary.completed += 1
         elif status == queue_control.PAUSED_STATUS:
             summary.paused = True
             summary.pending += 1

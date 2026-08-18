@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, dialog, ipcMain } = require("electron");
+const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = require("electron");
 const { spawn, spawnSync } = require("node:child_process");
 const http = require("node:http");
 const path = require("node:path");
@@ -13,6 +13,7 @@ const {
   getFreePort,
   generateControlToken,
   isAllowedNavigation,
+  isAllowedOAuthExternalUrl,
   parseArgs,
   portableRestartCommand,
   readRuntimeConfig,
@@ -25,6 +26,7 @@ const {
 let backendProcess = null;
 let backendExited = false;
 let mainWindow = null;
+let backendControlToken = "";
 let currentRuntime = {
   backend_running: false,
   backend_port: null,
@@ -386,6 +388,7 @@ async function bootstrap() {
     controlToken: generateControlToken(),
     controlActor: desktopControlActor()
   };
+  backendControlToken = runtime.controlToken;
   const commandText = startBackend(runtime);
   try {
     await waitForHealth(runtime.backendPort);
@@ -431,6 +434,14 @@ ipcMain.handle("desktop:window-control", (_event, action) => {
   return { maximized: Boolean(mainWindow && mainWindow.isMaximized()) };
 });
 
+ipcMain.handle("desktop:open-oauth", async (_event, targetUrl) => {
+  if (!isAllowedOAuthExternalUrl(targetUrl)) {
+    throw new Error("External OAuth URL is not allowed.");
+  }
+  await shell.openExternal(targetUrl);
+  return true;
+});
+
 ipcMain.handle("desktop:restart-app", () => {
   const portableRestart = portableRestartCommand({
     portableExecutableFile: process.env.PORTABLE_EXECUTABLE_FILE,
@@ -471,7 +482,9 @@ if (!app.requestSingleInstanceLock()) {
       createFailureWindow("Desktop startup failed", currentRuntime.last_error, backendLog.join("\n"));
     });
 
-  app.on("before-quit", stopBackend);
+  app.on("before-quit", () => {
+    stopBackend();
+  });
   app.on("window-all-closed", () => {
     stopBackend();
     app.quit();

@@ -6,6 +6,8 @@ import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import queue_control
 from queue_supervisor import build_queue_command, format_run_tag, queue_run_terminal, run_supervisor
@@ -118,6 +120,96 @@ class QueueSupervisorTerminalTests(unittest.TestCase):
 
             self.assertFalse(summary.is_terminal)
             self.assertEqual(summary.pending_stages, 1)
+
+    def test_stopped_video_ignores_legacy_pending_stages(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_dir = root / "vod"
+            input_dir.mkdir()
+            state_path = root / "state.json"
+            run_tag = format_run_tag(12)
+            video = self._write_video(input_dir, "a.mp4")
+            entry = self._entry(video, run_tag, "stopped", ffmpeg_status="pending", active=3)
+            entry["stages"]["yolo"]["status"] = "pending"
+            self._write_state(state_path, {str(video.resolve()): entry})
+
+            summary = queue_run_terminal(state_path, input_dir, run_tag, stable_seconds=0)
+
+            self.assertTrue(summary.is_terminal)
+            self.assertEqual(summary.completed, 1)
+            self.assertEqual(summary.pending_stages, 0)
+            self.assertEqual(summary.active_clip_renders, 0)
+
+    def test_failed_video_ignores_legacy_downstream_pending_stages(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_dir = root / "vod"
+            input_dir.mkdir()
+            state_path = root / "state.json"
+            run_tag = format_run_tag(12)
+            video = self._write_video(input_dir, "a.mp4")
+            entry = self._entry(video, run_tag, "failed", ffmpeg_status="pending")
+            self._write_state(state_path, {str(video.resolve()): entry})
+
+            summary = queue_run_terminal(state_path, input_dir, run_tag, stable_seconds=0)
+
+            self.assertTrue(summary.is_terminal)
+            self.assertEqual(summary.failed, 1)
+            self.assertEqual(summary.pending_stages, 0)
+
+    def test_supervisor_does_not_relaunch_after_stopped_terminal_result(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_dir = root / "vod"
+            input_dir.mkdir()
+            state_path = root / "state.json"
+            forever_path = root / "forever.json"
+            control_path = root / "control.json"
+            video = self._write_video(input_dir, "a.mp4")
+            run_tag = format_run_tag(12)
+            waiting = self._entry(video, run_tag, "waiting", ffmpeg_status="pending")
+            self._write_state(state_path, {str(video.resolve()): waiting})
+
+            args = SimpleNamespace(
+                python_exe="python",
+                input_dir=str(input_dir),
+                state_file=str(state_path),
+                forever_state_file=str(forever_path),
+                control_file=str(control_path),
+                start_run_number=12,
+                max_retries=2,
+                max_inflight_videos=1,
+                ffmpeg_max_parallel_clips=2,
+                stage_admission_limit=3,
+                poll_interval=0.01,
+                stable_seconds=0.0,
+                scan_interval=0.01,
+                restart_delay_seconds=0.0,
+                between_runs_delay_seconds=0.0,
+                max_clips=None,
+                min_score=None,
+                force_rescore=False,
+                force_modules=False,
+                retry_failed=False,
+                dry_run=False,
+                run_mode="folder_once",
+                pipeline_mode="full",
+                variant_mode="all",
+                variant_count=1,
+                video_path=None,
+                settings_snapshot_file=None,
+            )
+
+            def finish_as_stopped(*_args, **_kwargs):
+                stopped = self._entry(video, run_tag, "stopped", ffmpeg_status="pending")
+                self._write_state(state_path, {str(video.resolve()): stopped})
+                return SimpleNamespace(returncode=0)
+
+            with mock.patch("queue_supervisor.subprocess.run", side_effect=finish_as_stopped) as run_mock:
+                exit_code = run_supervisor(args)
+
+            self.assertEqual(exit_code, 0)
+            run_mock.assert_called_once()
 
     def test_queue_command_passes_launcher_modes_and_scan_once(self):
         args = type(

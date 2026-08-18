@@ -1,75 +1,75 @@
 # Desktop App
 
-Phase 4 wraps the FastAPI + React control app in a Windows Electron shell.
+The Windows Electron shell runs the compiled React control app and manages one loopback FastAPI child process. It is an operator wrapper around the existing project runtime, not a self-contained video-processing distribution.
 
-The desktop app is a local operator wrapper. It does not bundle Python, FFmpeg,
-LM Studio, CUDA packages, models, or production data. It launches the existing
-project runtime and serves the built React app through the existing FastAPI app.
-
-## Commands
+## Commands and Artifact
 
 From `new_app/`:
 
 ```powershell
-pnpm desktop:dev
-pnpm desktop:test
-pnpm desktop:portable
+pnpm.cmd desktop:dev
+pnpm.cmd desktop:test
+pnpm.cmd desktop:portable
 ```
 
-The portable build writes:
+`desktop:dev` builds the renderer before starting Electron. `desktop:portable` runs the frontend build and Electron runtime tests before packaging.
+
+Current package metadata is version `0.4.1`, product name `Clipper`, and artifact:
 
 ```text
-new_app/dist-desktop/PROYA-VOD-Control-0.4.0-portable.exe
+new_app/dist-desktop/Clipper-0.4.1-portable.exe
 ```
 
-`run_new_app.ps1` remains available for browser-based development and rollback.
+The artifact contains Electron, `main.cjs`, `preload.cjs`, `runtime.cjs`, and the compiled renderer under packaged `resources/renderer`. It does not contain Python, this repository, FFmpeg/FFprobe, LM Studio, CUDA/PyTorch, Whisper/YOLO models, VODs, assets outside the renderer, working state, or output media.
 
 ## Runtime Resolution
 
-Electron resolves the project root in this order:
+The project root must contain `config.py` and `clipper_app/web_api.py`. Electron resolves it in this order:
 
-1. `--project-root`
-2. `CLIPPER_PROJECT_ROOT`
-3. Saved Electron runtime config
-4. Executable/current-directory ancestors
-5. Operator-selected folder
+1. `--project-root`.
+2. `CLIPPER_PROJECT_ROOT`.
+3. Saved Electron runtime configuration.
+4. Ancestors of useful launch locations, including the current directory, app/executable paths, and home directory.
+5. An operator-selected folder.
 
-Electron resolves Python in this order:
+Python resolution is `--python-exe`, `CLIPPER_PYTHON_EXE`, saved configuration, then `python`. If validation/startup fails, the operator can select `python.exe` through the runtime flow.
 
-1. `--python-exe`
-2. `CLIPPER_PYTHON_EXE`
-3. Saved Electron runtime config
-4. `python` on `PATH`
-5. Operator-selected `python.exe`
+The per-user Electron `userData/runtime.json` stores schema version, `project_root`, `python_exe`, `last_backend_port`, and update time. It does not store OAuth credentials or control tokens.
 
-The saved runtime config lives under Electron `userData` as `runtime.json`.
-It stores only `project_root`, `python_exe`, and `last_backend_port`.
+## Startup Lifecycle
 
-## Backend Lifecycle
+1. Acquire a single-instance lock; a second launch focuses the existing window.
+2. Resolve the project and Python runtime and allocate a free `127.0.0.1` port.
+3. Generate a fresh random control token and actor `desktop:<Windows user>`.
+4. Launch:
 
-Electron starts:
+   ```powershell
+   python -m uvicorn clipper_app.web_api:app --host 127.0.0.1 --port <free-port>
+   ```
 
-```powershell
-python -m uvicorn clipper_app.web_api:app --host 127.0.0.1 --port <free_port>
-```
+   The child also receives `CLIPPER_DESKTOP=1`, `CLIPPER_CONTROL_TOKEN`, `CLIPPER_CONTROL_ACTOR`, `CLIPPER_MIGRATE_JOB_STORAGE=1`, `CLIPPER_STATIC_DIR`, and `PYTHONUNBUFFERED=1`.
 
-It waits for `/api/health`, then opens the main window at the managed local
-backend origin. Closing the desktop app terminates only the backend process
-started by Electron.
+5. Wait up to 45 seconds for `/api/health`.
+6. Open a frameless 1440 x 920 window, minimum 960 x 720, at the managed loopback origin.
+7. Inject the Bearer token into requests only for that exact origin.
+8. On normal close, terminate only the Uvicorn process started by this Electron instance. A Windows process-tree fallback is used if the child does not exit promptly.
+
+If startup fails, a local diagnostic window reports the command, project root, Python path, error, and captured backend output and offers copy/retry/exit actions. Portable restart relaunches the outer executable and preserves its arguments.
 
 ## Security Boundaries
 
 - `nodeIntegration` is disabled.
-- `contextIsolation` and `sandbox` are enabled.
-- The preload bridge exposes only desktop status.
-- Window navigation is restricted to the managed `127.0.0.1:<port>` origin.
-- Artifact access remains behind the existing FastAPI safety checks.
+- `contextIsolation` and the Chromium sandbox are enabled.
+- Navigation and new windows are restricted to the exact managed loopback origin.
+- The only allowed external OAuth target is the expected HTTPS TikTok Business authorization endpoint, opened in the system browser.
+- The preload bridge exposes runtime status, window minimize/maximize/close, approved OAuth opening, and app restart only.
+- API auth, trusted-host/origin checks, and artifact/path containment remain enforced by FastAPI.
+- Tokens are generated per launch and are not saved in `runtime.json` or exposed through the preload bridge.
 
-## Notes
+## Portable Build Behavior
 
-The portable build includes a Windows fallback for a local Electron Builder
-rename timing issue. If Electron Builder leaves `win-unpacked.tmp`, the build
-script retries by using the unpacked app as `--prepackaged`.
+`electron/build-portable.cjs` invokes electron-builder and contains Windows recovery paths for rename timing failures and partially prepared unpacked directories. The compiled renderer is packaged as an external resource and served by FastAPI through `CLIPPER_STATIC_DIR`; hashed assets receive immutable caching while the SPA entry is served without long-term caching.
 
-No installer, auto-update, code-signing identity, app icon, or bundled Python
-runtime is included in Phase 4.
+No installer, auto-update, code-signing identity, custom application icon, or bundled production runtime is currently configured.
+
+`run_new_app.ps1` remains the browser-development and rollback launcher.

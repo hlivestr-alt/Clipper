@@ -35,6 +35,7 @@ class RenderResumeTests(unittest.TestCase):
                 QUEUE_POLL_INTERVAL=2.0,
             )
             baseline = _render_fingerprint("missing.mp4", cfg, max_clips=None, cut_only=False)
+            self.assertEqual(baseline["extra"]["dynamic_text_plan_schema"], 7)
             changes = {
                 "OUTPUT_NVENC_PRESET": "p5",
                 "BGM_VOLUME": 0.2,
@@ -87,6 +88,31 @@ class RenderResumeTests(unittest.TestCase):
             (bgm_dir / "track.mp3").write_bytes(b"track")
             second = _render_fingerprint("missing.mp4", cfg, max_clips=None, cut_only=False)
             self.assertNotEqual(first["asset_hash"], second["asset_hash"])
+
+    def test_render_fingerprint_tracks_product_information_revision(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            information = root / "information"
+            information.mkdir()
+            cfg = SimpleNamespace(
+                WORKING_DIR=str(root / "working"),
+                OUTPUT_DIR=str(root / "output"),
+                PRODUCT_INFORMATION_DIR=str(information),
+                VARIANTS_PER_CLIP=1,
+                OUTPUT_CODEC="h264_nvenc",
+                BGM_DIR="",
+                PRODUCT_BROLL_DIR="",
+                FONT_HOOK_FALLBACKS=[],
+            )
+
+            first = _render_fingerprint("missing.mp4", cfg, max_clips=None, cut_only=False)
+            (information / "toner.pdf").write_bytes(b"approved product information")
+            second = _render_fingerprint("missing.mp4", cfg, max_clips=None, cut_only=False)
+
+            self.assertNotEqual(
+                first["extra"]["product_information_revision"],
+                second["extra"]["product_information_revision"],
+            )
 
     def test_completed_resume_rows_skip_failed_and_require_outputs(self):
         with tempfile.TemporaryDirectory() as temp_dir:

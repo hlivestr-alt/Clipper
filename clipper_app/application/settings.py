@@ -58,6 +58,7 @@ def _definitions() -> tuple[SettingDefinition, ...]:
         "QUEUE_YOLO_IN_SUBPROCESS": "queue",
         "LM_STUDIO_QWEN_THINKING_ENABLED": "models",
         "LM_STUDIO_MODEL_MANAGEMENT_ENABLED": "models",
+        "PRODUCT_INFORMATION_LLM_ENABLED": "models",
         "WHISPERX_ALIGN_IN_SUBPROCESS": "models",
         "WHISPERX_FALLBACK_TO_RAW_ON_OOM": "models",
         "WHISPERX_FALLBACK_TO_RAW_ON_ALIGNMENT_CRASH": "models",
@@ -65,6 +66,10 @@ def _definitions() -> tuple[SettingDefinition, ...]:
         "BGM_ENABLED": "render",
         "BGM_DUCKING_ENABLED": "render",
         "EXPORT_BATCHES_ENABLED": "render",
+        "WHATSAPP_DELIVERY_ENABLED": "render",
+        "WHATSAPP_DIRECT_PC_DELIVERY_ENABLED": "delivery",
+        "WHATSAPP_LEGACY_DRIVE_WORKFLOW_DISABLED": "delivery",
+        "WHATSAPP_RETAIN_MASTER": "render",
         "HOST_FACE_ZOOM_ENABLED": "render",
         "SFX_ENABLED": "render",
         "SILENCE_TRIM_ENABLED": "render",
@@ -100,6 +105,13 @@ def _definitions() -> tuple[SettingDefinition, ...]:
         "MAX_PARALLEL_CLIPS": ("render", 1, None),
         "OUTPUT_FPS": ("render", 1, 120),
         "OUTPUT_CQ": ("render", 0, 63),
+        "WHATSAPP_MAX_BYTES": ("render", 1, None),
+        "WHATSAPP_TARGET_BYTES": ("render", 1, None),
+        "WHATSAPP_MAX_FPS": ("render", 1, 30),
+        "WHATSAPP_720P_THRESHOLD_BPS": ("render", 1, None),
+        "WHATSAPP_MAX_VIDEO_BITRATE_BPS": ("render", 1, None),
+        "WHATSAPP_MAX_ENCODE_ATTEMPTS": ("render", 1, 10),
+        "WHATSAPP_MASTER_VIDEO_BITRATE_BPS": ("render", 1, None),
         "SCORER_BATCH_FLUSH_EVERY": ("scoring", 1, None),
         "SCORER_FRAME_SAMPLE_RATE": ("scoring", 1, None),
         "SCORER_TOP_VARIANTS_PER_CLIP": ("scoring", 0, None),
@@ -108,6 +120,8 @@ def _definitions() -> tuple[SettingDefinition, ...]:
         "MODULE_ASSEMBLY_CANDIDATE_POOL": ("modules", 1, None),
         "MODULE_ASSEMBLY_MIN_SOURCE_VIDEOS": ("modules", 1, None),
         "MODULE_CLASSIFIER_WORKERS": ("modules", 1, None),
+        "PRODUCT_INFORMATION_LLM_MAX_INPUT_CHARS": ("models", 2000, None),
+        "PRODUCT_INFORMATION_LLM_MAX_TOKENS": ("models", 512, None),
     }
     float_keys = {
         "QUEUE_POLL_INTERVAL": ("queue", 0.5, None),
@@ -119,6 +133,7 @@ def _definitions() -> tuple[SettingDefinition, ...]:
         "LM_STUDIO_TEMPERATURE": ("models", 0, 2),
         "LM_STUDIO_MODEL_UNLOAD_TIMEOUT": ("models", 1, None),
         "LM_STUDIO_MODEL_UNLOAD_LOG_INTERVAL": ("models", 1, None),
+        "PRODUCT_INFORMATION_LLM_TIMEOUT": ("models", 1, None),
         "MIN_CLIP_DURATION": ("selection", 0, None),
         "MAX_CLIP_DURATION": ("selection", 0, None),
         "MIN_SCORE": ("selection", 0, 10),
@@ -131,6 +146,7 @@ def _definitions() -> tuple[SettingDefinition, ...]:
         "FACE_ZOOM_DUR_MIN": ("render", 0, None),
         "FACE_ZOOM_DUR_MAX": ("render", 0, None),
         "BGM_VOLUME": ("render", 0, 1),
+        "WHATSAPP_GOP_SECONDS": ("render", 0.1, 10),
         "SFX_VOLUME_PRODUCT": ("render", 0, 1),
         "SILENCE_TRIM_MIN_GAP": ("render", 0, None),
         "SILENCE_TRIM_KEEP_GAP": ("render", 0, None),
@@ -170,6 +186,17 @@ def _definitions() -> tuple[SettingDefinition, ...]:
         "OUTPUT_CODEC": "render",
         "OUTPUT_PRESET": "render",
         "OUTPUT_NVENC_PRESET": "render",
+        "WHATSAPP_POLICY_REVISION": "render",
+        "WHATSAPP_AUDIO_BITRATE": "render",
+        "WHATSAPP_LEVEL_720P": "render",
+        "WHATSAPP_LEVEL_1080P": "render",
+        "WHATSAPP_NVENC_PRESET": "render",
+        "WHATSAPP_NVENC_TUNE": "render",
+        "WHATSAPP_NVENC_MULTIPASS": "render",
+        "WHATSAPP_OUTPUT_COLOR_RANGE": "render",
+        "WHATSAPP_OUTPUT_COLOR_SPACE": "render",
+        "WHATSAPP_OUTPUT_COLOR_PRIMARIES": "render",
+        "WHATSAPP_OUTPUT_COLOR_TRANSFER": "render",
     }
     definitions: list[SettingDefinition] = []
     definitions.extend(SettingDefinition(key, bool, category) for key, category in bool_keys.items())
@@ -198,6 +225,8 @@ PRIVILEGED_SETTINGS = frozenset({
     "MODULE_LIBRARY_DIR",
     "LM_STUDIO_BASE_URL",
     "SCORER_VISION_BASE_URL",
+    "WHATSAPP_DIRECT_PC_DELIVERY_ENABLED",
+    "WHATSAPP_LEGACY_DRIVE_WORKFLOW_DISABLED",
 })
 BROWSER_EDITABLE_SETTINGS = frozenset(SETTINGS_REGISTRY) - PRIVILEGED_SETTINGS
 
@@ -214,6 +243,20 @@ def validate_setting_relationships(values: Mapping[str, Any]) -> None:
     ordered("BROLL_INTRO_MIN_VARIANT_RATE", "BROLL_INTRO_MAX_VARIANT_RATE", "B-roll variant rate")
     ordered("FACE_ZOOM_SCALE_MIN", "FACE_ZOOM_SCALE_MAX", "Face zoom scale")
     ordered("FACE_ZOOM_DUR_MIN", "FACE_ZOOM_DUR_MAX", "Face zoom duration")
+    if (
+        "WHATSAPP_TARGET_BYTES" in values
+        and "WHATSAPP_MAX_BYTES" in values
+        and values["WHATSAPP_TARGET_BYTES"] >= values["WHATSAPP_MAX_BYTES"]
+    ):
+        errors.append("WhatsApp sizing: WHATSAPP_TARGET_BYTES must be below WHATSAPP_MAX_BYTES")
+    if (
+        values.get("WHATSAPP_DIRECT_PC_DELIVERY_ENABLED") is True
+        and values.get("WHATSAPP_LEGACY_DRIVE_WORKFLOW_DISABLED") is not True
+    ):
+        errors.append(
+            "WhatsApp cutover: direct PC delivery requires explicit confirmation "
+            "that the legacy Drive assignment/delivery workflow is disabled"
+        )
     ordered("MODULE_HOOK_MIN_DURATION", "MODULE_HOOK_MAX_DURATION", "Hook module duration")
     ordered("MODULE_MAIN_MIN_DURATION", "MODULE_MAIN_MAX_DURATION", "Main module duration")
     ordered("MODULE_CTA_MIN_DURATION", "MODULE_CTA_MAX_DURATION", "CTA module duration")

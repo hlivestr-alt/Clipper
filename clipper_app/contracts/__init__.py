@@ -53,6 +53,11 @@ from clipper_app.contracts.control_models import (
     RescoreRequest,
     SettingsOverrideDeleteRequest,
     SettingsOverrideWriteRequest,
+    TrendAnalysisRequest,
+    TrendDownloadRequest,
+    TrendMediaLinkRequest,
+    TrendRefreshRequest,
+    TikTokAdvertiserSelectionRequest,
 )
 from clipper_app.contracts.read_models import (
     ArtifactRef,
@@ -80,6 +85,14 @@ from clipper_app.contracts.read_models import (
     SettingsReadSnapshot,
     SourceSignature,
     SystemStats,
+)
+from clipper_app.contracts.whatsapp_delivery_models import (
+    WhatsAppAssignmentActionRequest,
+    WhatsAppAssignmentResponse,
+    WhatsAppClaimRequest,
+    WhatsAppDeliveryItemRequest,
+    WhatsAppOutboxAckRequest,
+    WhatsAppStatusResponse,
 )
 
 __all__ = [name for name in globals() if not name.startswith("_")]

@@ -491,6 +491,123 @@ class VideoQueueSchedulingTests(unittest.TestCase):
             self.assertEqual(payload["videos"]["vod"]["status"], "stopped")
             self.assertEqual(payload["videos"]["vod"]["stages"]["transcribe"]["status"], "skipped")
 
+    def test_clear_pending_queue_state_repairs_legacy_stopped_entry(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "queue_status": "stopped",
+                        "videos": {
+                            "vod": {
+                                "status": "stopped",
+                                "current_stage": "ffmpeg",
+                                "completed_at": "2026-05-27T16:40:00+07:00",
+                                "stages": {
+                                    "transcribe": {"status": "done", "attempts": 1},
+                                    "llm": {"status": "done", "attempts": 1},
+                                    "yolo": {"status": "pending", "attempts": 0},
+                                    "ffmpeg": {
+                                        "status": "running",
+                                        "attempts": 29,
+                                        "queued": True,
+                                        "queued_at": "2026-05-27T16:41:00+07:00",
+                                        "active_clip_renders": 2,
+                                        "render_paused": True,
+                                    },
+                                },
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = clear_pending_queue_state(state_path)
+            entry = json.loads(state_path.read_text(encoding="utf-8"))["videos"]["vod"]
+
+            self.assertGreater(result["changed"], 0)
+            self.assertEqual(entry["status"], "stopped")
+            self.assertIsNone(entry["current_stage"])
+            self.assertEqual(entry["stages"]["yolo"]["status"], "skipped")
+            self.assertEqual(entry["stages"]["ffmpeg"]["status"], "skipped")
+            self.assertEqual(entry["stages"]["ffmpeg"]["attempts"], 29)
+            self.assertFalse(entry["stages"]["ffmpeg"]["queued"])
+            self.assertEqual(entry["stages"]["ffmpeg"]["active_clip_renders"], 0)
+            self.assertFalse(entry["stages"]["ffmpeg"]["render_paused"])
+
+    def test_stopped_entry_refresh_does_not_reopen_or_enqueue(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_dir = root / "input"
+            input_dir.mkdir()
+            video = input_dir / "a.mp4"
+            video.write_bytes(b"video")
+            runner = VideoQueueRunner(
+                input_dir=str(input_dir),
+                state_path=str(root / "state.json"),
+                max_retries=0,
+                max_inflight_videos=1,
+                stable_seconds=0,
+                output_tag="_run_190",
+                working_tag="_run_190",
+            )
+            runner._sync_videos([video])
+            key = str(video.resolve())
+
+            with runner.state_lock:
+                entry = runner.state["videos"][key]
+                entry["status"] = "stopped"
+                entry["current_stage"] = EDIT_STAGE
+                entry["stages"][EDIT_STAGE]["status"] = "running"
+                entry["stages"][EDIT_STAGE]["attempts"] = 29
+                entry["stages"][EDIT_STAGE]["active_clip_renders"] = 2
+                runner._stage_output_current = mock.Mock(return_value=False)
+
+                runner._refresh_stage_status_from_disk(entry)
+                runner._schedule_locked("restart")
+
+                self.assertEqual(entry["status"], "stopped")
+                self.assertIsNone(entry["current_stage"])
+                self.assertEqual(entry["stages"][EDIT_STAGE]["status"], "skipped")
+                self.assertEqual(entry["stages"][EDIT_STAGE]["attempts"], 29)
+                self.assertEqual(runner.queues["ffmpeg"].qsize(), 0)
+                runner._stage_output_current.assert_not_called()
+
+    def test_new_run_tag_resets_stopped_entry_for_processing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_dir = root / "input"
+            input_dir.mkdir()
+            video = input_dir / "a.mp4"
+            video.write_bytes(b"video")
+            runner = VideoQueueRunner(
+                input_dir=str(input_dir),
+                state_path=str(root / "state.json"),
+                max_retries=0,
+                max_inflight_videos=1,
+                stable_seconds=0,
+                output_tag="_run_190",
+                working_tag="_run_190",
+            )
+            runner._sync_videos([video])
+            key = str(video.resolve())
+            with runner.state_lock:
+                entry = runner.state["videos"][key]
+                entry["status"] = "stopped"
+                entry["stages"]["transcribe"]["status"] = "skipped"
+
+            runner.output_tag = "_run_191"
+            runner.working_tag = "_run_191"
+            runner._sync_videos([video])
+
+            entry = runner.state["videos"][key]
+            self.assertEqual(entry["status"], "waiting")
+            self.assertEqual(entry["working_tag"], "_run_191")
+            self.assertEqual(entry["stages"]["transcribe"]["status"], "pending")
+            self.assertEqual(entry["stages"]["transcribe"]["attempts"], 0)
+
     def test_ffmpeg_progress_callback_persists_clip_counts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

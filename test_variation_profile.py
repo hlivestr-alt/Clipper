@@ -6,6 +6,8 @@ from unittest import mock
 
 from variation_profile import (
     VariationRevisionConflict,
+    _append_preview_dynamic_filters,
+    _preview_subtitle_words,
     active_profile_revision,
     default_profile,
     generate_previews,
@@ -36,7 +38,7 @@ class VariationProfileTests(unittest.TestCase):
 
             profile = default_profile(cfg)
 
-            self.assertEqual(profile["schema_version"], 8)
+            self.assertEqual(profile["schema_version"], 12)
             self.assertEqual(profile["variant_count"], 6)
             self.assertEqual(
                 [idx for idx, item in enumerate(profile["variants"]) if item["letterbox_enabled"]],
@@ -47,6 +49,18 @@ class VariationProfileTests(unittest.TestCase):
             self.assertFalse(profile["variants"][0]["random_broll_enabled"])
             self.assertTrue(profile["variants"][0]["subtitle_enabled"])
             self.assertEqual(profile["variants"][0]["subtitle_size"], "medium")
+            self.assertEqual(profile["variants"][0]["dynamic_text_mode"], "balanced")
+            self.assertEqual(
+                profile["variants"][0]["dynamic_text_roles"],
+                ["ingredients", "benefits", "usage", "cta"],
+            )
+            self.assertEqual(profile["variants"][0]["dynamic_text_settings"]["ingredients"]["font_size"], 35)
+            self.assertEqual(profile["variants"][0]["dynamic_text_settings"]["ingredients"]["duration_seconds"], 2.6)
+            self.assertEqual(profile["variants"][0]["dynamic_text_settings"]["cta"]["font_size"], 50)
+            self.assertEqual(profile["variants"][0]["dynamic_text_settings"]["cta"]["duration_seconds"], 1.3)
+            self.assertEqual(profile["variants"][0]["text_style_id"], "current")
+            self.assertEqual(profile["variants"][0]["headline_font_id"], profile["variants"][0]["font_id"])
+            self.assertEqual(profile["variants"][0]["caption_font_id"], profile["variants"][0]["font_id"])
             self.assertTrue(profile["variants"][0]["product_zoom_enabled"])
             self.assertFalse(profile["variants"][0]["mirror_enabled"])
             self.assertEqual(profile["variants"][0]["before_after_mode"], "fullscreen")
@@ -61,6 +75,104 @@ class VariationProfileTests(unittest.TestCase):
             self.assertEqual(profile["variants"][0]["letterbox_hook_y_frac"], 0.5)
             self.assertEqual(profile["variants"][5]["letterbox_top_frac"], 0.20)
             self.assertEqual(profile["variants"][5]["letterbox_bottom_frac"], 0.20)
+
+    def test_preview_subtitle_demo_contains_three_stable_timed_cues(self):
+        words = _preview_subtitle_words()
+        grouped = {}
+        for word in words:
+            grouped.setdefault(word["_subtitle_group"], []).append(word["word"])
+
+        self.assertEqual(
+            [" ".join(grouped[index]) for index in sorted(grouped)],
+            [
+                "Ini contoh gaya subtitle",
+                "Posisi dan ukuran mengikuti varian",
+                "Animasi terlihat di hasil render",
+            ],
+        )
+        self.assertGreaterEqual(words[0]["start"], 0.0)
+        self.assertLessEqual(words[-1]["end"], 6.0)
+
+    def test_preview_dynamic_filters_are_box_free_and_side_aligned(self):
+        filters = []
+        variant = {
+            "dynamic_text_mode": "balanced",
+            "subtitle_position": "bottom",
+            "letterbox_top_frac": 0.0,
+            "letterbox_bottom_frac": 0.0,
+        }
+
+        _append_preview_dynamic_filters(
+            filters,
+            variant,
+            1,
+            {"lines": ["Niacinamide", "Menjaga kelembapan", "Gunakan setelah cleanser"]},
+            headline_font="",
+            caption_font="",
+            check_font="",
+            font_color="white",
+            highlight="yellow",
+        )
+
+        graph = ",".join(filters)
+        self.assertNotIn("drawbox", graph)
+        self.assertIn("FUNGSI PRODUK", graph)
+        self.assertIn("WORTH DICOBA?", graph)
+        self.assertRegex(graph, r"x='\d+[+-]16\*")
+        self.assertIn("fontsize=15", graph)
+        self.assertIn("fontsize=11", graph)
+        self.assertIn("between(t,2.35,4.95)", graph)
+        self.assertNotIn("#32D583", graph)
+
+        disabled_filters = []
+        _append_preview_dynamic_filters(
+            disabled_filters,
+            {**variant, "dynamic_text_mode": "off"},
+            1,
+            {},
+            headline_font="",
+            caption_font="",
+            check_font="",
+            font_color="white",
+            highlight="yellow",
+        )
+        self.assertEqual(disabled_filters, [])
+
+    def test_preview_rotates_one_information_section_per_variant(self):
+        preview_content = {
+            "role_lines": {
+                "ingredients": ["Niacinamide"],
+                "benefits": ["Menjaga kelembapan"],
+                "usage": ["Gunakan setelah cleanser"],
+            },
+        }
+        rendered = []
+        for index in range(3):
+            filters = []
+            _append_preview_dynamic_filters(
+                filters,
+                {
+                    "dynamic_text_mode": "balanced",
+                    "dynamic_text_roles": ["ingredients", "benefits", "usage"],
+                    "subtitle_position": "bottom",
+                },
+                index,
+                preview_content,
+                headline_font="",
+                caption_font="",
+                check_font="",
+                font_color="white",
+                highlight="yellow",
+            )
+            rendered.append(",".join(filters))
+
+        self.assertIn("KANDUNGAN UTAMA", rendered[0])
+        self.assertNotIn("FUNGSI PRODUK", rendered[0])
+        self.assertIn("FUNGSI PRODUK", rendered[1])
+        self.assertNotIn("CARA PAKAI", rendered[1])
+        self.assertIn("CARA PAKAI", rendered[2])
+        self.assertNotIn("KANDUNGAN UTAMA", rendered[2])
+        self.assertIn("fontsize=10", rendered[2])
 
     def test_variation_options_report_global_feature_prerequisites(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -111,7 +223,7 @@ class VariationProfileTests(unittest.TestCase):
                 cfg,
             )
 
-            self.assertEqual(loaded["schema_version"], 8)
+            self.assertEqual(loaded["schema_version"], 12)
             self.assertEqual(loaded["variants"][0]["visual_mode"], "host")
             self.assertEqual(loaded["variants"][0]["subtitle_size"], "medium")
             self.assertFalse(loaded["variants"][0]["letterbox_hook_enabled"])
@@ -127,6 +239,40 @@ class VariationProfileTests(unittest.TestCase):
             self.assertEqual(loaded["variants"][2]["subtitle_y_frac"], 0.08)
             self.assertEqual(loaded["variants"][2]["letterbox_top_frac"], 0.0)
             self.assertEqual(loaded["variants"][2]["letterbox_bottom_frac"], 0.0)
+
+    def test_creator_bold_pop_style_supplies_reference_defaults(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cfg = self._cfg(Path(temp_dir))
+
+            loaded = normalize_profile(
+                {
+                    "variant_count": 1,
+                    "variants": [
+                        {
+                            "name": "Reference",
+                            "text_style_id": "creator_bold_pop",
+                        }
+                    ],
+                },
+                cfg,
+            )
+
+            variant = loaded["variants"][0]
+            self.assertEqual(variant["font_id"], "assets/fonts/Montserrat-ExtraBold.ttf")
+            self.assertEqual(variant["headline_font_id"], "assets/fonts/Montserrat-ExtraBold.ttf")
+            self.assertEqual(variant["caption_font_id"], "assets/fonts/Montserrat-ExtraBold.ttf")
+            self.assertEqual(variant["subtitle_size"], "compact")
+            self.assertEqual(variant["subtitle_y_frac"], 0.67)
+            self.assertEqual(variant["subtitle_stroke_width"], 5)
+            self.assertFalse(variant["subtitle_highlight_enabled"])
+            self.assertEqual(variant["headline_animation"], "pop_overshoot")
+            self.assertEqual(variant["caption_animation"], "staggered_reveal")
+            self.assertEqual(variant["headline_shadow_color"], "#FF719B")
+            self.assertEqual(variant["headline_rotation_degrees"], -2.0)
+
+            styles = variation_options(cfg)["text_styles"]
+            self.assertEqual(styles[0]["id"], "current")
+            self.assertTrue(any(item["id"] == "creator_bold_pop" for item in styles))
 
     def test_transitional_hook_is_available_and_normalizes(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -187,6 +333,14 @@ class VariationProfileTests(unittest.TestCase):
             profile["variants"][1]["letterbox_hook_font_size"] = 999
             profile["variants"][1]["letterbox_hook_x_frac"] = 1.5
             profile["variants"][1]["letterbox_hook_y_frac"] = -1
+            profile["variants"][1]["dynamic_text_settings"]["benefits"].update({
+                "font_size": 999,
+                "animation": "unknown",
+                "duration_seconds": 9.25,
+                "headline_font_id": "missing.ttf",
+                "body_font_id": "missing.ttf",
+            })
+            profile["variants"][1]["dynamic_text_settings"]["cta"]["font_size"] = 2
 
             saved = save_active_profile(cfg, profile, expected_revision=default_profile(cfg)["revision"])
             loaded = load_active_profile(cfg)
@@ -214,6 +368,13 @@ class VariationProfileTests(unittest.TestCase):
             self.assertEqual(loaded["variants"][1]["letterbox_hook_font_size"], 160)
             self.assertEqual(loaded["variants"][1]["letterbox_hook_x_frac"], 1.0)
             self.assertEqual(loaded["variants"][1]["letterbox_hook_y_frac"], 0.0)
+            benefit_settings = loaded["variants"][1]["dynamic_text_settings"]["benefits"]
+            self.assertEqual(benefit_settings["font_size"], 72)
+            self.assertEqual(benefit_settings["animation"], "current")
+            self.assertEqual(benefit_settings["duration_seconds"], 6.0)
+            self.assertEqual(benefit_settings["headline_font_id"], loaded["variants"][1]["headline_font_id"])
+            self.assertEqual(benefit_settings["body_font_id"], loaded["variants"][1]["caption_font_id"])
+            self.assertEqual(loaded["variants"][1]["dynamic_text_settings"]["cta"]["font_size"], 24)
             self.assertEqual(active_profile_revision(cfg), loaded["revision"])
 
             no_bars = dict(loaded)

@@ -27,6 +27,9 @@ class ControlOperation(StrEnum):
     MODULE_ASSEMBLY = "module_assembly"
     EXPORT_BATCHES = "export_batches"
     MODULE_REVIEW = "module_review"
+    TREND_REFRESH = "trend_refresh"
+    TREND_DOWNLOAD = "trend_download"
+    TREND_ANALYSIS = "trend_analysis"
 
 
 class ControlJobResultSummary(StrictModel):
@@ -158,8 +161,36 @@ class VariationProfileWriteRequest(StrictModel):
 class VariationPreviewRequest(StrictModel):
     profile: dict[str, Any] = Field(default_factory=dict)
     variant_index: int | None = Field(default=None, ge=0)
+    product_key: str = ""
 
 
 class VariationPresetWriteRequest(StrictModel):
     name: str
     profile: dict[str, Any] = Field(default_factory=dict)
+
+
+class TrendRefreshRequest(StrictModel):
+    country_code: str = "ID"
+    date_range: str = "1DAY"
+    category_name: str = "BEAUTY_AND_PERSONAL_CARE"
+    top_hashtag_limit: int = Field(default=30, ge=1, le=30)
+
+
+class TrendMediaLinkRequest(StrictModel):
+    relative_path: str
+
+
+class TrendDownloadRequest(StrictModel):
+    snapshot_id: str
+    rights_confirmed: bool
+    retry_failed: bool = True
+
+
+class TikTokAdvertiserSelectionRequest(StrictModel):
+    advertiser_id: str = Field(min_length=1, max_length=128)
+
+
+class TrendAnalysisRequest(StrictModel):
+    snapshot_id: str
+    video_ids: list[str] = Field(min_length=1, max_length=20)
+    force: bool = False

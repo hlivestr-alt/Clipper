@@ -13,6 +13,7 @@ const {
   findProjectRoot,
   generateControlToken,
   isAllowedNavigation,
+  isAllowedOAuthExternalUrl,
   isProjectRoot,
   parseArgs,
   portableRestartCommand,
@@ -116,6 +117,13 @@ test("navigation guard allows only the managed local backend origin", () => {
   assert.equal(isAllowedNavigation("http://127.0.0.1:5173/", 8765), false);
   assert.equal(isAllowedNavigation("https://127.0.0.1:8765/", 8765), false);
   assert.equal(isAllowedNavigation("https://example.com", 8765), false);
+});
+
+test("OAuth external navigation allows only the TikTok Business authorization endpoint", () => {
+  assert.equal(isAllowedOAuthExternalUrl("https://business-api.tiktok.com/portal/auth?app_id=123&state=abc"), true);
+  assert.equal(isAllowedOAuthExternalUrl("https://business-api.tiktok.com/open_api/v1.3/oauth2/access_token/"), false);
+  assert.equal(isAllowedOAuthExternalUrl("https://example.com/portal/auth"), false);
+  assert.equal(isAllowedOAuthExternalUrl("javascript:alert(1)"), false);
 });
 
 test("control token is strong, unique, and injected only for managed origin", () => {

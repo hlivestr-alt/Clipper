@@ -228,7 +228,7 @@ WORD_CORRECTION_APPLY_TO_SUBTITLES = True
 # LM Studio → Local Server → must be running before you start the pipeline
 LM_STUDIO_BASE_URL = "http://127.0.0.1:1234/v1"
 LM_STUDIO_API_KEY  = "lm-studio"               # LM Studio accepts any non-empty string
-LM_STUDIO_MOMENT_MODEL_ID = "qwen/qwen3.6-27b"
+LM_STUDIO_MOMENT_MODEL_ID = "qwen/qwen3.8-27b"
 LM_STUDIO_MODEL    = LM_STUDIO_MOMENT_MODEL_ID          # match the model name shown in LM Studio
 LM_STUDIO_TIMEOUT  = 360                       # seconds per request
 LM_STUDIO_TEMPERATURE = 0.2                    # keep Qwen text calls stable without reverting to UI defaults
@@ -498,6 +498,42 @@ LOG_FFMPEG_FILTER_COMPLEX = False
 RAW_CUT_CODEC   = "libx264"   # CPU — fast enough, no NVENC slot used
 RAW_CUT_PRESET  = "ultrafast"
 
+# WhatsApp delivery media. The 16,000,000-byte value is Clipper's conservative
+# internal maximum; newly encoded files target 15,000,000 bytes to leave room
+# for muxing variance and delivery retries.
+WHATSAPP_DELIVERY_ENABLED = True
+# Media rendering/backlog conversion may stay enabled while affiliate delivery is
+# cut over. Direct claims and send-state mutations remain fail-closed until both
+# flags below explicitly confirm that the legacy Drive workflow cannot compete.
+WHATSAPP_DIRECT_PC_DELIVERY_ENABLED = False
+WHATSAPP_LEGACY_DRIVE_WORKFLOW_DISABLED = False
+WHATSAPP_POLICY_REVISION = "whatsapp-media-v4-clipper-stale-nclx-cohort"
+WHATSAPP_MAX_BYTES = 16_000_000
+WHATSAPP_TARGET_BYTES = 15_000_000
+WHATSAPP_AUDIO_BITRATE = "96k"
+WHATSAPP_MAX_FPS = 30
+WHATSAPP_GOP_SECONDS = 2.0
+WHATSAPP_LEVEL_720P = "3.2"
+WHATSAPP_LEVEL_1080P = "4.1"
+WHATSAPP_720P_THRESHOLD_BPS = 3_500_000
+WHATSAPP_MAX_VIDEO_BITRATE_BPS = 8_000_000
+WHATSAPP_NVENC_PRESET = "p6"
+WHATSAPP_NVENC_TUNE = "hq"
+WHATSAPP_NVENC_MULTIPASS = "fullres"
+WHATSAPP_MAX_ENCODE_ATTEMPTS = 3
+WHATSAPP_OUTPUT_COLOR_RANGE = "tv"
+WHATSAPP_OUTPUT_COLOR_SPACE = "bt709"
+WHATSAPP_OUTPUT_COLOR_PRIMARIES = "bt709"
+WHATSAPP_OUTPUT_COLOR_TRANSFER = "bt709"
+WHATSAPP_UNKNOWN_COLOR_POLICY = "review"
+WHATSAPP_HDR_POLICY = "tone_map_approved_signatures"
+WHATSAPP_RETAIN_MASTER = False
+WHATSAPP_MASTER_VIDEO_BITRATE_BPS = 12_000_000
+WHATSAPP_STATE_DB = (
+    r"D:\output_clips\export_batches_whatsapp\_whatsapp_state.sqlite3"
+)
+WHATSAPP_ASSIGNMENTS_ROOT = r"D:\output_clips\affiliate_assignments"
+
 # Moderate dead-air compaction during Stage 4 rendering.
 SILENCE_TRIM_ENABLED = True
 SILENCE_TRIM_MIN_GAP = 1.2
@@ -519,7 +555,7 @@ SCORER_EXPORT_READY_THRESHOLD = 7.0
 SCORER_REVIEW_THRESHOLD = 5.0
 SCORER_AUTO_SORT_ENABLED = True
 SCORER_TOP_VARIANTS_PER_CLIP = 0
-SCORER_VISION_ENABLED = False
+SCORER_VISION_ENABLED = True
 SCORER_VISION_FRAME_SAMPLE_RATE = 150
 SCORER_VISION_BASE_URL = "http://localhost:1234/v1"
 SCORER_VISION_API_KEY = "lm-studio"
@@ -530,6 +566,17 @@ SCORER_VISION_DEBUG = False
 SCORER_VISION_CONTACT_SHEET = True
 SCORER_VISION_CONTACT_SHEET_MAX_FRAMES = 6
 SCORER_VISION_CONTACT_SHEET_CELL_SIZE = 384
+
+# TikTok trend-analysis intake. App credentials come from the environment;
+# OAuth tokens are stored separately in the encrypted runtime credential store.
+TREND_MEDIA_DIR = "working/trends/media"
+TREND_YTDLP_CONCURRENCY = 2
+TREND_YTDLP_TIMEOUT_SECONDS = 600
+TREND_YTDLP_MIN_FREE_BYTES = 5 * 1024 * 1024 * 1024
+TREND_ANALYSIS_DIR = "working/trends/analysis"
+TREND_ANALYSIS_MAX_VIDEOS = 20
+TREND_QWEN_ENABLED = False
+TREND_QWEN_CONTACT_SHEET_MAX_FRAMES = 8
 SCORER_FOCUS_DROP_OUTLIERS = True
 SCORER_FOCUS_SKIP_FIRST_FRAME = True
 SCORER_BATCH_FLUSH_EVERY = 5
@@ -539,7 +586,7 @@ SCORER_SIMILARITY_MAX_FRAMES = 24
 # Affiliate handoff packaging. Export-ready clips from all VOD output folders
 # are moved into numbered batch folders with at most 15 videos each.
 EXPORT_BATCHES_ENABLED = True
-EXPORT_BATCH_DIR_NAME = "export_batches"
+EXPORT_BATCH_DIR_NAME = "export_batches_whatsapp"
 EXPORT_BATCH_SIZE = 15
 # Default layout: move every export-ready variant into a rolling pending pool,
 # then emit full, diversity-balanced folders without touching older partials.
@@ -650,6 +697,14 @@ BROLL_INTRO_PRODUCT_ALIASES = {
 PRODUCT_BROLL_DIR = "assets/product_broll"
 PRODUCT_BROLL_CROSSFADE_SECONDS = 0.3
 PRODUCT_BROLL_VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi"}
+
+# Approved product facts used for evidence-backed dynamic text overlays.
+PRODUCT_INFORMATION_DIR = "assets/information"
+PRODUCT_INFORMATION_LLM_ENABLED = True
+PRODUCT_INFORMATION_LLM_TIMEOUT = 360
+PRODUCT_INFORMATION_LLM_MAX_INPUT_CHARS = 6000
+PRODUCT_INFORMATION_LLM_MAX_TOKENS = 8192
+DYNAMIC_TEXT_MODE = "balanced"
 
 # Optional transitional hook pre-roll variants.
 # Drop viral hook videos into assets/transitional_hooks/. When a variant uses

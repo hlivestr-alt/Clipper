@@ -474,6 +474,11 @@ class VariationGeneratorTests(unittest.TestCase):
             profile["variants"][1]["letterbox_hook_font_size"] = 88
             profile["variants"][1]["letterbox_hook_x_frac"] = 0.42
             profile["variants"][1]["letterbox_hook_y_frac"] = 0.64
+            profile["variants"][1]["dynamic_text_settings"]["benefits"].update({
+                "font_size": 52,
+                "animation": "fade_up",
+                "duration_seconds": 3.4,
+            })
             profile["variants"][1]["zoom_intensity"] = "none"
             profile["variants"][1]["product_zoom_enabled"] = False
             saved = save_active_profile(cfg, profile, expected_revision=default_profile(cfg)["revision"])
@@ -515,6 +520,9 @@ class VariationGeneratorTests(unittest.TestCase):
             self.assertEqual(expanded[1]["_variant"].letterbox_hook_font_size, 88)
             self.assertEqual(expanded[1]["_variant"].letterbox_hook_x_frac, 0.42)
             self.assertEqual(expanded[1]["_variant"].letterbox_hook_y_frac, 0.64)
+            self.assertEqual(expanded[1]["_variant"].dynamic_text_settings["benefits"]["font_size"], 52)
+            self.assertEqual(expanded[1]["_variant"].dynamic_text_settings["benefits"]["animation"], "fade_up")
+            self.assertEqual(expanded[1]["_variant"].dynamic_text_settings["benefits"]["duration_seconds"], 3.4)
             self.assertEqual(expanded[1]["_variant"].zoom_intensity, "none")
             self.assertFalse(expanded[1]["_variant"].product_zoom_enabled)
 
@@ -554,6 +562,67 @@ class VariationGeneratorTests(unittest.TestCase):
             self.assertEqual(expanded[1]["_variant"].subtitle_y_frac, 0.58)
             self.assertEqual(expanded[1]["_variant"].before_after_variant_mode, "fullscreen")
             self.assertTrue(expanded[1]["_variant"].profile_revision)
+
+    def test_creator_text_style_propagates_to_render_configuration(self):
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            cfg = SimpleNamespace(
+                WORKING_DIR=str(root / "working"),
+                OUTPUT_DIR=str(root / "output"),
+                VARIANTS_PER_CLIP=1,
+                HOOK_DURATION=1.5,
+                HOOK_FONTSIZE=150,
+                HOOK_STROKE_W=5,
+                HOOK_STROKE_COLOR="black",
+                HOOK_SHADOW_COLOR="#000000",
+                ZOOM_SCALE=1.45,
+                ZOOM_CAPTION_STROKE_WIDTH=4,
+                SUBTITLE_Y_POS=0.80,
+                SUBTITLE_STROKE="#000000",
+                SUBTITLE_STROKE_W=3,
+                FONT_SUBTITLE="assets/fonts/Montserrat-ExtraBold.ttf",
+                FONT_HOOK="assets/fonts/Poppins-Bold.ttf",
+                FONT_PRODUCT="assets/fonts/Poppins-Bold.ttf",
+                FONT_HOOK_FALLBACKS=[],
+                KARAOKE_ACTIVE_COLOR="#FFD600",
+                KARAOKE_INACTIVE_OPACITY=1.0,
+                BROLL_INTRO_ENABLED=False,
+                BGM_DIR=str(root / "bgm"),
+            )
+            profile = default_profile(cfg)
+            profile["variants"][0] = {
+                "name": "Reference",
+                "hook_type": "text",
+                "text_style_id": "creator_bold_pop",
+            }
+            save_active_profile(cfg, profile, expected_revision=default_profile(cfg)["revision"])
+
+            expanded = expand_moments_with_variants(
+                [{
+                    "clip_id": "clip_0001",
+                    "start": 0.0,
+                    "end": 20.0,
+                    "score": 9,
+                    "hook": "Wajib pakai toner",
+                    "product": "Toner",
+                    "selected_text": "pakai toner proya",
+                }],
+                cfg,
+                n_variants=1,
+            )
+            variant = expanded[0]["_variant"]
+            patched = apply_variant_to_cfg(cfg, variant)
+
+            self.assertEqual(variant.text_style_id, "creator_bold_pop")
+            self.assertEqual(variant.subtitle_font_size, 72)
+            self.assertFalse(variant.subtitle_highlight_enabled)
+            self.assertEqual(variant.headline_animation, "pop_overshoot")
+            self.assertEqual(variant.caption_animation, "staggered_reveal")
+            self.assertEqual(patched.FONT_HOOK, "assets/fonts/Montserrat-ExtraBold.ttf")
+            self.assertEqual(patched.FONT_PRODUCT, "assets/fonts/Montserrat-ExtraBold.ttf")
+            self.assertEqual(patched.KARAOKE_ACTIVE_COLOR, "#FFFFFF")
+            self.assertEqual(patched.SUBTITLE_STROKE_W, 5)
+            self.assertEqual(patched._headline_rotation_degrees, -2.0)
 
     def test_profile_broll_intro_can_use_detected_product_fallback(self):
         with TemporaryDirectory() as tmp_dir:

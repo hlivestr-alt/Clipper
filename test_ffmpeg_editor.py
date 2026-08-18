@@ -6,7 +6,9 @@ from unittest import mock
 
 from ffmpeg_editor import (
     _add_before_after_overlay_filters,
+    _add_dynamic_text_filters,
     _add_letterbox_hook_text,
+    _add_product_caption_filters,
     _add_product_broll_visual_filters,
     _add_random_broll_cutaway_filters,
     _add_transitional_hook_concat_filters,
@@ -14,9 +16,12 @@ from ffmpeg_editor import (
     _build_zoom_expressions,
     _cpu_encode_fallback_cmd,
     _hook_layout_settings,
+    _headline_animation_options,
+    _headline_animation_segments,
     _letterbox_bar_heights,
     _prepare_karaoke_words,
     _resolve_subtitle_font,
+    _reference_product_caption_lines,
     _subtitle_line_centers,
     _subtitle_row_centers,
     _variant_hook_format,
@@ -26,6 +31,106 @@ from product_broll import BrollClip, BrollPlan, BrollTransition, RandomBrollPlan
 
 
 class FfmpegEditorFallbackTests(unittest.TestCase):
+    def test_dynamic_checklist_builds_timed_green_check_filters(self):
+        filters = []
+        cfg = types.SimpleNamespace(
+            _text_style_id="creator_bold_pop",
+            _variant_subtitle_position="bottom",
+            _letterbox_enabled=False,
+            _variant_font_color="#FFFFFF",
+            _variant_highlight_color="#FF719B",
+            FONT_HOOK="assets/fonts/Montserrat-ExtraBold.ttf",
+            FONT_HOOK_FALLBACKS=[],
+            FONT_PRODUCT="assets/fonts/Montserrat-ExtraBold.ttf",
+            HOOK_SHADOW_COLOR="#000000",
+            _dynamic_text_settings={
+                "benefits": {
+                    "headline_font_id": "assets/fonts/Montserrat-ExtraBold.ttf",
+                    "body_font_id": "assets/fonts/Montserrat-ExtraBold.ttf",
+                    "font_size": 52,
+                    "animation": "fade_up",
+                    "duration_seconds": 3.0,
+                }
+            },
+        )
+        plan = {
+            "items": [
+                {
+                    "role": "checklist",
+                    "content_role": "benefits",
+                    "headline": "FUNGSI TONER:",
+                    "lines": ["Niacinamide", "Membantu menjaga kelembapan"],
+                    "start": 2.0,
+                    "end": 5.0,
+                    "reveal_offsets": [0.0, 0.22],
+                }
+            ]
+        }
+
+        output = _add_dynamic_text_filters(filters, "[v0]", plan, 10.0, 1080, 1920, cfg)
+
+        self.assertNotEqual(output, "[v0]")
+        graph = ";".join(filters)
+        self.assertIn("FUNGSI", graph)
+        self.assertIn("TONER", graph)
+        self.assertIn("Niacinamide", graph)
+        self.assertIn("0x32D583", graph)
+        self.assertIn("between(t,2.000,5.000)", graph)
+        self.assertNotIn("drawbox", graph)
+        self.assertRegex(graph, r"y='\d+\+19\*")
+        self.assertIn("fontsize=67", graph)
+        self.assertIn("fontsize=48", graph)
+
+    def test_reference_headline_animation_uses_overshoot_scale(self):
+        segments = _headline_animation_segments(
+            "pop_overshoot",
+            105,
+            120,
+            0.0,
+            1.0,
+        )
+
+        self.assertEqual([item[0] for item in segments], [76, 147, 97, 105])
+        self.assertEqual(segments[-1][4], "120")
+        self.assertEqual(segments[-1][2], 1.0)
+
+    def test_reference_product_caption_stacks_brand_before_product(self):
+        self.assertEqual(
+            _reference_product_caption_lines("Toner", "PROYA 5X Vitamin C"),
+            ("PROYA", "5X VITAMIN C TONER"),
+        )
+        cfg = types.SimpleNamespace(
+            _text_style_id="creator_bold_pop",
+            _caption_animation="staggered_reveal",
+            _caption_stroke_width=5,
+            FONT_PRODUCT="assets/fonts/Montserrat-ExtraBold.ttf",
+            ZOOM_CAPTION_FONTSIZE=120,
+            ZOOM_CAPTION_BRAND_FONTSIZE=0,
+            ZOOM_CAPTION_TEXT_COLOR="white",
+            ZOOM_CAPTION_BRAND_COLOR="#FFD600",
+            ZOOM_CAPTION_STROKE_COLOR="black",
+            ZOOM_CAPTION_STROKE_WIDTH=4,
+            ZOOM_CAPTION_Y_POS=0.10,
+            BRAND_NAME="PROYA 5X Vitamin C",
+        )
+        filters = []
+
+        output = _add_product_caption_filters(
+            filters,
+            "[v0]",
+            {"product_name": "Toner", "trigger_t": 1.0},
+            2.0,
+            1080,
+            1920,
+            cfg,
+        )
+
+        self.assertEqual(output, "[vcapproduct]")
+        self.assertEqual(len(filters), 2)
+        self.assertIn("text='PROYA'", filters[0])
+        self.assertIn("text='5X VITAMIN C TONER'", filters[1])
+        self.assertIn("alpha='min(1,max(0", filters[1])
+
     def test_cpu_encode_fallback_replaces_nvenc_options(self):
         cfg = types.SimpleNamespace(OUTPUT_CRF=24)
         cmd = [

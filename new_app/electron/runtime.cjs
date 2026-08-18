@@ -187,6 +187,17 @@ function isAllowedNavigation(targetUrl, backendPort) {
   }
 }
 
+function isAllowedOAuthExternalUrl(targetUrl) {
+  try {
+    const parsed = new URL(targetUrl);
+    return parsed.protocol === "https:"
+      && parsed.hostname === "business-api.tiktok.com"
+      && parsed.pathname === "/portal/auth";
+  } catch (_error) {
+    return false;
+  }
+}
+
 function desktopStartDirs({ appPath, execPath, dirname, cwd } = {}) {
   return [
     cwd || process.cwd(),
@@ -230,6 +241,7 @@ module.exports = {
   getFreePort,
   generateControlToken,
   isAllowedNavigation,
+  isAllowedOAuthExternalUrl,
   isProjectRoot,
   parseArgs,
   portableRestartCommand,

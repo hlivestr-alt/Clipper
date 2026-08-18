@@ -1,4 +1,4 @@
-import type { PointerEvent as ReactPointerEvent, ReactNode } from "react";
+import type { ReactNode } from "react";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import {
   BrowserRouter,
@@ -74,6 +74,7 @@ import {
   ModuleReadinessRow,
   OverviewData,
   OverviewTopClip,
+  ProductInformationStatus,
   query,
   QueueDetail,
   QueueLaunchConfig,
@@ -89,11 +90,15 @@ import {
   SettingsReadEntry,
   SettingsReadSnapshot,
   SystemStats,
-  VariationOption,
+  TrendMediaFiles,
+  TrendPageData,
+  TrendVideo,
+  TikTokOAuthStart,
   VariationPageData,
   VariationPreviewResult,
   VariationProfile,
-  VariationVariant
+  VariationVariant,
+  WhatsAppDeliveryStatus
 } from "./api";
 import { boundedJsonPreview } from "./boundedJsonPreview";
 import { buildExportOverview } from "./exportOverview";
@@ -101,7 +106,41 @@ import { invalidateApiPrefix } from "./queryClient";
 import { useApiQuery } from "./useApiQuery";
 import { useDebouncedValue } from "./useDebouncedValue";
 import { useLiveUpdateStatus } from "./liveUpdates";
+import {
+  defaultTrendHashtagId,
+  completedTrendDownloadCount,
+  displayedTrendHashtags,
+  TREND_HASHTAG_DISPLAY_LIMIT,
+  toggleTrendVideoSelection,
+  trendDownloadDisabledReason,
+  trendRecommendationRows,
+  trendVideoCountsByHashtag,
+  trendVideoIsSelectable,
+  trendVideoShortageMessage,
+  trendVideosForHashtag
+} from "./trendSelection";
+import {
+  baselineMatchesServer,
+  clampSelectedVariantIndex,
+  copyVariationProfile,
+  createPreviewRequestSignature,
+  isDraftDirty,
+  patchVariationVariant,
+  resizeVariationProfile,
+  shouldInvalidatePreview
+} from "./variants/variantModel";
+import { VariantCommandBar } from "./variants/VariantCommandBar";
+import { VariantEditorTabs } from "./variants/VariantEditorTabs";
+import { VariantNavigator } from "./variants/VariantNavigator";
+import { VariantPreviewPanel } from "./variants/VariantPreviewPanel";
+import { VariantWorkspace } from "./variants/VariantWorkspace";
+import type {
+  PresetPanelFeedback,
+  VariantCommandStatus,
+  VariantPreviewFeedback
+} from "./variants/variantTypes";
 import "./styles.css";
+import "./variants/variants.css";
 
 type BadgeKind = "good" | "bad" | "warn" | "info" | "neutral";
 type ActionMessage = { kind: BadgeKind; text: string };
@@ -134,6 +173,7 @@ declare global {
       getStatus?: () => Promise<DesktopRuntimeStatus>;
       windowControl?: (action: WindowControlAction) => Promise<{ maximized: boolean }>;
       restartApp?: () => Promise<void>;
+      openOAuth?: (targetUrl: string) => Promise<boolean>;
     };
   }
 }
@@ -150,6 +190,7 @@ const mainNav: NavItem[] = [
   { label: "Overview", path: "/overview", match: "/overview", icon: LayoutDashboard, detail: "Production, quality, compliance, and delivery health" },
   { label: "Production", path: "/production/live", match: "/production", icon: Gauge, detail: "Current run, queue progress, and launch controls" },
   { label: "Review", path: "/review/clips", match: "/review", icon: Video, detail: "Clip quality, variants, and policy review" },
+  { label: "Trends", path: "/trends", match: "/trends", icon: TrendingUp, detail: "TikTok discovery, approved media, and editing fingerprints" },
   { label: "Variants", path: "/variants", match: "/variants", icon: SlidersHorizontal, detail: "Global variant profiles and previews" },
   { label: "Modules", path: "/modules", match: "/modules", icon: Library, detail: "Reusable hook, main, and CTA inventory" },
   { label: "Deliveries", path: "/deliveries", match: "/deliveries", icon: PackageCheck, detail: "Automatic batching and recovery" }
@@ -230,6 +271,19 @@ function healthSummary(summary?: DashboardSummary): string {
 
 function numberText(value: number | undefined | null, digits = 0): string {
   return new Intl.NumberFormat(undefined, { maximumFractionDigits: digits }).format(value ?? 0);
+}
+
+function byteSizeText(value: number | undefined | null): string {
+  const bytes = Math.max(0, value ?? 0);
+  if (bytes < 1024) return `${numberText(bytes)} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let amount = bytes / 1024;
+  let unit = units[0];
+  for (let index = 1; index < units.length && amount >= 1024; index += 1) {
+    amount /= 1024;
+    unit = units[index];
+  }
+  return `${numberText(amount, amount >= 10 ? 1 : 2)} ${unit}`;
 }
 
 function scoreText(value?: number | null): string {
@@ -721,6 +775,7 @@ function AppShell({ children }: { children: ReactNode }) {
   const page = usePageInfo();
   const location = useLocation();
   const topbarDetail = page.path === "/overview" ? dashboardDateText() : page.detail;
+  const variantsOwnsPageIdentity = location.pathname === "/variants";
   return (
     <div className="app-shell">
       <aside className="side-rail">
@@ -791,13 +846,15 @@ function AppShell({ children }: { children: ReactNode }) {
         </details>
       </nav>
 
-      <main className="main-panel">
-        <header className="topbar">
-          <div>
-            <div className="eyebrow">Clipper</div>
-            <h1>{page.label}</h1>
-            <p>{topbarDetail}</p>
-          </div>
+      <main className={`main-panel ${variantsOwnsPageIdentity ? "variants-main-panel" : ""}`}>
+        <header className={`topbar ${variantsOwnsPageIdentity ? "command-page-topbar" : ""}`}>
+          {!variantsOwnsPageIdentity && (
+            <div>
+              <div className="eyebrow">Clipper</div>
+              <h1>{page.label}</h1>
+              <p>{topbarDetail}</p>
+            </div>
+          )}
           <div className="topbar-actions">
             <QueueHealthPill summary={summary} />
             <WindowControls />
@@ -919,7 +976,17 @@ function ActionNotice({ message }: { message?: ActionMessage }) {
   if (!message) {
     return null;
   }
-  return <StateBlock kind={message.kind} detail={message.text} />;
+  const urgent = message.kind === "bad" || message.kind === "warn";
+  return (
+    <div
+      className="action-notice"
+      role={urgent ? "alert" : "status"}
+      aria-live={urgent ? "assertive" : "polite"}
+      aria-atomic="true"
+    >
+      <StateBlock kind={message.kind} detail={message.text} />
+    </div>
+  );
 }
 
 function EmptyState({ icon: Icon, title, detail }: { icon: LucideIcon; title: string; detail: string }) {
@@ -1005,16 +1072,20 @@ function ConfirmDialog({
   detail,
   confirmLabel,
   danger = false,
+  confirmDisabled = false,
   onConfirm,
-  onClose
+  onClose,
+  children
 }: {
   open: boolean;
   title: string;
   detail: string;
   confirmLabel: string;
   danger?: boolean;
+  confirmDisabled?: boolean;
   onConfirm: () => void;
   onClose: () => void;
+  children?: ReactNode;
 }) {
   const confirmRef = useRef<HTMLButtonElement | null>(null);
   useEffect(() => {
@@ -1043,9 +1114,10 @@ function ConfirmDialog({
           <h2 id="confirm-dialog-title">{title}</h2>
           <p id="confirm-dialog-detail">{detail}</p>
         </div>
+        {children && <div className="confirm-dialog-content">{children}</div>}
         <div className="confirm-dialog-actions">
           <button className="secondary-button" onClick={onClose}>Cancel</button>
-          <button ref={confirmRef} className={danger ? "danger-button" : "primary-button"} onClick={() => { onConfirm(); onClose(); }}>
+          <button ref={confirmRef} disabled={confirmDisabled} className={danger ? "danger-button" : "primary-button"} onClick={() => { onConfirm(); onClose(); }}>
             {confirmLabel}
           </button>
         </div>
@@ -1054,11 +1126,48 @@ function ConfirmDialog({
   );
 }
 
+const JOB_TRAY_DISMISSED_STORAGE_KEY = "clipper.job-tray.dismissed.v1";
+
+export function jobTrayDismissalKey(job: ControlJobSummary): string {
+  return `${job.job_id}:${job.status}`;
+}
+
+export function selectJobTrayJobs(jobs: ControlJobSummary[], dismissed: ReadonlySet<string>): ControlJobSummary[] {
+  return jobs
+    .filter((job) => ["queued", "running", "failed", "rejected"].includes(job.status))
+    .slice(0, 3)
+    .filter((job) => !dismissed.has(jobTrayDismissalKey(job)));
+}
+
+function readDismissedJobTrayItems(): Set<string> {
+  try {
+    const stored = JSON.parse(globalThis.localStorage?.getItem(JOB_TRAY_DISMISSED_STORAGE_KEY) ?? "[]");
+    return new Set(Array.isArray(stored) ? stored.filter((item): item is string => typeof item === "string") : []);
+  } catch {
+    return new Set();
+  }
+}
+
 function JobTray() {
   const jobs = useApiQuery<ControlJobPage>("/api/control/jobs?limit=12", jobPollingInterval, true);
-  const visible = (jobs.envelope?.data.jobs ?? [])
+  const [dismissed, setDismissed] = useState<Set<string>>(readDismissedJobTrayItems);
+  const candidates = (jobs.envelope?.data.jobs ?? [])
     .filter((job) => ["queued", "running", "failed", "rejected"].includes(job.status))
     .slice(0, 3);
+  const visible = selectJobTrayJobs(jobs.envelope?.data.jobs ?? [], dismissed);
+
+  function dismiss(): void {
+    const next = new Set(dismissed);
+    candidates.forEach((job) => next.add(jobTrayDismissalKey(job)));
+    const bounded = new Set([...next].slice(-100));
+    setDismissed(bounded);
+    try {
+      globalThis.localStorage?.setItem(JOB_TRAY_DISMISSED_STORAGE_KEY, JSON.stringify([...bounded]));
+    } catch {
+      // The in-memory dismissal still works when browser storage is unavailable.
+    }
+  }
+
   if (visible.length === 0) {
     return null;
   }
@@ -1066,7 +1175,12 @@ function JobTray() {
     <aside className="job-tray" aria-label="Background jobs">
       <div className="job-tray-head">
         <span><Activity size={15} aria-hidden="true" /> Background activity</span>
-        <Link to="/activity/jobs">View all</Link>
+        <div className="job-tray-actions">
+          <Link to="/activity/jobs">View all</Link>
+          <button type="button" onClick={dismiss} aria-label="Dismiss background activity" title="Dismiss background activity">
+            <X size={15} aria-hidden="true" />
+          </button>
+        </div>
       </div>
       {visible.map((job) => (
         <Link className="job-tray-row" to={`/activity/jobs?job=${encodeURIComponent(job.job_id)}`} key={job.job_id}>
@@ -3279,6 +3393,11 @@ function ExportsPage() {
   const [packagingConfirmOpen, setPackagingConfirmOpen] = useState(false);
   const [message, setMessage] = useState<ActionMessage>();
   const overview = useApiQuery<OverviewData>("/api/overview", 30_000, true);
+  const whatsappDelivery = useApiQuery<WhatsAppDeliveryStatus>(
+    "/api/whatsapp-delivery/status",
+    30_000,
+    true
+  );
   const exportHistory = useApiQuery<ControlJobPage>("/api/control/jobs?limit=100&operation=export_batches", jobPollingInterval, true);
   const exportJobs = exportHistory.envelope?.data.jobs ?? [];
   const exportOverview = buildExportOverview(overview.envelope?.data.export);
@@ -3307,10 +3426,39 @@ function ExportsPage() {
         onRefresh={() => {
           void overview.refresh();
           void exportHistory.refresh();
+          void whatsappDelivery.refresh();
         }}
       />
       {overview.error && <StateBlock kind="bad" title="Automatic packaging status failed" detail={overview.error} />}
       {exportHistory.error && <StateBlock kind="bad" title="Delivery history failed" detail={exportHistory.error} />}
+      {whatsappDelivery.error && <StateBlock kind="bad" title="WhatsApp delivery state failed" detail={whatsappDelivery.error} />}
+      {whatsappDelivery.envelope?.data.cutover && !whatsappDelivery.envelope.data.cutover.claims_enabled && (
+        <StateBlock
+          kind="warn"
+          title="Direct PC delivery is locked"
+          detail={whatsappDelivery.envelope.data.cutover.blocking_reason || "Complete the legacy workflow cutover before claiming batches."}
+        />
+      )}
+      <article className="panel delivery-status-panel">
+        <div className="panel-head">
+          <div>
+            <h2>Canonical WhatsApp batches</h2>
+            <p>Media readiness and affiliate delivery are tracked separately. Numeric folders remain permanent.</p>
+          </div>
+          <Badge
+            value={`${numberText(whatsappDelivery.envelope?.data.counts.ready_batches ?? 0)} ready`}
+            kind={(whatsappDelivery.envelope?.data.counts.delivery_failed ?? 0) > 0 ? "bad" : "good"}
+          />
+        </div>
+        <div className="overview-export-stats delivery-status-stats">
+          <OverviewStatLine label="Complete media batches" value={numberText(whatsappDelivery.envelope?.data.counts.media_complete ?? 0)} />
+          <OverviewStatLine label="Ready for delivery" value={numberText(whatsappDelivery.envelope?.data.counts.ready_batches ?? 0)} />
+          <OverviewStatLine label="Assigned" value={numberText(whatsappDelivery.envelope?.data.counts.assigned ?? 0)} />
+          <OverviewStatLine label="Sending" value={numberText(whatsappDelivery.envelope?.data.counts.sending ?? 0)} />
+          <OverviewStatLine label="Sent" value={numberText(whatsappDelivery.envelope?.data.counts.sent ?? 0)} />
+          <OverviewStatLine label="Delivery failed" value={numberText(whatsappDelivery.envelope?.data.counts.delivery_failed ?? 0)} />
+        </div>
+      </article>
       <article className="panel delivery-status-panel">
         <div className="panel-head">
           <div>
@@ -3393,32 +3541,448 @@ function ExportsPage() {
   );
 }
 
-const zoomSteps: Array<VariationVariant["zoom_intensity"]> = ["none", "subtle", "normal", "strong"];
-const fallbackSubtitleSizes: Array<VariationVariant["subtitle_size"]> = ["small", "medium", "large"];
+function TrendsPage({ active }: { active: boolean }) {
+  const [country, setCountry] = useState("ID");
+  const [windowRange, setWindowRange] = useState("1DAY");
+  const [category, setCategory] = useState("BEAUTY_AND_PERSONAL_CARE");
+  const path = `/api/trends?country_code=${encodeURIComponent(country)}&date_range=${encodeURIComponent(windowRange)}&category_name=${encodeURIComponent(category)}`;
+  const downloadJobs = useApiQuery<ControlJobPage>("/api/control/jobs?limit=10&operation=trend_download", jobPollingInterval, active);
+  const activeDownloadJob = (downloadJobs.envelope?.data.jobs ?? []).find((job) => ["queued", "running"].includes(job.status));
+  const trends = useApiQuery<TrendPageData>(path, activeDownloadJob ? 2_000 : 15_000, active);
+  const media = useApiQuery<TrendMediaFiles>("/api/trends/media-files", activeDownloadJob ? 3_000 : 30_000, active);
+  const data = trends.envelope?.data;
+  const [selectedHashtag, setSelectedHashtag] = useState<string>("");
+  const [selectedVideo, setSelectedVideo] = useState<string>("");
+  const [selectedMedia, setSelectedMedia] = useState<string>("");
+  const [analysisSelection, setAnalysisSelection] = useState<string[]>([]);
+  const [message, setMessage] = useState<ActionMessage>();
+  const [downloadConfirmOpen, setDownloadConfirmOpen] = useState(false);
+  const [rightsConfirmed, setRightsConfirmed] = useState(false);
 
-function VariationsPage({ active }: { active: boolean }) {
+  const videoCounts = useMemo(() => trendVideoCountsByHashtag(data?.videos ?? []), [data?.videos]);
+  const visibleHashtags = useMemo(() => displayedTrendHashtags(data?.hashtags ?? []), [data?.hashtags]);
+  const rankedFileCount = data?.videos.length ?? 0;
+  const completedDownloadCount = useMemo(() => completedTrendDownloadCount(data?.videos ?? []), [data?.videos]);
+  const downloadDisabledReason = trendDownloadDisabledReason(Boolean(data?.snapshot), data?.configuration, Boolean(activeDownloadJob));
+  const visibleVideos = useMemo(
+    () => trendVideosForHashtag(data?.videos ?? [], selectedHashtag),
+    [data?.videos, selectedHashtag]
+  );
+  const activeHashtag = visibleHashtags.find((hashtag) => hashtag.hashtag_id === selectedHashtag);
+  const activeVideoDiagnostics = data?.video_diagnostics?.find((item) => item.hashtag_id === selectedHashtag);
+  const videoShortageMessage = trendVideoShortageMessage(activeVideoDiagnostics, visibleVideos.length);
+  const activeVideo = visibleVideos.find((video) => video.video_id === selectedVideo) ?? visibleVideos[0];
+
+  useEffect(() => {
+    if (!data) return;
+    if (!selectedHashtag || !visibleHashtags.some((hashtag) => hashtag.hashtag_id === selectedHashtag)) {
+      setSelectedHashtag(defaultTrendHashtagId(visibleHashtags, data.videos));
+      setSelectedVideo("");
+    }
+  }, [data, selectedHashtag, visibleHashtags]);
+
+  useEffect(() => {
+    if (!data?.snapshot) return;
+    console.debug("[trends] Current Trending Hashtags render", {
+      snapshotId: data.snapshot.snapshot_id,
+      receivedFromBackend: data.hashtags.length,
+      rendered: visibleHashtags.length,
+      displayLimit: TREND_HASHTAG_DISPLAY_LIMIT
+    });
+  }, [data?.snapshot?.snapshot_id, data?.hashtags.length, visibleHashtags.length]);
+
+  useEffect(() => {
+    if (activeVideo && activeVideo.video_id !== selectedVideo) {
+      setSelectedVideo(activeVideo.video_id);
+    } else if (!activeVideo && selectedVideo) {
+      setSelectedVideo("");
+    }
+  }, [activeVideo, selectedVideo]);
+
+  useEffect(() => {
+    if (!selectedMedia && !activeVideo?.media_status && activeVideo?.downloaded_relative_path) {
+      setSelectedMedia(activeVideo.downloaded_relative_path);
+    }
+  }, [activeVideo?.video_id, activeVideo?.downloaded_relative_path, selectedMedia]);
+
+  function selectHashtag(hashtagId: string) {
+    const firstVideo = trendVideosForHashtag(data?.videos ?? [], hashtagId)[0];
+    setSelectedHashtag(hashtagId);
+    setSelectedVideo(firstVideo?.video_id ?? "");
+    setSelectedMedia("");
+  }
+
+  function submitRefresh() {
+    void submitMutation(
+      () => sendJson<ControlJob>("POST", "/api/operations/trend-refresh", {
+        country_code: country,
+        date_range: windowRange,
+        category_name: category,
+        top_hashtag_limit: TREND_HASHTAG_DISPLAY_LIMIT
+      }),
+      setMessage,
+      refreshJobQueries,
+      [trends.refresh]
+    );
+  }
+
+  async function connectTikTok() {
+    try {
+      const envelope = await sendJson<TikTokOAuthStart>("POST", "/api/integrations/tiktok/oauth/start", {});
+      if (window.clipperDesktop?.openOAuth) {
+        await window.clipperDesktop.openOAuth(envelope.data.authorization_url);
+      } else {
+        window.open(envelope.data.authorization_url, "_blank", "noopener,noreferrer");
+      }
+      setMessage({ kind: "info", text: "TikTok authorization opened in your browser. Complete it once, then return here." });
+    } catch (caught: unknown) {
+      setMessage({ kind: "bad", text: caught instanceof Error ? caught.message : String(caught) });
+    }
+  }
+
+  async function selectTikTokAdvertiser(advertiserId: string) {
+    try {
+      await sendJson<Record<string, unknown>>("PUT", "/api/integrations/tiktok/oauth/advertiser", {
+        advertiser_id: advertiserId
+      });
+      setMessage({ kind: "good", text: "TikTok advertiser selection saved." });
+      trends.refresh();
+    } catch (caught: unknown) {
+      setMessage({ kind: "bad", text: caught instanceof Error ? caught.message : String(caught) });
+    }
+  }
+
+  function submitDownload() {
+    if (!data?.snapshot || !rightsConfirmed) return;
+    void submitMutation(
+      () => sendJson<ControlJob>("POST", "/api/operations/trend-download", {
+        snapshot_id: data.snapshot?.snapshot_id,
+        rights_confirmed: true,
+        retry_failed: true
+      }),
+      setMessage,
+      refreshJobQueries,
+      [trends.refresh, media.refresh]
+    );
+    setRightsConfirmed(false);
+  }
+
+  async function linkMedia() {
+    if (!activeVideo || !selectedMedia) return;
+    try {
+      await sendJson<Record<string, unknown>>("PUT", `/api/trends/videos/${encodeURIComponent(activeVideo.video_id)}/media`, {
+        relative_path: selectedMedia
+      });
+      setMessage({ kind: "good", text: `Approved media linked to ${activeVideo.video_id}.` });
+      trends.refresh();
+    } catch (caught: unknown) {
+      setMessage({ kind: "bad", text: caught instanceof Error ? caught.message : String(caught) });
+    }
+  }
+
+  function toggleAnalysis(video: TrendVideo) {
+    setAnalysisSelection((current) => toggleTrendVideoSelection(current, video));
+  }
+
+  function submitAnalysis() {
+    if (!data?.snapshot) return;
+    void submitMutation(
+      () => sendJson<ControlJob>("POST", "/api/operations/trend-analysis", {
+        snapshot_id: data.snapshot?.snapshot_id,
+        video_ids: analysisSelection,
+        force: false
+      }),
+      setMessage,
+      refreshJobQueries,
+      [trends.refresh]
+    );
+  }
+
+  return (
+    <section className="page-stack trend-page">
+      <PageTitle title="TikTok Trends" detail="Discover TikTok-ranked videos, automatically link saved media, and derive editing recommendations." onRefresh={() => { trends.refresh(); media.refresh(); }}>
+        {data?.configuration.oauth?.authorization_required && (
+          <button
+            className="secondary-button"
+            onClick={() => void connectTikTok()}
+            disabled={!data.configuration.oauth.app_configured || !data.configuration.oauth.redirect_configured || !data.configuration.oauth.callback_supported}
+            title={data.configuration.oauth.configuration_error || "Authorize TikTok Business"}
+          >
+            <ShieldCheck size={16} aria-hidden="true" /> Connect TikTok
+          </button>
+        )}
+        <button
+          className="secondary-button"
+          onClick={() => setDownloadConfirmOpen(true)}
+          disabled={Boolean(downloadDisabledReason)}
+          title={downloadDisabledReason ?? "Save every ranked hashtag video in this snapshot"}
+        >
+          <Download size={16} aria-hidden="true" /> {activeDownloadJob ? "Saving videos" : "Save all videos"}
+        </button>
+        <button className="primary-button" onClick={submitRefresh} disabled={!data?.configuration.access_configured}>
+          <RefreshCw size={16} aria-hidden="true" /> Refresh Discovery
+        </button>
+      </PageTitle>
+      <ActionNotice message={message} />
+      {trends.loading && <SkeletonLines count={6} />}
+      {trends.error && <StateBlock kind="bad" title="Trend read failed" detail={trends.error} />}
+      <StateBlock kind="warn" warnings={[...(trends.envelope?.warnings ?? []), ...(data?.warnings ?? [])]} />
+      {data && (
+        <>
+          <article className="panel trend-toolbar">
+            <div className="filter-row">
+              <FilterField label="Country"><input value={country} maxLength={2} onChange={(event) => setCountry(event.target.value.toUpperCase())} /></FilterField>
+              <FilterField label="Window">
+                <select value={windowRange} onChange={(event) => setWindowRange(event.target.value)}>
+                  {['1DAY', '7DAY', '30DAY', '120DAY'].map((value) => <option key={value} value={value}>{value}</option>)}
+                </select>
+              </FilterField>
+              <FilterField label="Category"><input value={category} onChange={(event) => setCategory(event.target.value.toUpperCase())} /></FilterField>
+              {(data.configuration.oauth?.advertiser_ids?.length ?? 0) > 1 && (
+                <FilterField label="TikTok advertiser">
+                  <select
+                    value={data.configuration.oauth?.selected_advertiser_id ?? ""}
+                    onChange={(event) => void selectTikTokAdvertiser(event.target.value)}
+                  >
+                    <option value="">Select advertiser</option>
+                    {data.configuration.oauth?.advertiser_ids?.map((advertiserId) => (
+                      <option value={advertiserId} key={advertiserId}>{advertiserId}</option>
+                    ))}
+                  </select>
+                </FilterField>
+              )}
+            </div>
+            <div className="trend-config-grid">
+              <DetailItem label="API access" value={data.configuration.access_configured ? "Configured" : "Missing token or advertiser"} />
+              <DetailItem label="OAuth" value={data.configuration.oauth?.connected ? "Connected · long-term token" : "Authorization required"} />
+              <DetailItem label="Media folder" value={data.configuration.media_dir} />
+              <DetailItem label="Qwen-VL" value={data.configuration.qwen_enabled ? "Enabled" : "Deterministic fallback"} />
+              <DetailItem label="yt-dlp" value={data.configuration.ytdlp_available ? data.configuration.ytdlp_version : "Unavailable"} />
+              <DetailItem label="Free media storage" value={byteSizeText(data.configuration.media_free_bytes)} />
+              <DetailItem label="Snapshot" value={data.snapshot ? displayTime(data.snapshot.retrieved_at) : "Not refreshed"} />
+            </div>
+          </article>
+
+          {data.snapshot && data.download_summary && (
+            <article className="panel trend-download-progress">
+              <div className="panel-head">
+                <div>
+                  <h2>Local video saves</h2>
+                  <p>{activeDownloadJob ? "Bulk download is active. Valid files become media-ready automatically." : "Successful downloads are automatically linked for analysis."}</p>
+                </div>
+                <Badge value={activeDownloadJob?.status ?? "idle"} kind={activeDownloadJob ? "info" : "neutral"} />
+              </div>
+              <progress
+                max={Math.max(1, data.download_summary.targets)}
+                value={Math.min(data.download_summary.targets, completedDownloadCount)}
+              />
+              <div className="trend-download-counts">
+                <span>{numberText(data.download_summary.targets)} ranked files</span>
+                <span>{numberText(data.download_summary.queued)} queued</span>
+                <span>{numberText(data.download_summary.downloading)} downloading</span>
+                <span>{numberText(data.download_summary.downloaded)} downloaded</span>
+                <span>{numberText(data.download_summary.approved)} approved</span>
+                <span>{numberText(data.download_summary.failed + data.download_summary.interrupted)} failed/interrupted</span>
+              </div>
+            </article>
+          )}
+
+          {!data.snapshot ? (
+            <EmptyState icon={TrendingUp} title="No trend snapshot" detail="Configure TikTok access and refresh Discovery to create the first snapshot." />
+          ) : (
+            <div className="trend-layout">
+              <article className="panel trend-hashtags">
+                <div className="panel-head"><div><h2>Current Trending Hashtags</h2><p>Up to 30 skincare, beauty, cosmetics, personal-care, and recognized brand hashtags from {data.snapshot.country_code}.</p></div></div>
+                <div className="trend-video-diagnostics" aria-label="Hashtag diagnostics">
+                  <strong>Hashtag diagnostics</strong>
+                  <span>{numberText(data.hashtag_diagnostics.total_candidates_returned)} TikTok candidates</span>
+                  <span>{numberText(data.hashtag_diagnostics.accepted_topical)} topical accepted</span>
+                  <span>{numberText(data.hashtag_diagnostics.accepted_brands)} brands accepted</span>
+                  <span>{numberText(data.hashtag_diagnostics.excluded)} excluded</span>
+                  <span>{numberText(data.hashtag_diagnostics.deduplicated)} deduplicated</span>
+                  <span>{numberText(data.hashtag_diagnostics.stored)} stored</span>
+                  <span>{numberText(data.hashtag_diagnostics.backend_returned)} returned by backend</span>
+                  <span>{numberText(visibleHashtags.length)} rendered</span>
+                  <span>{data.hashtag_diagnostics.source} · {data.hashtag_diagnostics.source_category}</span>
+                </div>
+                {visibleHashtags.length === 0 ? (
+                  <EmptyState icon={TrendingUp} title="No relevant trending hashtags" detail="TikTok returned no qualifying topical or recognized beauty and personal-care brand hashtags for this selection. Unrelated trends are never used as filler." />
+                ) : <div className="trend-scroll-list">
+                  {visibleHashtags.map((hashtag) => (
+                    <button
+                      type="button"
+                      className={`trend-hashtag-row ${selectedHashtag === hashtag.hashtag_id ? "active" : ""}`}
+                      key={hashtag.hashtag_id}
+                      aria-pressed={selectedHashtag === hashtag.hashtag_id}
+                      onClick={() => selectHashtag(hashtag.hashtag_id)}
+                    >
+                      <strong>#{numberText(hashtag.original_rank ?? hashtag.rank_position)} {hashtag.hashtag_name}</strong>
+                      <span>{numberText(hashtag.views)} views · {numberText(hashtag.posts)} posts</span>
+                      <small>{hashtag.matched_brand ? `Brand: ${hashtag.matched_brand} · ` : ""}{videoCounts[hashtag.hashtag_id] ? `${numberText(videoCounts[hashtag.hashtag_id])} video references` : "No video references fetched"}</small>
+                    </button>
+                  ))}
+                </div>}
+              </article>
+
+              <article className="panel trend-videos">
+                <div className="panel-head"><div><h2>Ranked video references</h2><p>{activeHashtag ? `Showing ${numberText(visibleVideos.length)} playable videos for #${activeHashtag.hashtag_name}.` : "Select a ranked hashtag."} Final video-only ranks are used by the page, database, metadata, and saved filenames.</p></div><Badge value={`${analysisSelection.length}/20 selected`} kind="info" /></div>
+                {activeVideoDiagnostics && (
+                  <div className="trend-video-diagnostics" aria-label={`Video diagnostics for ${activeVideoDiagnostics.hashtag_name}`}>
+                    <strong>#{activeVideoDiagnostics.hashtag_name} diagnostics</strong>
+                    <span>{numberText(activeVideoDiagnostics.total_candidates_returned)} candidates returned</span>
+                    <span>{numberText(activeVideoDiagnostics.video_posts_detected)} video posts detected</span>
+                    <span>{numberText(activeVideoDiagnostics.image_carousel_posts_excluded)} image/carousel excluded</span>
+                    <span>{numberText(activeVideoDiagnostics.unknown_posts_excluded)} unknown excluded</span>
+                    <span>{numberText(activeVideoDiagnostics.unavailable_posts_excluded)} unavailable excluded</span>
+                    <span>{numberText(activeVideoDiagnostics.valid_videos_stored)} valid stored</span>
+                    <span>{numberText(activeVideoDiagnostics.sent_to_frontend)} sent to frontend</span>
+                    <span>{numberText(visibleVideos.length)} rendered</span>
+                    <span>Pagination {activeVideoDiagnostics.pagination_available ? "available" : "unavailable"}</span>
+                  </div>
+                )}
+                {videoShortageMessage && <StateBlock kind="warn" detail={videoShortageMessage} />}
+                {visibleVideos.length === 0 ? (
+                  <EmptyState icon={Video} title="No playable videos available for this hashtag" detail="TikTok returned no valid playable video posts in this ranked pool. Image, carousel, unknown, private, deleted, and unplayable posts were excluded." />
+                ) : (
+                  <div className="trend-video-grid">
+                    {visibleVideos.map((video) => {
+                      const selectable = trendVideoIsSelectable(video);
+                      const displayStatus = video.media_status || video.download_status || "discovered";
+                      const displayKind: BadgeKind = displayStatus === "failed" || displayStatus === "interrupted"
+                        ? "bad"
+                        : displayStatus === "queued" || displayStatus === "downloading"
+                          ? "warn"
+                          : video.media_status
+                            ? "good"
+                            : displayStatus === "downloaded" ? "info" : "neutral";
+                      return (
+                        <button type="button" className={`trend-video-row ${activeVideo?.video_id === video.video_id ? "active" : ""}`} key={video.video_id} onClick={() => { setSelectedVideo(video.video_id); setSelectedMedia(""); }}>
+                          <input type="checkbox" checked={analysisSelection.includes(video.video_id)} disabled={!selectable} onClick={(event) => event.stopPropagation()} onChange={() => toggleAnalysis(video)} aria-label={`Select ${video.video_id} for analysis`} />
+                          <span>
+                            <strong>#{video.final_rank} · #{video.hashtag_name}</strong>
+                            <small>Original TikTok rank #{video.original_provider_rank ?? video.provider_ordinal} · {video.media_type} · {video.video_id}</small>
+                            <small>{video.classification_evidence}</small>
+                          </span>
+                          <Badge value={displayStatus} kind={displayKind} />
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+                <button className="primary-button trend-analyze-button" disabled={analysisSelection.length < 5} onClick={submitAnalysis}>
+                  <Zap size={16} aria-hidden="true" /> Analyze selected videos
+                </button>
+              </article>
+
+              <article className="panel trend-inspector">
+                <div className="panel-head"><div><h2>Reference and local media</h2><p>{activeVideo ? `#${activeVideo.hashtag_name}` : "Select a video"}</p></div></div>
+                {activeVideo?.embed_url ? (
+                  <iframe className="trend-embed" src={activeVideo.embed_url.replace("autoplay=1", "autoplay=0")} title={`TikTok ${activeVideo.video_id}`} allow="encrypted-media; picture-in-picture" />
+                ) : <EmptyState icon={Video} title="No reference selected" detail="Choose a discovered video to inspect it." />}
+                <FilterField label="Approved file in watched folder">
+                  <select value={selectedMedia} onChange={(event) => setSelectedMedia(event.target.value)}>
+                    <option value="">Choose a local media file</option>
+                    {(media.envelope?.data.files ?? []).map((file) => <option key={file.relative_path} value={file.relative_path}>{file.relative_path}</option>)}
+                  </select>
+                </FilterField>
+                <button className="secondary-button full-width" disabled={!activeVideo || !selectedMedia} onClick={() => void linkMedia()}>
+                  <FolderOpen size={16} aria-hidden="true" /> Approve and link media
+                </button>
+                {activeVideo?.media_error && <StateBlock kind="bad" detail={activeVideo.media_error} />}
+                {activeVideo?.download_error && <StateBlock kind="bad" detail={activeVideo.download_error} />}
+              </article>
+            </div>
+          )}
+
+          {data.latest_pattern && (
+            <article className="panel trend-pattern">
+              <div className="panel-head">
+                <div><h2>Suggested Variation profile</h2><p>Read-only suggestion based on {numberText(data.latest_pattern.sample_count)} approved videos.</p></div>
+                <Badge value="Not applied" kind="warn" />
+              </div>
+              <div className="trend-recommendation-grid">
+                {trendRecommendationRows(data.latest_pattern).map(([field, recommendation]) => (
+                  <div className={`trend-recommendation ${recommendation.applied_to_suggestion ? "accepted" : "retained"}`} key={field}>
+                    <span>{reviewFlagLabel(field)}</span>
+                    <strong>{String(recommendation.value)}</strong>
+                    <small>{Math.round(recommendation.confidence * 100)}% confidence · {recommendation.support_count}/{recommendation.sample_count} support</small>
+                    <Badge value={recommendation.applied_to_suggestion ? "Suggested" : "Baseline retained"} kind={recommendation.applied_to_suggestion ? "good" : "neutral"} />
+                  </div>
+                ))}
+              </div>
+            </article>
+          )}
+        </>
+      )}
+      <ConfirmDialog
+        open={downloadConfirmOpen}
+        title="Save all TikTok videos?"
+        detail={`This explicit run targets ${numberText(rankedFileCount)} ranked hashtag files. Every valid saved or reused file will be linked automatically for analysis.`}
+        confirmLabel="Save all videos"
+        confirmDisabled={!rightsConfirmed}
+        onClose={() => { setDownloadConfirmOpen(false); setRightsConfirmed(false); }}
+        onConfirm={submitDownload}
+      >
+        <div className="trend-download-confirm">
+          <span>Already downloaded: {numberText(data?.download_summary?.downloaded)}</span>
+          <span>Already approved: {numberText(data?.download_summary?.approved)}</span>
+          <span>Free storage: {byteSizeText(data?.configuration.media_free_bytes)}</span>
+          <label>
+            <input type="checkbox" checked={rightsConfirmed} onChange={(event) => setRightsConfirmed(event.target.checked)} />
+            I confirm I have permission to download and store this content for internal analysis.
+          </label>
+        </div>
+      </ConfirmDialog>
+    </section>
+  );
+}
+
+export function VariationsPage({ active }: { active: boolean }) {
   const variations = useApiQuery<VariationPageData>("/api/variations", 30_000, active);
+  const productInformation = useApiQuery<ProductInformationStatus>("/api/product-information", 30_000, active);
   const data = variations.envelope?.data;
+  const informationData = productInformation.envelope?.data;
   const normalizedServerProfile = useMemo(
     () => data?.profile ? normalizeUiProfile(data.profile) : null,
     [data?.profile]
   );
   const [draft, setDraft] = useState<VariationProfile | null>(null);
-  const [openVariant, setOpenVariant] = useState(0);
-  const [selectedPreviewIndex, setSelectedPreviewIndex] = useState(0);
+  const [draftBaseline, setDraftBaseline] = useState<VariationProfile | null>(null);
+  const [selectedVariantIndex, setSelectedVariantIndex] = useState(0);
   const [message, setMessage] = useState<ActionMessage>();
+  const [revisionConflict, setRevisionConflict] = useState("");
   const [presetName, setPresetName] = useState("");
   const [selectedPreset, setSelectedPreset] = useState("");
+  const [presetFeedback, setPresetFeedback] = useState<PresetPanelFeedback>();
+  const [presetLoadConfirmOpen, setPresetLoadConfirmOpen] = useState(false);
   const [previewProduct, setPreviewProduct] = useState("");
+  const [previewInformationProduct, setPreviewInformationProduct] = useState("");
   const [busy, setBusy] = useState("");
   const [renderedPreview, setRenderedPreview] = useState<VariationPreviewResult>();
-  const previewFrameRef = useRef<HTMLDivElement | null>(null);
+  const [renderedPreviewSignature, setRenderedPreviewSignature] = useState("");
+  const [previewFeedback, setPreviewFeedback] = useState<VariantPreviewFeedback>();
+  const [previewMediaError, setPreviewMediaError] = useState("");
+  const previewRequestIdRef = useRef(0);
+  const currentPreviewSignatureRef = useRef("");
 
   useEffect(() => {
-    if (normalizedServerProfile) {
-      setDraft(copyProfile(normalizedServerProfile));
-      setSelectedPreviewIndex(0);
+    if (!normalizedServerProfile) {
+      return;
     }
+    if (!draft || !draftBaseline) {
+      acceptServerProfile(normalizedServerProfile);
+      return;
+    }
+    if (baselineMatchesServer(draftBaseline, normalizedServerProfile)) {
+      return;
+    }
+    if (isDraftDirty(draft, draftBaseline)) {
+      setRevisionConflict(
+        "A newer variation profile is available. Your unsaved draft was preserved; applying it may require resolving the revision conflict."
+      );
+      return;
+    }
+    acceptServerProfile(normalizedServerProfile);
   }, [normalizedServerProfile?.revision]);
 
   useEffect(() => {
@@ -3431,16 +3995,32 @@ function VariationsPage({ active }: { active: boolean }) {
     }
     const firstWithPreview = products.find((item) => item.preview?.exists) ?? products[0];
     setPreviewProduct(firstWithPreview.product_key);
+    invalidateRenderedPreview();
   }, [data?.product_broll?.root, data?.product_broll?.products.length, previewProduct]);
 
-  const dirty = Boolean(draft && normalizedServerProfile && JSON.stringify(draft) !== JSON.stringify(normalizedServerProfile));
+  useEffect(() => {
+    const products = informationData?.products ?? [];
+    if (products.length === 0) {
+      return;
+    }
+    if (previewInformationProduct && products.some((item) => item.product_key === previewInformationProduct)) {
+      return;
+    }
+    const firstWithFacts = products.find((item) => item.eligible_fact_count > 0) ?? products[0];
+    setPreviewInformationProduct(firstWithFacts.product_key);
+    invalidateRenderedPreview();
+  }, [informationData?.revision, informationData?.products.length, previewInformationProduct]);
+
+  const dirty = isDraftDirty(draft, draftBaseline);
   const visibleVariants = draft?.variants.slice(0, draft.variant_count) ?? [];
   const limits = data?.limits ?? { min_variants: 1, max_variants: 6 };
-  const previewIndex = Math.max(0, Math.min(selectedPreviewIndex, Math.max(0, visibleVariants.length - 1)));
+  const previewIndex = clampSelectedVariantIndex(selectedVariantIndex, visibleVariants.length);
   const previewVariant = visibleVariants[previewIndex];
-  const visualModes = data?.visual_modes ?? ["host", "broll_audio"];
-  const subtitleSizeOptions = data?.subtitle_sizes ?? fallbackSubtitleSizes;
-  const beforeAfterModes: Array<VariationVariant["before_after_mode"]> = ["fullscreen"];
+  const currentPreviewSignature = draft
+    ? createPreviewRequestSignature(draft, previewIndex, previewInformationProduct, previewProduct)
+    : "";
+  currentPreviewSignatureRef.current = currentPreviewSignature;
+  const dynamicTextRoles = data?.dynamic_text_roles ?? ["ingredients", "benefits", "usage", "cta"];
   const featureFlags = data?.global_feature_flags ?? {
     sfx: true,
     bgm: true,
@@ -3449,15 +4029,14 @@ function VariationsPage({ active }: { active: boolean }) {
     transitional_hook: true,
     host_face_zoom: true
   };
-  const disabledFeatureLabels = [
-    !featureFlags.sfx && "SFX",
-    !featureFlags.bgm && "BGM",
-    !featureFlags.before_after && "before/after images",
-    !featureFlags.broll_intro && "B-roll hooks",
-    !featureFlags.transitional_hook && "transitional hooks"
-  ].filter(Boolean) as string[];
-  const brollPreviewProducts = data?.product_broll?.products ?? [];
-  const selectedBrollProduct = brollPreviewProducts.find((item) => item.product_key === previewProduct) ?? brollPreviewProducts[0];
+  const commandStatus: VariantCommandStatus = busy === "save" ? "saving" : dirty ? "unsaved" : "saved";
+
+  useEffect(() => {
+    if (renderedPreview && shouldInvalidatePreview(renderedPreviewSignature, currentPreviewSignature)) {
+      setRenderedPreview(undefined);
+      setRenderedPreviewSignature("");
+    }
+  }, [currentPreviewSignature, renderedPreview, renderedPreviewSignature]);
 
   useEffect(() => {
     if (!dirty) {
@@ -3471,27 +4050,85 @@ function VariationsPage({ active }: { active: boolean }) {
     return () => window.removeEventListener("beforeunload", protectDraft);
   }, [dirty]);
 
+  function invalidateRenderedPreview() {
+    previewRequestIdRef.current += 1;
+    setRenderedPreview(undefined);
+    setRenderedPreviewSignature("");
+    setPreviewFeedback(undefined);
+    setPreviewMediaError("");
+    setBusy((current) => current === "preview" ? "" : current);
+  }
+
+  function acceptServerProfile(profile: VariationProfile) {
+    const accepted = copyVariationProfile(profile);
+    setDraft(accepted);
+    setDraftBaseline(copyVariationProfile(accepted));
+    setSelectedVariantIndex((current) => clampSelectedVariantIndex(current, accepted.variant_count));
+    setRevisionConflict("");
+    invalidateRenderedPreview();
+  }
+
   function updateDraft(next: VariationProfile) {
     setDraft(next);
-    setRenderedPreview(undefined);
+    invalidateRenderedPreview();
   }
 
   function updateVariant(index: number, patch: Partial<VariationVariant>) {
     if (!draft) {
       return;
     }
-    const safePatch = patch.visual_mode === "broll_audio"
-      ? { ...patch, random_broll_enabled: false }
-      : patch;
-    const variants = draft.variants.map((variant, itemIndex) => itemIndex === index ? { ...variant, ...safePatch } : variant);
-    updateDraft({ ...draft, variants });
+    updateDraft(patchVariationVariant(draft, index, patch));
+  }
+
+  function updateDynamicTextRole(
+    index: number,
+    role: VariationVariant["dynamic_text_roles"][number],
+    enabled: boolean
+  ) {
+    const current = visibleVariants[index];
+    if (!current) {
+      return;
+    }
+    const selected = new Set(current.dynamic_text_roles ?? []);
+    if (enabled) {
+      selected.add(role);
+    } else {
+      selected.delete(role);
+    }
+    updateVariant(index, {
+      dynamic_text_roles: dynamicTextRoles.filter((item) => selected.has(item))
+    });
+  }
+
+  function updateDynamicTextSetting(
+    index: number,
+    role: VariationVariant["dynamic_text_roles"][number],
+    patch: Partial<VariationVariant["dynamic_text_settings"]["ingredients"]>
+  ) {
+    const current = visibleVariants[index];
+    if (!current) {
+      return;
+    }
+    updateVariant(index, {
+      dynamic_text_settings: {
+        ...current.dynamic_text_settings,
+        [role]: { ...current.dynamic_text_settings[role], ...patch }
+      }
+    });
+  }
+
+  function applyTextStyle(index: number, textStyleId: VariationVariant["text_style_id"]) {
+    const style = data?.text_styles.find((item) => item.id === textStyleId);
+    updateVariant(index, {
+      ...(style?.defaults ?? {}),
+      text_style_id: textStyleId
+    });
   }
 
   function selectPreviewVariant(index: number) {
-    const nextIndex = Math.max(0, Math.min(index, Math.max(0, visibleVariants.length - 1)));
-    setSelectedPreviewIndex(nextIndex);
-    setOpenVariant(nextIndex);
-    setRenderedPreview(undefined);
+    const nextIndex = clampSelectedVariantIndex(index, visibleVariants.length);
+    setSelectedVariantIndex(nextIndex);
+    invalidateRenderedPreview();
   }
 
   function updateSubtitleY(index: number, value: number) {
@@ -3525,52 +4162,42 @@ function VariationsPage({ active }: { active: boolean }) {
     });
   }
 
-  function moveSubtitleFromPointer(event: ReactPointerEvent<HTMLElement>) {
-    if (!previewVariant) {
-      return;
-    }
-    const rect = previewFrameRef.current?.getBoundingClientRect();
-    if (!rect || rect.height <= 0) {
-      return;
-    }
-    updateSubtitleY(previewIndex, (event.clientY - rect.top) / rect.height);
-  }
-
-  function startSubtitleDrag(event: ReactPointerEvent<HTMLButtonElement>) {
-    event.preventDefault();
-    event.currentTarget.setPointerCapture(event.pointerId);
-    moveSubtitleFromPointer(event);
-  }
-
   function updateVariantCount(value: number) {
     if (!draft) {
       return;
     }
-    const count = Math.max(limits.min_variants, Math.min(limits.max_variants, value));
-    const variants = [...draft.variants];
-    while (variants.length < count) {
-      variants.push(createUiVariant(variants.length, variants[variants.length - 1]));
-    }
-    updateDraft({ ...draft, variant_count: count, variants });
-    setOpenVariant(Math.min(openVariant, count - 1));
-    setSelectedPreviewIndex(Math.min(selectedPreviewIndex, count - 1));
+    const next = resizeVariationProfile(
+      draft,
+      value,
+      limits.min_variants,
+      limits.max_variants,
+      createUiVariant
+    );
+    updateDraft(next);
+    setSelectedVariantIndex((current) => clampSelectedVariantIndex(current, next.variant_count));
   }
 
   async function saveProfile() {
-    if (!draft || !data?.profile) {
+    if (!draft || !draftBaseline) {
       return;
     }
     setBusy("save");
     try {
       const envelope = await sendJson<VariationPageData>("PUT", "/api/variations", {
         profile: draft,
-        expected_revision: data.profile.revision
+        expected_revision: draftBaseline.revision
       });
-      setDraft(normalizeUiProfile(envelope.data.profile));
+      acceptServerProfile(normalizeUiProfile(envelope.data.profile));
       setMessage({ kind: "good", text: "Variation profile saved for future renders." });
       variations.refresh();
     } catch (caught) {
-      setMessage({ kind: "bad", text: caught instanceof Error ? caught.message : String(caught) });
+      const detail = caught instanceof Error ? caught.message : String(caught);
+      if (/\b409\b|conflict/i.test(detail)) {
+        setRevisionConflict(
+          "The variation profile changed before your draft could be applied. Your draft is still intact; no server data was loaded over it."
+        );
+      }
+      setMessage({ kind: "bad", text: detail });
     } finally {
       setBusy("");
     }
@@ -3587,27 +4214,47 @@ function VariationsPage({ active }: { active: boolean }) {
         profile: draft
       });
       setPresetName("");
+      setPresetFeedback({ kind: "success", text: "Preset saved." });
       setMessage({ kind: "good", text: "Preset saved." });
       variations.refresh();
     } catch (caught) {
-      setMessage({ kind: "bad", text: caught instanceof Error ? caught.message : String(caught) });
+      const detail = caught instanceof Error ? caught.message : String(caught);
+      setPresetFeedback({ kind: "error", text: detail });
+      setMessage({ kind: "bad", text: detail });
     } finally {
       setBusy("");
     }
   }
 
-  async function loadPreset() {
+  function requestPresetLoad() {
     if (!selectedPreset) {
+      return;
+    }
+    if (dirty) {
+      setPresetLoadConfirmOpen(true);
+      return;
+    }
+    void loadPreset();
+  }
+
+  async function loadPreset() {
+    const presetId = selectedPreset;
+    if (!presetId) {
       return;
     }
     setBusy("load");
     try {
-      const envelope = await getJson<VariationProfile>(`/api/variations/presets/${encodeURIComponent(selectedPreset)}`);
-      setDraft(normalizeUiProfile(envelope.data));
-      setSelectedPreviewIndex(0);
+      const envelope = await getJson<VariationProfile>(`/api/variations/presets/${encodeURIComponent(presetId)}`);
+      const loadedDraft = normalizeUiProfile(envelope.data);
+      setDraft(loadedDraft);
+      setSelectedVariantIndex((current) => clampSelectedVariantIndex(current, loadedDraft.variant_count));
+      invalidateRenderedPreview();
+      setPresetFeedback({ kind: "info", text: "Preset loaded into the draft. Apply separately when ready." });
       setMessage({ kind: "info", text: "Preset loaded into the editor. Save to apply it." });
     } catch (caught) {
-      setMessage({ kind: "bad", text: caught instanceof Error ? caught.message : String(caught) });
+      const detail = caught instanceof Error ? caught.message : String(caught);
+      setPresetFeedback({ kind: "error", text: detail });
+      setMessage({ kind: "bad", text: detail });
     } finally {
       setBusy("");
     }
@@ -3617,17 +4264,64 @@ function VariationsPage({ active }: { active: boolean }) {
     if (!draft || !previewVariant) {
       return;
     }
+    const requestId = previewRequestIdRef.current + 1;
+    previewRequestIdRef.current = requestId;
+    const requestSignature = createPreviewRequestSignature(
+      draft,
+      previewIndex,
+      previewInformationProduct,
+      previewProduct
+    );
     setBusy("preview");
+    setPreviewFeedback(undefined);
+    setPreviewMediaError("");
     try {
       const envelope = await sendJson<VariationPreviewResult>("POST", "/api/variations/previews", {
         profile: draft,
-        variant_index: previewIndex
+        variant_index: previewIndex,
+        product_key: previewInformationProduct
       });
+      if (
+        requestId !== previewRequestIdRef.current
+        || requestSignature !== currentPreviewSignatureRef.current
+      ) {
+        return;
+      }
       setRenderedPreview(envelope.data);
+      setRenderedPreviewSignature(requestSignature);
+      const hasRenderedPreview = envelope.data.previews.some((preview) => preview.exists);
+      const feedback = {
+        kind: hasRenderedPreview ? "success" : "warning",
+        text: envelope.data.message || (hasRenderedPreview ? "Rendered preview ready." : "No rendered preview was produced.")
+      } as VariantPreviewFeedback;
+      setPreviewFeedback(feedback);
+      setMessage({ kind: hasRenderedPreview ? "good" : "warn", text: feedback.text });
+    } catch (caught) {
+      if (
+        requestId !== previewRequestIdRef.current
+        || requestSignature !== currentPreviewSignatureRef.current
+      ) {
+        return;
+      }
+      const detail = caught instanceof Error ? caught.message : String(caught);
+      setPreviewFeedback({ kind: "error", text: detail });
+      setMessage({ kind: "bad", text: detail });
+    } finally {
+      if (requestId === previewRequestIdRef.current) {
+        setBusy("");
+      }
+    }
+  }
+
+  async function rescanProductInformation() {
+    setBusy("information");
+    try {
+      const envelope = await sendJson<ProductInformationStatus>("POST", "/api/product-information/rescan", {});
       setMessage({
-        kind: envelope.data.previews.length ? "good" : "warn",
-        text: envelope.data.message || (envelope.data.previews.length ? "Rendered preview ready." : "No rendered preview was produced.")
+        kind: envelope.data.warnings.length ? "warn" : "good",
+        text: `Product information scanned: ${numberText(envelope.data.sources.length)} source file(s).`
       });
+      productInformation.refresh();
     } catch (caught) {
       setMessage({ kind: "bad", text: caught instanceof Error ? caught.message : String(caught) });
     } finally {
@@ -3636,520 +4330,143 @@ function VariationsPage({ active }: { active: boolean }) {
   }
 
   return (
-    <section className="page-stack">
-      <PageTitle title="Variants" detail="Configure and preview global clip variants before the next render." onRefresh={variations.refresh}>
-        <button className="primary-button" disabled={!draft || !dirty || busy === "save"} onClick={saveProfile}>
-          <CheckCircle2 size={16} aria-hidden="true" />
-          {busy === "save" ? "Saving" : "Apply to future clips"}
-        </button>
-      </PageTitle>
+    <section className="page-stack variants-page">
+      <VariantCommandBar
+        status={commandStatus}
+        conflict={revisionConflict}
+        variantCount={draft?.variant_count ?? data?.profile.variant_count ?? 0}
+        revision={draftBaseline?.revision ?? data?.profile.revision}
+        refreshing={variations.refreshing}
+        canApply={Boolean(draft && dirty)}
+        presetsDisabled={!draft || !data}
+        presetName={presetName}
+        selectedPreset={selectedPreset}
+        presets={(data?.presets ?? []).map((preset) => ({ presetId: preset.preset_id, name: preset.name }))}
+        presetSaving={busy === "preset"}
+        presetLoading={busy === "load"}
+        presetFeedback={presetFeedback}
+        onRefresh={variations.refresh}
+        onApply={() => void saveProfile()}
+        onPresetNameChange={setPresetName}
+        onSelectedPresetChange={setSelectedPreset}
+        onSavePreset={() => void savePreset()}
+        onLoadPreset={requestPresetLoad}
+      />
       {variations.loading && <SkeletonLines count={5} />}
       {variations.error && <StateBlock kind="bad" title="Variation profile read failed" detail={variations.error} />}
-      <StateBlock kind="warn" warnings={variations.envelope?.warnings} />
-      {disabledFeatureLabels.length > 0 && (
-        <StateBlock
-          kind="warn"
-          title="Some variant features are globally disabled"
-          detail={`${disabledFeatureLabels.join(", ")} cannot be enabled by an individual variant. Saved choices are preserved and will become active again when the global setting is enabled.`}
-        />
-      )}
       <ActionNotice message={message} />
       {draft && data && (
-        <div className="variation-layout">
-          <article className="panel variation-editor">
-            <div className="panel-head">
-              <div>
-                <h2>Profile</h2>
-                <p>Revision {data.profile.revision ? data.profile.revision.slice(0, 12) : "new"}.</p>
-              </div>
-              <Badge value={dirty ? "Unsaved" : "Saved"} kind={dirty ? "warn" : "good"} />
-            </div>
-            <div className="variation-top-controls">
-              <FilterField label="Number of variants">
-                <input
-                  type="number"
-                  min={limits.min_variants}
-                  max={limits.max_variants}
-                  value={draft.variant_count}
-                  onChange={(event) => updateVariantCount(Number.parseInt(event.target.value || "1", 10))}
-                />
-              </FilterField>
-              <span className="variation-count-note">({limits.min_variants}-{limits.max_variants})</span>
-            </div>
-            <div className="variant-accordion">
-              {visibleVariants.map((variant, index) => (
-                <section className={`variant-editor-row ${openVariant === index ? "open" : ""}`} key={`variant-editor-${index}`}>
-                  <button className="variant-row-head" onClick={() => setOpenVariant(openVariant === index ? -1 : index)}>
-                    <span className="variant-index">V{index + 1}</span>
-                    <strong>{variant.name || `Variant ${index + 1}`}</strong>
-                    {variant.visual_mode === "broll_audio" && <span className="visual-mode-chip">B-roll visual</span>}
-                    {variant.mirror_enabled && <span className="flip-chip">Flipped</span>}
-                    {usesBeforeAfterImage(variant) && <span className="before-after-chip">{variationLabel(variant.before_after_mode)}</span>}
-                    {variant.letterbox_enabled && <span className="letterbox-chip">Letterbox</span>}
-                    <ChevronRight size={16} aria-hidden="true" />
-                  </button>
-                  {openVariant === index && (
-                    <div className="variant-row-body">
-                      <FilterField label="Name">
-                        <input value={variant.name} onChange={(event) => updateVariant(index, { name: event.target.value })} />
-                      </FilterField>
-                      <FilterField label="Hook type">
-                        <select value={variant.hook_type} onChange={(event) => updateVariant(index, { hook_type: event.target.value })}>
-                          {data.hook_types.map((item) => (
-                            <option value={item} key={item} disabled={!hookTypeAvailable(item, featureFlags)}>
-                              {variationLabel(item)}{hookTypeAvailable(item, featureFlags) ? "" : " (globally disabled)"}
-                            </option>
-                          ))}
-                        </select>
-                      </FilterField>
-                      <SegmentedField
-                        label="Visual"
-                        value={variant.visual_mode ?? "host"}
-                        options={visualModes}
-                        onChange={(value) => updateVariant(index, { visual_mode: value as VariationVariant["visual_mode"] })}
-                      />
-                      <ToggleField label="Flip video" checked={variant.mirror_enabled} onChange={(value) => updateVariant(index, { mirror_enabled: value })} />
-                      <FilterField label="Before/After image">
-                        <select
-                          value={variant.before_after_mode}
-                          disabled={!usesBeforeAfterImage(variant)}
-                          onChange={(event) => updateVariant(index, { before_after_mode: event.target.value as VariationVariant["before_after_mode"] })}
-                        >
-                          {beforeAfterModes.map((item) => <option value={item} key={item}>{variationLabel(item)}</option>)}
-                        </select>
-                      </FilterField>
-                      <FilterField label="Font">
-                        <select value={variant.font_id} onChange={(event) => updateVariant(index, { font_id: event.target.value })}>
-                          {data.fonts.map((font) => <option value={font.id ?? font.path ?? ""} key={font.id ?? font.path}>{font.label}</option>)}
-                        </select>
-                      </FilterField>
-                      <ColorField label="Font color" value={variant.font_color} onChange={(value) => updateVariant(index, { font_color: value })} />
-                      <ColorField label="Highlight color" value={variant.highlight_color} onChange={(value) => updateVariant(index, { highlight_color: value })} />
-                      <ToggleField label="Subtitles" checked={variant.subtitle_enabled} onChange={(value) => updateVariant(index, { subtitle_enabled: value })} />
-                      <SegmentedField label="Subtitle placement" value={variant.subtitle_position} options={data.subtitle_positions} disabled={!variant.subtitle_enabled} onChange={(value) => {
-                        const subtitle_position = value as VariationVariant["subtitle_position"];
-                        updateVariant(index, {
-                          subtitle_position,
-                          subtitle_y_frac: subtitleYDefault(subtitle_position)
-                        });
-                      }} />
-                      <SegmentedField
-                        label="Subtitle size"
-                        value={variant.subtitle_size}
-                        options={subtitleSizeOptions}
-                        disabled={!variant.subtitle_enabled}
-                        onChange={(value) => updateVariant(index, { subtitle_size: value as VariationVariant["subtitle_size"] })}
-                      />
-                      <FilterField label="Color grade">
-                        <select value={variant.color_grade} onChange={(event) => updateVariant(index, { color_grade: event.target.value })}>
-                          {data.color_grades.map((item) => <option value={item} key={item}>{variationLabel(item)}</option>)}
-                        </select>
-                      </FilterField>
-                      <FilterField label="BGM">
-                        <select disabled={!featureFlags.bgm} value={variant.bgm_mode === "selected" ? variant.bgm_path : variant.bgm_mode} onChange={(event) => {
-                          const value = event.target.value;
-                          if (value === "auto" || value === "none") {
-                            updateVariant(index, { bgm_mode: value, bgm_path: "" });
-                          } else {
-                            updateVariant(index, { bgm_mode: "selected", bgm_path: value });
-                          }
-                        }}>
-                          <option value="auto">Auto from folder</option>
-                          <option value="none">No BGM</option>
-                          {data.bgm_tracks.map((track) => <option value={track.path ?? ""} key={track.path}>{track.label}</option>)}
-                        </select>
-                      </FilterField>
-                      <ToggleField label="SFX" checked={variant.sfx_enabled} disabled={!featureFlags.sfx} onChange={(value) => updateVariant(index, { sfx_enabled: value })} />
-                      <ToggleField
-                        label="Random relevant B-roll"
-                        checked={variant.random_broll_enabled}
-                        disabled={variant.visual_mode === "broll_audio"}
-                        onChange={(value) => updateVariant(index, { random_broll_enabled: value })}
-                      />
-                      <ToggleField
-                        label="Product zoom"
-                        checked={variant.product_zoom_enabled}
-                        disabled={variant.visual_mode === "broll_audio"}
-                        onChange={(value) => updateVariant(index, { product_zoom_enabled: value })}
-                      />
-                      <ZoomField
-                        value={variant.zoom_intensity}
-                        disabled={variant.visual_mode === "broll_audio"}
-                        onChange={(value) => updateVariant(index, { zoom_intensity: value })}
-                      />
-                      <ToggleField label="Black bars" checked={variant.letterbox_enabled} onChange={(value) => updateLetterboxEnabled(index, value)} />
-                      <div className={`letterbox-hook-settings ${!variant.letterbox_enabled ? "control-disabled" : ""}`}>
-                        <ToggleField
-                          label="Auto top bar hook"
-                          checked={variant.letterbox_hook_enabled}
-                          disabled={!variant.letterbox_enabled}
-                          onChange={(value) => updateLetterboxHookEnabled(index, value)}
-                        />
-                        <FilterField label="Hook font">
-                          <select
-                            value={variant.letterbox_hook_font_id || variant.font_id}
-                            disabled={!variant.letterbox_enabled || !variant.letterbox_hook_enabled}
-                            onChange={(event) => updateVariant(index, { letterbox_hook_font_id: event.target.value })}
-                          >
-                            {data.fonts.map((font) => <option value={font.id ?? font.path ?? ""} key={font.id ?? font.path}>{font.label}</option>)}
-                          </select>
-                        </FilterField>
-                        <ColorField
-                          label="Hook color"
-                          value={variant.letterbox_hook_font_color}
-                          disabled={!variant.letterbox_enabled || !variant.letterbox_hook_enabled}
-                          onChange={(value) => updateVariant(index, { letterbox_hook_font_color: value })}
-                        />
-                        <NumberControl
-                          label="Hook size"
-                          value={variant.letterbox_hook_font_size}
-                          min={24}
-                          max={160}
-                          unit="px"
-                          disabled={!variant.letterbox_enabled || !variant.letterbox_hook_enabled}
-                          onChange={(value) => updateVariant(index, { letterbox_hook_font_size: value })}
-                        />
-                        <PercentControl
-                          label="Hook X"
-                          value={variant.letterbox_hook_x_frac}
-                          disabled={!variant.letterbox_enabled || !variant.letterbox_hook_enabled}
-                          onChange={(value) => updateVariant(index, { letterbox_hook_x_frac: value })}
-                        />
-                        <PercentControl
-                          label="Hook Y"
-                          value={variant.letterbox_hook_y_frac}
-                          disabled={!variant.letterbox_enabled || !variant.letterbox_hook_enabled}
-                          onChange={(value) => updateVariant(index, { letterbox_hook_y_frac: value })}
-                        />
-                      </div>
-                    </div>
-                  )}
-                </section>
-              ))}
-            </div>
-            <div className="preset-row">
-              <FilterField label="Save preset">
-                <input value={presetName} onChange={(event) => setPresetName(event.target.value)} placeholder="Preset name" />
-              </FilterField>
-              <button className="secondary-button" disabled={!presetName.trim() || busy === "preset"} onClick={savePreset}>Save preset</button>
-              <FilterField label="Load preset">
-                <select value={selectedPreset} onChange={(event) => setSelectedPreset(event.target.value)}>
-                  <option value="">Choose preset</option>
-                  {data.presets.map((preset) => <option value={preset.preset_id} key={preset.preset_id}>{preset.name}</option>)}
-                </select>
-              </FilterField>
-              <button className="secondary-button" disabled={!selectedPreset || busy === "load"} onClick={loadPreset}>Load</button>
-            </div>
-          </article>
-          <article className="panel variation-preview-panel">
-            <div className="panel-head">
-              <div>
-                <h2>Preview</h2>
-                <p>
-                  {previewVariant?.visual_mode === "broll_audio"
-                    ? selectedBrollProduct?.exists
-                      ? `B-roll ${selectedBrollProduct.label} (${selectedBrollProduct.video_count})`
-                      : `Missing ${selectedBrollProduct?.folder ?? data.product_broll.root}`
-                    : data.preview_source.exists ? `Source ${parentDir(data.preview_source.path)}` : "Missing assets/variation_preview/raw_cut_preview.mp4"}
-                </p>
-              </div>
-              <Badge
-                value={previewVariant?.visual_mode === "broll_audio"
-                  ? selectedBrollProduct?.preview?.exists ? "B-roll clip" : "Missing"
-                  : data.preview_source.exists ? "Fixed clip" : "Missing"}
-                kind={(previewVariant?.visual_mode === "broll_audio" ? selectedBrollProduct?.preview?.exists : data.preview_source.exists) ? "good" : "warn"}
+        <>
+        <VariantWorkspace
+          navigator={(
+            <VariantNavigator
+              variants={visibleVariants}
+              selectedIndex={previewIndex}
+              minimumCount={limits.min_variants}
+              maximumCount={limits.max_variants}
+              onSelect={selectPreviewVariant}
+              onCountChange={updateVariantCount}
+            />
+          )}
+          editor={(
+            <article className="panel variation-editor">
+              <VariantEditorTabs
+                variant={previewVariant}
+                variantIndex={previewIndex}
+                data={data}
+                informationData={informationData}
+                variationWarnings={variations.envelope?.warnings}
+                productInformationLoading={productInformation.loading}
+                productInformationError={productInformation.error}
+                productInformationScanning={busy === "information"}
+                onRescanProductInformation={() => void rescanProductInformation()}
+                featureFlags={featureFlags}
+                previewProduct={previewProduct}
+                previewInformationProduct={previewInformationProduct}
+                updateVariant={(patch) => updateVariant(previewIndex, patch)}
+                applyTextStyle={(textStyleId) => applyTextStyle(previewIndex, textStyleId)}
+                updateSubtitleY={(value) => updateSubtitleY(previewIndex, value)}
+                updateLetterboxEnabled={(enabled) => updateLetterboxEnabled(previewIndex, enabled)}
+                updateLetterboxHookEnabled={(enabled) => updateLetterboxHookEnabled(previewIndex, enabled)}
+                updateDynamicTextRole={(role, enabled) => updateDynamicTextRole(previewIndex, role, enabled)}
+                updateDynamicTextSetting={(role, patch) => updateDynamicTextSetting(previewIndex, role, patch)}
+                updatePreviewProduct={(productKey) => {
+                  setPreviewProduct(productKey);
+                  invalidateRenderedPreview();
+                }}
+                updatePreviewInformationProduct={(productKey) => {
+                  setPreviewInformationProduct(productKey);
+                  invalidateRenderedPreview();
+                }}
+                hookTypeAvailable={(hookType) => hookTypeAvailable(hookType, featureFlags)}
+                beforeAfterRelevant={usesBeforeAfterImage(previewVariant)}
               />
-            </div>
-            {previewVariant && (
-              <div className="single-preview-stack">
-                <div className="variation-preview-toolbar">
-                  <FilterField label="Preview variant">
-                    <select value={previewIndex} onChange={(event) => selectPreviewVariant(Number.parseInt(event.target.value, 10))}>
-                      {visibleVariants.map((variant, index) => (
-                        <option value={index} key={`preview-variant-${index}`}>
-                          V{index + 1} {variant.name || `Variant ${index + 1}`}
-                        </option>
-                      ))}
-                    </select>
-                  </FilterField>
-                  {previewVariant.visual_mode === "broll_audio" && (
-                    <FilterField label="Sample product">
-                      <select value={selectedBrollProduct?.product_key ?? ""} onChange={(event) => setPreviewProduct(event.target.value)}>
-                        {brollPreviewProducts.map((product) => (
-                          <option value={product.product_key} key={product.product_key}>
-                            {product.label} ({product.video_count})
-                          </option>
-                        ))}
-                      </select>
-                    </FilterField>
-                  )}
-                  <div className="preview-variant-meta">
-                    <span className="variant-index">V{previewIndex + 1}</span>
-                    <span>{variationLabel(previewVariant.visual_mode)} / {variationLabel(previewVariant.color_grade)} / {previewVariant.visual_mode === "broll_audio" ? "No host zoom" : previewVariant.product_zoom_enabled ? variationLabel(previewVariant.zoom_intensity) : "No product zoom"}</span>
-                  </div>
-                  <button className="secondary-button render-preview-button" disabled={busy === "preview"} onClick={renderPreview}>
-                    <RefreshCw size={15} aria-hidden="true" />
-                    {busy === "preview" ? "Rendering" : "Render preview"}
-                  </button>
-                </div>
-                <div className="single-preview-shell">
-                  <div
-                    className={`single-preview-frame grade-${previewVariant.color_grade} ${previewVariant.letterbox_enabled ? "has-bars" : ""} ${previewVariant.mirror_enabled ? "is-flipped" : ""}`}
-                    ref={previewFrameRef}
-                  >
-                    {renderedPreview?.previews[0]?.exists ? (
-                      <img className="generated-variation-preview" src={renderedPreview.previews[0].url} alt={`Rendered ${renderedPreview.previews[0].variant_name} preview`} />
-                    ) : previewVariant.visual_mode === "broll_audio" ? (
-                      selectedBrollProduct?.preview?.exists ? (
-                        <video src={selectedBrollProduct.preview.url} muted autoPlay loop playsInline />
-                      ) : (
-                        <div className="preview-placeholder preview-missing">
-                          <Video size={34} aria-hidden="true" />
-                          <strong>B-roll preview missing</strong>
-                          <span>{selectedBrollProduct?.folder ?? data.product_broll.root}</span>
-                        </div>
-                      )
-                    ) : data.preview_source.exists ? (
-                      <video src={data.preview_source.url} muted autoPlay loop playsInline />
-                    ) : (
-                      <div className="preview-placeholder preview-missing">
-                        <Video size={34} aria-hidden="true" />
-                        <strong>Preview asset missing</strong>
-                        <span>assets/variation_preview/raw_cut_preview.mp4</span>
-                      </div>
-                    )}
-                    {previewVariant.letterbox_enabled && (
-                      <>
-                        <div
-                          className="preview-blackbar top"
-                          style={{ height: `${clampNumber(previewVariant.letterbox_top_frac, 0, 0.4) * 100}%` }}
-                        />
-                        <div
-                          className="preview-blackbar bottom"
-                          style={{ height: `${clampNumber(previewVariant.letterbox_bottom_frac, 0, 0.4) * 100}%` }}
-                        />
-                        {previewVariant.letterbox_hook_enabled && previewVariant.letterbox_top_frac > 0 && (
-                          <div
-                            className="preview-letterbox-hook"
-                            style={{
-                              left: `${clampNumber(previewVariant.letterbox_hook_x_frac, 0, 1) * 100}%`,
-                              top: `${clampNumber(previewVariant.letterbox_top_frac, 0, 0.4) * clampNumber(previewVariant.letterbox_hook_y_frac, 0, 1) * 100}%`,
-                              color: previewVariant.letterbox_hook_font_color,
-                              fontSize: `${letterboxHookPreviewFontSize(previewVariant.letterbox_hook_font_size)}px`
-                            }}
-                          >
-                            Auto hook text
-                          </div>
-                        )}
-                      </>
-                    )}
-                    {usesBeforeAfterImage(previewVariant) && (
-                      <div className={`preview-before-after-card mode-${previewVariant.before_after_mode}`}>
-                        <strong>Before</strong>
-                        <span />
-                        <strong>After</strong>
-                      </div>
-                    )}
-                    {previewVariant.subtitle_enabled && (
-                      <button
-                        type="button"
-                        className="subtitle-drag-handle"
-                        style={{
-                          top: `${clampNumber(previewVariant.subtitle_y_frac, 0.08, 0.92) * 100}%`,
-                          color: previewVariant.font_color,
-                          borderColor: previewVariant.highlight_color,
-                          fontSize: `${subtitlePreviewFontSize(previewVariant.subtitle_size)}px`
-                        }}
-                        aria-label="Subtitle position"
-                        onPointerDown={startSubtitleDrag}
-                        onPointerMove={(event) => {
-                          if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-                            moveSubtitleFromPointer(event);
-                          }
-                        }}
-                      >
-                        <span style={{ color: previewVariant.highlight_color }}>Subtitle</span>
-                        <small>{Math.round(clampNumber(previewVariant.subtitle_y_frac, 0.08, 0.92) * 100)}%</small>
-                      </button>
-                    )}
-                  </div>
-                </div>
-                <div className="preview-adjustments">
-                  <PercentControl
-                    label="Top bar"
-                    value={previewVariant.letterbox_top_frac}
-                    max={0.4}
-                    disabled={!previewVariant.letterbox_enabled}
-                    onChange={(value) => updateVariant(previewIndex, { letterbox_top_frac: value })}
-                  />
-                  <PercentControl
-                    label="Bottom bar"
-                    value={previewVariant.letterbox_bottom_frac}
-                    max={0.4}
-                    disabled={!previewVariant.letterbox_enabled}
-                    onChange={(value) => updateVariant(previewIndex, { letterbox_bottom_frac: value })}
-                  />
-                  <PercentControl
-                    label="Subtitle Y"
-                    value={previewVariant.subtitle_y_frac}
-                    min={0.08}
-                    max={0.92}
-                    disabled={!previewVariant.subtitle_enabled}
-                    onChange={(value) => updateSubtitleY(previewIndex, value)}
-                  />
-                </div>
-              </div>
-            )}
-          </article>
-        </div>
+            </article>
+          )}
+          preview={(
+            <VariantPreviewPanel
+              variant={previewVariant}
+              variantIndex={previewIndex}
+              data={data}
+              informationData={informationData}
+              previewProduct={previewProduct}
+              renderedPreview={renderedPreview}
+              rendering={busy === "preview"}
+              feedback={previewFeedback}
+              mediaError={previewMediaError}
+              onRender={() => void renderPreview()}
+              onMediaError={setPreviewMediaError}
+              onMediaLoaded={() => setPreviewMediaError("")}
+            />
+          )}
+        />
+        <ConfirmDialog
+          open={presetLoadConfirmOpen}
+          title="Replace unsaved variation draft?"
+          detail="Loading this preset will replace your current unsaved edits. It will not apply the preset to future clips."
+          confirmLabel="Load preset"
+          danger
+          onConfirm={() => void loadPreset()}
+          onClose={() => setPresetLoadConfirmOpen(false)}
+        />
+        </>
       )}
     </section>
   );
 }
 
-function ColorField({ label, value, disabled = false, onChange }: { label: string; value: string; disabled?: boolean; onChange: (value: string) => void }) {
-  return (
-    <FilterField label={label}>
-      <div className="color-field">
-        <input type="color" value={value} disabled={disabled} onChange={(event) => onChange(event.target.value.toUpperCase())} />
-        <input value={value} disabled={disabled} onChange={(event) => onChange(event.target.value.toUpperCase())} maxLength={7} />
-      </div>
-    </FilterField>
-  );
-}
-
-function NumberControl({
-  label,
-  value,
-  min,
-  max,
-  unit,
-  disabled = false,
-  onChange
-}: {
-  label: string;
-  value: number;
-  min: number;
-  max: number;
-  unit: string;
-  disabled?: boolean;
-  onChange: (value: number) => void;
-}) {
-  const clamped = Math.round(clampNumber(value, min, max));
-  return (
-    <div className={`filter-field number-control ${disabled ? "control-disabled" : ""}`}>
-      <span>{label}</span>
-      <div className="number-control-row">
-        <input
-          type="range"
-          min={min}
-          max={max}
-          step={1}
-          value={clamped}
-          disabled={disabled}
-          onChange={(event) => onChange(Math.round(clampNumber(Number.parseInt(event.target.value || `${min}`, 10), min, max)))}
-        />
-        <input
-          type="number"
-          min={min}
-          max={max}
-          value={clamped}
-          disabled={disabled}
-          onChange={(event) => onChange(Math.round(clampNumber(Number.parseInt(event.target.value || `${min}`, 10), min, max)))}
-        />
-        <span>{unit}</span>
-      </div>
-    </div>
-  );
-}
-
-function PercentControl({
-  label,
-  value,
-  min = 0,
-  max = 1,
-  disabled = false,
-  onChange
-}: {
-  label: string;
-  value: number;
-  min?: number;
-  max?: number;
-  disabled?: boolean;
-  onChange: (value: number) => void;
-}) {
-  const clamped = clampNumber(value, min, max);
-  const percent = Math.round(clamped * 100);
-  const minPercent = Math.round(min * 100);
-  const maxPercent = Math.round(max * 100);
-  return (
-    <div className={`filter-field percent-control ${disabled ? "control-disabled" : ""}`}>
-      <span>{label}</span>
-      <div className="percent-control-row">
-        <input
-          type="range"
-          min={minPercent}
-          max={maxPercent}
-          step={1}
-          value={percent}
-          disabled={disabled}
-          onChange={(event) => onChange(clampNumber(Number.parseInt(event.target.value, 10) / 100, min, max))}
-        />
-        <input
-          type="number"
-          min={minPercent}
-          max={maxPercent}
-          step={1}
-          value={percent}
-          disabled={disabled}
-          aria-label={label}
-          onChange={(event) => onChange(clampNumber(Number.parseInt(event.target.value || "0", 10) / 100, min, max))}
-        />
-        <span>%</span>
-      </div>
-    </div>
-  );
-}
-
-function SegmentedField({ label, value, options, disabled = false, onChange }: { label: string; value: string; options: string[]; disabled?: boolean; onChange: (value: string) => void }) {
-  return (
-    <div className={`filter-field ${disabled ? "control-disabled" : ""}`}>
-      <span>{label}</span>
-      <div className="segmented-control">
-        {options.map((option) => (
-          <button className={value === option ? "active" : ""} disabled={disabled} key={option} onClick={() => onChange(option)}>
-            {variationLabel(option)}
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function ToggleField({ label, checked, disabled = false, onChange }: { label: string; checked: boolean; disabled?: boolean; onChange: (value: boolean) => void }) {
-  return (
-    <label className={`toggle-field ${disabled ? "control-disabled" : ""}`}>
-      <span>{label}</span>
-      <input type="checkbox" checked={checked} disabled={disabled} onChange={(event) => onChange(event.target.checked)} />
-    </label>
-  );
-}
-
-function ZoomField({ value, disabled = false, onChange }: { value: VariationVariant["zoom_intensity"]; disabled?: boolean; onChange: (value: VariationVariant["zoom_intensity"]) => void }) {
-  const index = Math.max(0, zoomSteps.indexOf(value));
-  return (
-    <div className={`filter-field ${disabled ? "control-disabled" : ""}`}>
-      <span>Zoom intensity</span>
-      <input type="range" min={0} max={zoomSteps.length - 1} step={1} value={index} disabled={disabled} onChange={(event) => onChange(zoomSteps[Number(event.target.value)] ?? "normal")} />
-      <div className="zoom-labels">
-        {zoomSteps.map((step) => <span key={step}>{variationLabel(step)}</span>)}
-      </div>
-    </div>
-  );
-}
-
 function copyProfile(profile: VariationProfile): VariationProfile {
   return JSON.parse(JSON.stringify(profile)) as VariationProfile;
+}
+
+function defaultDynamicTextSettings(
+  headlineFont: string,
+  bodyFont: string
+): VariationVariant["dynamic_text_settings"] {
+  return {
+    ingredients: { headline_font_id: headlineFont, body_font_id: bodyFont, font_size: 35, animation: "current", duration_seconds: 2.6 },
+    benefits: { headline_font_id: headlineFont, body_font_id: bodyFont, font_size: 35, animation: "current", duration_seconds: 2.6 },
+    usage: { headline_font_id: headlineFont, body_font_id: bodyFont, font_size: 35, animation: "current", duration_seconds: 2.6 },
+    cta: { headline_font_id: headlineFont, body_font_id: bodyFont, font_size: 50, animation: "current", duration_seconds: 1.3 }
+  };
+}
+
+function normalizeDynamicTextSettings(variant: VariationVariant): VariationVariant["dynamic_text_settings"] {
+  const defaults = defaultDynamicTextSettings(
+    variant.headline_font_id || variant.font_id || "",
+    variant.caption_font_id || variant.font_id || ""
+  );
+  const roles = Object.keys(defaults) as VariationVariant["dynamic_text_roles"];
+  return Object.fromEntries(roles.map((role) => {
+    const raw = variant.dynamic_text_settings?.[role];
+    const isCta = role === "cta";
+    return [role, {
+      ...defaults[role],
+      ...raw,
+      font_size: clampNumber(raw?.font_size ?? defaults[role].font_size, isCta ? 24 : 20, isCta ? 96 : 72),
+      duration_seconds: Math.round(clampNumber(raw?.duration_seconds ?? defaults[role].duration_seconds, 1, 6) * 10) / 10
+    }];
+  })) as VariationVariant["dynamic_text_settings"];
 }
 
 function normalizeUiProfile(profile: VariationProfile): VariationProfile {
@@ -4158,7 +4475,26 @@ function normalizeUiProfile(profile: VariationProfile): VariationProfile {
     ...variant,
     before_after_mode: "fullscreen",
     random_broll_enabled: variant.random_broll_enabled ?? false,
+    text_style_id: variant.text_style_id ?? "current",
+    headline_font_id: variant.headline_font_id || variant.font_id || "",
+    caption_font_id: variant.caption_font_id || variant.font_id || "",
     subtitle_size: variant.subtitle_size ?? "medium",
+    subtitle_stroke_color: variant.subtitle_stroke_color ?? "#000000",
+    subtitle_stroke_width: clampNumber(variant.subtitle_stroke_width ?? 3, 0, 12),
+    subtitle_highlight_enabled: variant.subtitle_highlight_enabled ?? true,
+    subtitle_animation: variant.subtitle_animation ?? "current",
+    headline_animation: variant.headline_animation ?? "current",
+    caption_animation: variant.caption_animation ?? "current",
+    headline_stroke_width: clampNumber(variant.headline_stroke_width ?? 5, 0, 12),
+    headline_shadow_color: variant.headline_shadow_color ?? "#000000",
+    headline_shadow_x: clampNumber(variant.headline_shadow_x ?? 3, -20, 20),
+    headline_shadow_y: clampNumber(variant.headline_shadow_y ?? 3, -20, 20),
+    headline_rotation_degrees: clampNumber(variant.headline_rotation_degrees ?? 0, -10, 10),
+    caption_stroke_width: clampNumber(variant.caption_stroke_width ?? 4, 0, 12),
+    dynamic_text_mode: variant.dynamic_text_mode ?? "balanced",
+    dynamic_text_roles: variant.dynamic_text_roles
+      ?? ["ingredients", "benefits", "usage", "cta"],
+    dynamic_text_settings: normalizeDynamicTextSettings(variant),
     letterbox_hook_enabled: variant.letterbox_hook_enabled ?? false,
     letterbox_hook_font_id: variant.letterbox_hook_font_id || variant.font_id || "",
     letterbox_hook_font_color: variant.letterbox_hook_font_color ?? "#FFFFFF",
@@ -4196,32 +4532,36 @@ function subtitlePositionFromY(value: number): VariationVariant["subtitle_positi
   return "bottom";
 }
 
-function subtitlePreviewFontSize(size: VariationVariant["subtitle_size"]): number {
-  if (size === "small") {
-    return 14;
-  }
-  if (size === "large") {
-    return 20;
-  }
-  return 17;
-}
-
-function letterboxHookPreviewFontSize(value: number): number {
-  return Math.round(clampNumber(value * 0.32, 12, 34));
-}
-
 function createUiVariant(index: number, base?: VariationVariant): VariationVariant {
+  const dynamicTextSettings = base
+    ? normalizeDynamicTextSettings(base)
+    : defaultDynamicTextSettings("", "");
   return {
     name: `Variant ${index + 1}`,
     hook_type: base?.hook_type ?? "text",
     visual_mode: base?.visual_mode ?? "host",
     random_broll_enabled: base?.visual_mode === "broll_audio" ? false : base?.random_broll_enabled ?? false,
     before_after_mode: base?.before_after_mode ?? "fullscreen",
+    text_style_id: base?.text_style_id ?? "current",
     font_id: base?.font_id ?? "",
+    headline_font_id: base?.headline_font_id || base?.font_id || "",
+    caption_font_id: base?.caption_font_id || base?.font_id || "",
     font_color: base?.font_color ?? "#FFFFFF",
     highlight_color: base?.highlight_color ?? "#FFD600",
     subtitle_position: base?.subtitle_position ?? "bottom",
     subtitle_size: base?.subtitle_size ?? "medium",
+    subtitle_stroke_color: base?.subtitle_stroke_color ?? "#000000",
+    subtitle_stroke_width: base?.subtitle_stroke_width ?? 3,
+    subtitle_highlight_enabled: base?.subtitle_highlight_enabled ?? true,
+    subtitle_animation: base?.subtitle_animation ?? "current",
+    headline_animation: base?.headline_animation ?? "current",
+    caption_animation: base?.caption_animation ?? "current",
+    headline_stroke_width: base?.headline_stroke_width ?? 5,
+    headline_shadow_color: base?.headline_shadow_color ?? "#000000",
+    headline_shadow_x: base?.headline_shadow_x ?? 3,
+    headline_shadow_y: base?.headline_shadow_y ?? 3,
+    headline_rotation_degrees: base?.headline_rotation_degrees ?? 0,
+    caption_stroke_width: base?.caption_stroke_width ?? 4,
     color_grade: base?.color_grade ?? "original",
     bgm_mode: base?.bgm_mode ?? "auto",
     bgm_path: base?.bgm_path ?? "",
@@ -4229,6 +4569,11 @@ function createUiVariant(index: number, base?: VariationVariant): VariationVaria
     zoom_intensity: base?.zoom_intensity ?? "normal",
     product_zoom_enabled: base?.product_zoom_enabled ?? true,
     subtitle_enabled: base?.subtitle_enabled ?? true,
+    dynamic_text_mode: base?.dynamic_text_mode ?? "balanced",
+    dynamic_text_roles: base?.dynamic_text_roles
+      ? [...base.dynamic_text_roles]
+      : ["ingredients", "benefits", "usage", "cta"],
+    dynamic_text_settings: JSON.parse(JSON.stringify(dynamicTextSettings)) as VariationVariant["dynamic_text_settings"],
     letterbox_enabled: false,
     mirror_enabled: base?.mirror_enabled ?? false,
     subtitle_y_frac: base?.subtitle_y_frac ?? subtitleYDefault(base?.subtitle_position ?? "bottom"),
@@ -4263,25 +4608,6 @@ function hookTypeAvailable(
   return true;
 }
 
-function variationLabel(value: string): string {
-  const labels: Record<string, string> = {
-    none: "None",
-    text: "Text",
-    before_after_image: "Before/After image",
-    text_before_after_image: "Text + Before/After image",
-    b_roll: "B-roll",
-    text_b_roll: "Text + B-roll",
-    transitional_hook: "Transitional Hook",
-    host: "Host",
-    broll_audio: "Audio over B-roll",
-    fullscreen: "Fullscreen",
-    small: "Small",
-    medium: "Medium",
-    large: "Large"
-  };
-  return labels[value] ?? String(value || "text").replace(/_/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
-}
-
 function JobsPage({ active }: { active: boolean }) {
   const params = new URLSearchParams(window.location.search);
   const initialJob = params.get("job") ?? "";
@@ -4304,7 +4630,7 @@ function JobsPage({ active }: { active: boolean }) {
     { cache: false }
   );
   const rows = jobs.envelope?.data.jobs ?? [];
-  const operations: ControlJob["operation"][] = ["queue_control", "settings_update", "settings_delete", "settings_reset", "rescore", "compliance_scan", "module_assembly", "export_batches", "module_review"];
+  const operations: ControlJob["operation"][] = ["queue_control", "settings_update", "settings_delete", "settings_reset", "rescore", "compliance_scan", "module_assembly", "export_batches", "module_review", "trend_refresh", "trend_download", "trend_analysis"];
 
   useEffect(() => { setOffset(0); }, [status, operation]);
 
@@ -4886,6 +5212,7 @@ function RoutedApp() {
         <Route path="/review" element={<Navigate to="/review/clips" replace />} />
         <Route path="/review/clips" element={<ClipReviewPage active />} />
         <Route path="/review/compliance" element={<CompliancePage active />} />
+        <Route path="/trends" element={<TrendsPage active />} />
         <Route path="/variants" element={<VariationsPage active />} />
         <Route path="/modules" element={<ModulesPage active />} />
         <Route path="/deliveries" element={<ExportsPage />} />

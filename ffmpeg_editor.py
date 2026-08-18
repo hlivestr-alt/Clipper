@@ -38,7 +38,9 @@
 from __future__ import annotations
 
 import json
+import copy
 import logging
+import math
 import os
 import random
 import re
@@ -47,11 +49,26 @@ import tempfile
 import threading
 import time
 import atexit
+from uuid import uuid4
 from pathlib import Path
 from typing import Any, Optional
+from types import SimpleNamespace
 
 from hook_text import ensure_hook_payload
 from utils import _format_rupiah_compact
+from whatsapp_media import (
+    MediaPolicy,
+    ProcessingAction,
+    RenderResult,
+    DeliveryComplianceResult,
+    calculate_bitrate_plan,
+    choose_final_fps,
+    probe_media,
+    full_decode,
+    retry_bitrate,
+    source_color_normalization_filters,
+    validate_delivery,
+)
 
 log = logging.getLogger("proya.ffmpeg_editor")
 
@@ -248,13 +265,15 @@ def cut_raw_clip(
     return _run_ffmpeg(cmd, output_path, timeout=180)
 
 
-def edit_clip(
+def _edit_clip_boolean(
     raw_clip_path: str,
     output_path: str,
     moment: dict,
     clip_words: list,
     product_events: list,
     cfg,
+    dynamic_text_plan: dict | None = None,
+    target_video_bps: int | None = None,
 ) -> bool:
     """
     Full edit pass — hardcodes all overlays, zoom, subtitles into output video.
@@ -437,7 +456,9 @@ def edit_clip(
             hook_format=hook_format,
             broll_visual_plan=broll_visual_plan,
             product_events=product_events,
+            dynamic_text_plan=dynamic_text_plan,
             cfg=cfg,
+            target_video_bps=target_video_bps,
         )
     finally:
         _NVENC_SEM.release()
@@ -449,6 +470,275 @@ def edit_clip(
                 pass
 
     return ok
+
+
+def render_clip(
+    raw_clip_path: str,
+    output_path: str,
+    moment: dict,
+    clip_words: list,
+    product_events: list,
+    cfg,
+    dynamic_text_plan: dict | None = None,
+) -> RenderResult:
+    """Render once to the delivery policy, validate, then publish atomically."""
+    try:
+        render_cfg = copy.copy(cfg)
+    except TypeError:
+        render_cfg = SimpleNamespace(
+            **{
+                name: getattr(cfg, name)
+                for name in dir(cfg)
+                if not name.startswith("__")
+            }
+        )
+    if bool(getattr(render_cfg, "BGM_ENABLED", False)) and not getattr(
+        render_cfg, "_bgm_path", None
+    ):
+        setattr(render_cfg, "_bgm_path", _pick_bgm(render_cfg) or "")
+    if bool(getattr(render_cfg, "BEFORE_AFTER_ENABLED", False)) and not getattr(
+        render_cfg, "_before_after_path", None
+    ):
+        setattr(
+            render_cfg,
+            "_before_after_path",
+            _pick_before_after(render_cfg) or "",
+        )
+    if _variant_hook_format(render_cfg) == "transitional_hook" and not getattr(
+        render_cfg, "_transitional_hook_path", None
+    ):
+        setattr(
+            render_cfg,
+            "_transitional_hook_path",
+            _pick_transitional_hook(render_cfg) or "",
+        )
+    if not bool(getattr(cfg, "WHATSAPP_DELIVERY_ENABLED", True)):
+        ok = _edit_clip_boolean(
+            raw_clip_path,
+            output_path,
+            moment,
+            clip_words,
+            product_events,
+            render_cfg,
+            dynamic_text_plan,
+        )
+        compliance = DeliveryComplianceResult(
+            compliant=bool(ok),
+            policy_revision="delivery-disabled",
+            action=ProcessingAction.DIRECT_RENDERED.value,
+            diagnostics={"delivery_validation_disabled": True},
+            failure_codes=[] if ok else ["render_failed"],
+        )
+        return RenderResult(
+            ok=bool(ok),
+            output_path=Path(output_path) if ok else None,
+            delivery_compliance=compliance,
+            failure_stage=None if ok else "render",
+            error_code=None if ok else "render_failed",
+        )
+
+    policy = MediaPolicy.from_config(render_cfg)
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging_root = destination.parent / "_tmp" / "render"
+    staging_root.mkdir(parents=True, exist_ok=True)
+    source_probe = probe_media(raw_clip_path)
+    expected_duration = source_probe.duration_seconds or 0.25
+    expected_duration /= max(
+        0.01, float(getattr(render_cfg, "_speed_ramp", 1.0) or 1.0)
+    )
+    validation_expected_duration = (
+        None
+        if _variant_hook_format(render_cfg) == "transitional_hook"
+        else expected_duration
+    )
+    base_plan = calculate_bitrate_plan(
+        expected_duration,
+        has_audio=source_probe.audio_stream_count > 0,
+        policy=policy,
+    )
+    target_bps = base_plan.target_video_bps
+    last_error = "render_failed"
+    last_compliance: DeliveryComplianceResult | None = None
+
+    for attempt in range(1, policy.max_encode_attempts + 1):
+        staged = staging_root / (
+            f"{destination.stem}.{os.getpid()}.{attempt}.{uuid4().hex}.mp4"
+        )
+        action = (
+            ProcessingAction.DIRECT_RENDERED
+            if attempt == 1
+            else ProcessingAction.RETRY_RENDERED
+        )
+        try:
+            ok = _edit_clip_boolean(
+                raw_clip_path,
+                str(staged),
+                moment,
+                clip_words,
+                product_events,
+                render_cfg,
+                dynamic_text_plan,
+                target_video_bps=target_bps,
+            )
+            if not ok:
+                last_error = "ffmpeg_render_failed"
+                continue
+            compliance = validate_delivery(
+                staged,
+                policy=policy,
+                action=action,
+                expected_duration=validation_expected_duration,
+                require_target_size=True,
+                decode=True,
+            )
+            compliance.diagnostics.update(
+                {
+                    "encoding_attempt_count": attempt,
+                    "target_video_bps": target_bps,
+                    "source_frame_rate": source_probe.avg_frame_rate
+                    or source_probe.r_frame_rate,
+                    "source_color_range": source_probe.color_range,
+                    "source_color_space": source_probe.color_space,
+                    "source_color_primaries": source_probe.color_primaries,
+                    "source_color_transfer": source_probe.color_transfer,
+                }
+            )
+            last_compliance = compliance
+            if compliance.compliant:
+                os.replace(staged, destination)
+                compliance.diagnostics["path"] = str(destination)
+                if bool(getattr(render_cfg, "WHATSAPP_RETAIN_MASTER", False)):
+                    master_root = destination.parent / "masters"
+                    master_tmp_root = master_root / "_tmp"
+                    master_tmp_root.mkdir(parents=True, exist_ok=True)
+                    master_stage = master_tmp_root / (
+                        f"{destination.stem}.{uuid4().hex}.mp4"
+                    )
+                    master_path = master_root / destination.name
+                    master_ok = _edit_clip_boolean(
+                        raw_clip_path,
+                        str(master_stage),
+                        moment,
+                        clip_words,
+                        product_events,
+                        render_cfg,
+                        dynamic_text_plan,
+                        target_video_bps=int(
+                            getattr(
+                                render_cfg,
+                                "WHATSAPP_MASTER_VIDEO_BITRATE_BPS",
+                                12_000_000,
+                            )
+                        ),
+                    )
+                    decode_ok, decode_error = (
+                        full_decode(master_stage) if master_ok else (False, "render_failed")
+                    )
+                    if master_ok and decode_ok:
+                        master_root.mkdir(parents=True, exist_ok=True)
+                        os.replace(master_stage, master_path)
+                        compliance.diagnostics.update(
+                            {
+                                "master_retained": True,
+                                "master_path": str(master_path),
+                                "master_size_bytes": master_path.stat().st_size,
+                            }
+                        )
+                    else:
+                        master_stage.unlink(missing_ok=True)
+                        compliance.diagnostics.update(
+                            {
+                                "master_retained": False,
+                                "master_error": decode_error,
+                            }
+                        )
+                return RenderResult(True, destination, compliance)
+            last_error = ",".join(compliance.failure_codes)
+            actual_size = staged.stat().st_size
+            if actual_size > policy.target_bytes:
+                target_bps = retry_bitrate(target_bps, actual_size, policy)
+            else:
+                from whatsapp_media import transcode_media
+
+                fallback_stage = staging_root / (
+                    f"{destination.stem}.{os.getpid()}.fallback.{uuid4().hex}.mp4"
+                )
+                try:
+                    fallback_process, fallback_plan = transcode_media(
+                        staged,
+                        fallback_stage,
+                        policy=policy,
+                    )
+                    if fallback_process.returncode == 0:
+                        fallback_compliance = validate_delivery(
+                            fallback_stage,
+                            policy=policy,
+                            action=ProcessingAction.FALLBACK_TRANSCODED,
+                            expected_duration=validation_expected_duration,
+                            require_target_size=True,
+                            decode=True,
+                        )
+                        fallback_compliance.diagnostics.update(
+                            {
+                                "encoding_attempt_count": attempt + 1,
+                                "target_video_bps": fallback_plan.target_video_bps,
+                                "fallback_source_failure_codes": compliance.failure_codes,
+                            }
+                        )
+                        if fallback_compliance.compliant:
+                            os.replace(fallback_stage, destination)
+                            fallback_compliance.diagnostics["path"] = str(destination)
+                            return RenderResult(
+                                True, destination, fallback_compliance
+                            )
+                        last_compliance = fallback_compliance
+                        last_error = ",".join(
+                            fallback_compliance.failure_codes
+                        )
+                    else:
+                        last_error = (
+                            fallback_process.stderr or "fallback transcode failed"
+                        )
+                finally:
+                    fallback_stage.unlink(missing_ok=True)
+                break
+        finally:
+            if staged.exists():
+                try:
+                    staged.unlink()
+                except OSError:
+                    pass
+
+    return RenderResult(
+        ok=False,
+        output_path=None,
+        delivery_compliance=last_compliance,
+        failure_stage="delivery_compliance",
+        error_code="delivery_validation_failed",
+        error_message=last_error,
+    )
+
+
+def edit_clip(
+    raw_clip_path: str,
+    output_path: str,
+    moment: dict,
+    clip_words: list,
+    product_events: list,
+    cfg,
+    dynamic_text_plan: dict | None = None,
+) -> bool:
+    """Deprecated compatibility wrapper; true means validated and published."""
+    return render_clip(
+        raw_clip_path,
+        output_path,
+        moment,
+        clip_words,
+        product_events,
+        cfg,
+        dynamic_text_plan,
+    ).ok
 
 
 def get_words_for_clip(all_words: list, clip_start: float, clip_end: float) -> list:
@@ -1037,7 +1327,9 @@ def _build_and_run(
     W, H, clip_duration, clip_fps, has_audio,
     moment, prod_trigger, face_zooms,
     zoom_dur, zoom_scale, hook_end,
-    extra_inputs, sfx_events, bgm_path, hook_format, broll_visual_plan, cfg, product_events=None,
+    extra_inputs, sfx_events, bgm_path, hook_format, broll_visual_plan, cfg,
+    product_events=None, dynamic_text_plan=None,
+    target_video_bps: int | None = None,
 ) -> bool:
     """
     Assemble -filter_complex string and run FFmpeg.
@@ -1054,8 +1346,15 @@ def _build_and_run(
     color_grade    = "" if variant_baked else getattr(cfg, "_color_grade_filter", "")
     crop_x_offset  = 0.0 if variant_baked else getattr(cfg, "_crop_x_offset", 0.0)
     zoom_trig_off  = getattr(cfg, "_zoom_trigger_offset",  0.0)
-    output_fps     = getattr(cfg, "OUTPUT_FPS", 30)
-    timeline_fps   = clip_fps if clip_fps and clip_fps > 1.0 else output_fps
+    media_policy = MediaPolicy.from_config(cfg)
+    source_media_probe = probe_media(raw_clip_path)
+    final_fps_fraction = choose_final_fps(
+        source_media_probe.r_frame_rate,
+        source_media_probe.avg_frame_rate,
+        max_fps=media_policy.max_fps,
+    )
+    output_fps = float(final_fps_fraction)
+    timeline_fps = output_fps
     hook_format    = _variant_hook_format(cfg, hook_format)
     profile_driven = bool(getattr(cfg, "_variation_profile_driven", False))
     broll_visual_active = broll_visual_plan is not None
@@ -1196,6 +1495,15 @@ def _build_and_run(
     # ── 1. Base video transforms ──────────────────────────────────────────────
     base_filters = []
 
+    if source_media_probe.color_conflict and not broll_visual_active:
+        log.error(
+            "Delivery render blocked by contradictory color metadata: %s",
+            raw_clip_path,
+        )
+        return False
+    if not broll_visual_active:
+        base_filters.extend(source_color_normalization_filters(source_media_probe))
+
     # Crop X offset
     if abs(crop_x_offset) > 0.005:
         crop_w = int(W * (1.0 - abs(crop_x_offset)))
@@ -1305,6 +1613,10 @@ def _build_and_run(
         hook_sc    = _css_to_ffmpeg_color(getattr(cfg, "HOOK_STROKE_COLOR", "black"))
         hook_shadow = _css_to_ffmpeg_color(getattr(cfg, "HOOK_SHADOW_COLOR", "#000000"))
         hook_accent = _css_to_ffmpeg_color(getattr(cfg, "HOOK_ACCENT_COLOR", "#FFD600"))
+        headline_animation = str(getattr(cfg, "_headline_animation", "current") or "current")
+        headline_rotation = float(getattr(cfg, "_headline_rotation_degrees", 0.0) or 0.0)
+        headline_shadow_x = int(getattr(cfg, "_headline_shadow_x", 3) or 0)
+        headline_shadow_y = int(getattr(cfg, "_headline_shadow_y", 3) or 0)
 
         if hook_headline:
             vid = _add_hook_text_block(
@@ -1312,6 +1624,7 @@ def _build_and_run(
                 vid=vid,
                 text=hook_headline,
                 frame_width=W,
+                frame_height=H,
                 font_path=hook_font,
                 font_size=int(getattr(cfg, "HOOK_TOP_FONTSIZE", hook_fs)),
                 font_color=_css_to_ffmpeg_color(getattr(cfg, "HOOK_COLOR", "white")),
@@ -1324,6 +1637,10 @@ def _build_and_run(
                 block_tag="vhooktop",
                 width_ratio=hook_layout["top_width"],
                 x_expr=hook_layout["top_x"],
+                animation=headline_animation,
+                rotation_degrees=headline_rotation,
+                shadow_x=headline_shadow_x,
+                shadow_y=headline_shadow_y,
             )
 
         if hook_subtext:
@@ -1332,6 +1649,7 @@ def _build_and_run(
                 vid=vid,
                 text=hook_subtext,
                 frame_width=W,
+                frame_height=H,
                 font_path=hook_font,
                 font_size=int(getattr(cfg, "HOOK_MID_FONTSIZE", max(58, hook_fs * 0.52))),
                 font_color=hook_accent,
@@ -1344,6 +1662,10 @@ def _build_and_run(
                 block_tag="vhookmid",
                 width_ratio=hook_layout["mid_width"],
                 x_expr=hook_layout["mid_x"],
+                animation=headline_animation,
+                rotation_degrees=headline_rotation,
+                shadow_x=headline_shadow_x,
+                shadow_y=headline_shadow_y,
             )
 
         if hook_cta:
@@ -1352,6 +1674,7 @@ def _build_and_run(
                 vid=vid,
                 text=hook_cta,
                 frame_width=W,
+                frame_height=H,
                 font_path=hook_font,
                 font_size=int(getattr(cfg, "HOOK_BOTTOM_FONTSIZE", max(82, hook_fs * 0.98))),
                 font_color=hook_accent,
@@ -1364,6 +1687,10 @@ def _build_and_run(
                 block_tag="vhookbtm",
                 width_ratio=hook_layout["bottom_width"],
                 x_expr=hook_layout["bottom_x"],
+                animation=headline_animation,
+                rotation_degrees=headline_rotation,
+                shadow_x=headline_shadow_x,
+                shadow_y=headline_shadow_y,
             )
 
     # ── 5. Product caption (drawtext above product bbox) ─────────────────────
@@ -1371,6 +1698,16 @@ def _build_and_run(
 
     if prod_trigger:
         vid = _add_product_caption_filters(fc, vid, prod_trigger, zoom_dur, W, H, cfg)
+
+    vid = _add_dynamic_text_filters(
+        fc,
+        vid,
+        dynamic_text_plan or {},
+        clip_duration,
+        W,
+        H,
+        cfg,
+    )
 
     # ── 6. Before/After overlay ───────────────────────────────────────────────
     # ── 7. Logo watermark ─────────────────────────────────────────────────────
@@ -1512,8 +1849,44 @@ def _build_and_run(
     preset = getattr(cfg, "OUTPUT_PRESET", "p1")
     if str(codec).endswith("_nvenc"):
         preset = getattr(cfg, "OUTPUT_NVENC_PRESET", preset)
-    fps    = output_fps
-    ab     = getattr(cfg, "OUTPUT_AUDIO_BITRATE", "128k")
+    fps = final_fps_fraction
+    ab = getattr(cfg, "WHATSAPP_AUDIO_BITRATE", "96k")
+
+    expected_output_duration = max(
+        0.25,
+        clip_duration / max(0.01, float(speed_ramp)),
+    )
+    bitrate_plan = calculate_bitrate_plan(
+        expected_output_duration,
+        has_audio=True,
+        policy=media_policy,
+    )
+    selected_video_bps = int(target_video_bps or bitrate_plan.target_video_bps)
+    maxrate_bps = max(selected_video_bps, int(selected_video_bps * 1.15))
+    bufsize_bps = max(selected_video_bps, selected_video_bps * 2)
+    use_720p = selected_video_bps < media_policy.threshold_720p_bps
+    max_width, max_height = ((720, 1280) if use_720p else (1080, 1920))
+    if W > H:
+        max_width, max_height = max_height, max_width
+    scale_ratio = min(1.0, max_width / max(2, W), max_height / max(2, H))
+    final_width = max(2, int(W * scale_ratio) // 2 * 2)
+    final_height = max(2, int(H * scale_ratio) // 2 * 2)
+    gop_frames = max(1, round(float(fps) * media_policy.gop_seconds))
+    h264_level = (
+        str(getattr(cfg, "WHATSAPP_LEVEL_720P", "3.2"))
+        if final_width * final_height <= 720 * 1280
+        else str(getattr(cfg, "WHATSAPP_LEVEL_1080P", "4.1"))
+    )
+
+    # Normalize the completed composition exactly once. Range conversion is
+    # performed by scale; explicit MP4/H.264 color tags below describe the
+    # resulting limited-range BT.709 delivery stream.
+    delivery_filter = (
+        f"scale={final_width}:{final_height}:flags=lanczos:out_range=tv,"
+        "setsar=1,format=yuv420p"
+    )
+    fc.append(f"{vid}{delivery_filter}[vdelivery]")
+    vid = "[vdelivery]"
 
     fc_clean = []
     if fc:
@@ -1536,18 +1909,43 @@ def _build_and_run(
     else:
         cmd += ["-map", aud]
 
-    cmd += ["-c:v", codec, "-preset", preset]
+    cmd += ["-c:v", codec]
 
     if codec.endswith("_nvenc"):
-        cq = getattr(cfg, "OUTPUT_CQ", 28)
-        cmd += ["-cq", str(cq), "-rc", "vbr", "-b:v", "0"]
+        cmd += [
+            "-preset", media_policy.nvenc_preset,
+            "-tune", media_policy.nvenc_tune,
+            "-rc", "vbr",
+            "-multipass", media_policy.nvenc_multipass,
+            "-spatial-aq", "1",
+            "-temporal-aq", "1",
+            "-aq-strength", "8",
+            "-b:v", str(selected_video_bps),
+            "-maxrate", str(maxrate_bps),
+            "-bufsize", str(bufsize_bps),
+        ]
     else:
-        crf = getattr(cfg, "OUTPUT_CRF", 23)
-        cmd += ["-crf", str(crf)]
+        cmd += [
+            "-preset", str(getattr(cfg, "OUTPUT_PRESET", "slow")),
+            "-b:v", str(selected_video_bps),
+            "-maxrate", str(maxrate_bps),
+            "-bufsize", str(bufsize_bps),
+        ]
 
     cmd += [
-        "-c:a", "aac", "-b:a", ab,
-        "-r", str(fps),
+        "-profile:v", "main",
+        "-level:v", h264_level,
+        "-bf", "0",
+        "-pix_fmt", "yuv420p",
+        "-r", f"{fps.numerator}/{fps.denominator}",
+        "-fps_mode", "cfr",
+        "-g", str(gop_frames),
+        "-color_range", "tv",
+        "-colorspace", "bt709",
+        "-color_primaries", "bt709",
+        "-color_trc", "bt709",
+        "-c:a", "aac", "-profile:a", "aac_low", "-b:a", ab,
+        "-ar", "48000",
         "-movflags", "+faststart",
         output_path,
     ]
@@ -1914,6 +2312,31 @@ def _add_before_after_overlay_filters(fc, vid, extra_inputs, clip_duration, W, H
 #  PRODUCT CAPTION VIA DRAWTEXT
 # =============================================================================
 
+def _caption_motion_options(animation: str, start_t: float, base_y: int) -> tuple[str, str, str]:
+    animation = str(animation or "current").strip().casefold()
+    if animation in {"staggered_reveal", "wipe"}:
+        duration = 0.18 if animation == "staggered_reveal" else 0.24
+        progress = f"min(1,max(0,(t-{start_t:.3f})/{duration:.3f}))"
+        x_expr = f"(w-text_w)/2-42*(1-({progress}))"
+        return x_expr, str(base_y), progress
+    if animation in {"fade_up", "slide_up"}:
+        duration = 0.28 if animation == "fade_up" else 0.20
+        distance = 24 if animation == "fade_up" else 58
+        progress = f"min(1,max(0,(t-{start_t:.3f})/{duration:.3f}))"
+        return "(w-text_w)/2", f"{base_y}+{distance}*(1-({progress}))", progress
+    return "(w-text_w)/2", str(base_y), "1"
+
+
+def _reference_product_caption_lines(product_name: str, brand_name: str) -> tuple[str, str]:
+    product = " ".join(str(product_name or "").upper().split())
+    brand_tokens = " ".join(str(brand_name or "PROYA").upper().split()).split()
+    brand = brand_tokens[0] if brand_tokens else "PROYA"
+    family = " ".join(brand_tokens[1:]).strip()
+    if family and product and product not in family and family not in product:
+        product = f"{family} {product}".strip()
+    return brand, product
+
+
 def _add_product_caption_filters(fc, vid, prod_trigger, zoom_dur, W, H, cfg) -> str:
     """Add product name + brand caption drawtext filters. Returns new vid label."""
     product_name = prod_trigger.get("product_name", "")
@@ -1923,13 +2346,15 @@ def _add_product_caption_filters(fc, vid, prod_trigger, zoom_dur, W, H, cfg) -> 
     t_start = prod_trigger["trigger_t"]
     t_end   = t_start + zoom_dur
 
+    text_style_id = str(getattr(cfg, "_text_style_id", "current") or "current").strip().casefold()
+    caption_animation = str(getattr(cfg, "_caption_animation", "current") or "current")
     font_path  = _font_file_with_fallback(getattr(cfg, "FONT_PRODUCT", ""))
     product_fs = getattr(cfg, "ZOOM_CAPTION_FONTSIZE", 80)
     brand_fs   = getattr(cfg, "ZOOM_CAPTION_BRAND_FONTSIZE", 0)
     txt_color  = _css_to_ffmpeg_color(getattr(cfg, "ZOOM_CAPTION_TEXT_COLOR",  "white"))
     brand_color = _css_to_ffmpeg_color(getattr(cfg, "ZOOM_CAPTION_BRAND_COLOR", "#FFD600"))
     stroke_c   = _css_to_ffmpeg_color(getattr(cfg, "ZOOM_CAPTION_STROKE_COLOR", "black"))
-    stroke_w   = getattr(cfg, "ZOOM_CAPTION_STROKE_WIDTH", 2)
+    stroke_w   = int(getattr(cfg, "_caption_stroke_width", getattr(cfg, "ZOOM_CAPTION_STROKE_WIDTH", 2)))
     caption_y_frac = float(getattr(cfg, "ZOOM_CAPTION_Y_POS", 0.10))
     text_x_expr = "(w-text_w)/2"
     text_y = max(40, int(H * caption_y_frac))
@@ -1938,26 +2363,80 @@ def _add_product_caption_filters(fc, vid, prod_trigger, zoom_dur, W, H, cfg) -> 
     safe_name = _escape_drawtext(product_name.upper())
 
     enable = f"between(t,{t_start:.2f},{t_end:.2f})"
+    brand_name = getattr(cfg, "BRAND_NAME", "PROYA 5X Vitamin C")
+
+    if text_style_id == "creator_bold_pop":
+        brand_text, product_text = _reference_product_caption_lines(product_name, brand_name)
+        brand_fs = brand_fs if brand_fs > 0 else max(34, int(product_fs * 0.48))
+        text_y = max(32, int(H * 0.055))
+        brand_x, brand_y, brand_alpha = _caption_motion_options(caption_animation, t_start, text_y)
+        product_start = t_start + 0.10
+        product_x, product_y, product_alpha = _caption_motion_options(
+            caption_animation,
+            product_start,
+            text_y + int(brand_fs * 1.08),
+        )
+        safe_brand = _escape_drawtext(brand_text)
+        safe_product = _escape_drawtext(product_text)
+        fc.append(
+            f"{vid}drawtext=text='{safe_brand}'{font_arg}"
+            f":fontsize={brand_fs}:fontcolor={txt_color}"
+            f":borderw={max(2, stroke_w - 2)}:bordercolor={stroke_c}"
+            f":x='{brand_x}':y='{brand_y}':alpha='{brand_alpha}'"
+            f":enable='{enable}'[vcapbrand]"
+        )
+        vid = "[vcapbrand]"
+        fc.append(
+            f"{vid}drawtext=text='{safe_product}'{font_arg}"
+            f":fontsize={product_fs}:fontcolor={txt_color}"
+            f":borderw={stroke_w}:bordercolor={stroke_c}"
+            f":x='{product_x}':y='{product_y}':alpha='{product_alpha}'"
+            f":enable='between(t,{product_start:.2f},{t_end:.2f})'[vcapproduct]"
+        )
+        descriptor = " ".join(str(getattr(cfg, "ZOOM_CAPTION_DESCRIPTOR", "") or "").split())
+        if descriptor:
+            descriptor_start = t_start + 0.20
+            descriptor_fs = max(24, int(product_fs * 0.28))
+            descriptor_x, descriptor_y, descriptor_alpha = _caption_motion_options(
+                caption_animation,
+                descriptor_start,
+                text_y + int(brand_fs * 1.08) + int(product_fs * 1.02),
+            )
+            fc.append(
+                f"[vcapproduct]drawtext=text='{_escape_drawtext(descriptor)}'{font_arg}"
+                f":fontsize={descriptor_fs}:fontcolor={txt_color}"
+                f":borderw={max(1, stroke_w - 3)}:bordercolor={stroke_c}"
+                f":x='{descriptor_x}':y='{descriptor_y}':alpha='{descriptor_alpha}'"
+                f":enable='between(t,{descriptor_start:.2f},{t_end:.2f})'[vcapdesc]"
+            )
+            return "[vcapdesc]"
+        return "[vcapproduct]"
 
     if product_fs > 0:
+        text_x_expr, animated_y, alpha_expr = _caption_motion_options(caption_animation, t_start, text_y)
         fc.append(
             f"{vid}drawtext=text='{safe_name}'{font_arg}"
             f":fontsize={product_fs}:fontcolor={txt_color}"
             f":borderw={stroke_w}:bordercolor={stroke_c}"
-            f":x={text_x_expr}:y={text_y}"
+            f":x='{text_x_expr}':y='{animated_y}':alpha='{alpha_expr}'"
             f":enable='{enable}'[vcap1]"
         )
         vid = "[vcap1]"
 
-    brand_name = getattr(cfg, "BRAND_NAME", "PROYA 5X Vitamin C")
     if brand_fs > 0 and brand_name:
         safe_brand = _escape_drawtext(brand_name.upper())
+        brand_start = t_start + (0.10 if caption_animation != "current" else 0.0)
+        brand_x, brand_y, brand_alpha = _caption_motion_options(
+            caption_animation,
+            brand_start,
+            text_y + int(product_fs * 1.2),
+        )
         fc.append(
             f"{vid}drawtext=text='{safe_brand}'{font_arg}"
             f":fontsize={brand_fs}:fontcolor={brand_color}"
             f":borderw=1:bordercolor={stroke_c}"
-            f":x={text_x_expr}:y={text_y + int(product_fs * 1.2)}"
-            f":enable='{enable}'[vcap2]"
+            f":x='{brand_x}':y='{brand_y}':alpha='{brand_alpha}'"
+            f":enable='between(t,{brand_start:.2f},{t_end:.2f})'[vcap2]"
         )
         vid = "[vcap2]"
 
@@ -2314,10 +2793,21 @@ def _plan_face_zooms(clip_words, face_events, clip_duration, prod_trigger, hook_
 def _chunk_words(clip_words: list, words_per_chunk: int = 4) -> list[list]:
     """Group words into chunks of N for subtitle display."""
     chunks = []
-    i = 0
-    while i < len(clip_words):
-        chunks.append(clip_words[i:i+words_per_chunk])
-        i += words_per_chunk
+    current = []
+    current_group = None
+    for word in clip_words:
+        group = word.get("_subtitle_group") if isinstance(word, dict) else None
+        if current and (
+            (group is None and len(current) >= words_per_chunk)
+            or (group is not None and current_group is not None and group != current_group)
+        ):
+            chunks.append(current)
+            current = []
+        if not current:
+            current_group = group
+        current.append(word)
+    if current:
+        chunks.append(current)
     return chunks
 
 
@@ -2910,6 +3400,13 @@ def _plan_emoji_overlays(clip_words: list, clip_duration: float, W: int, H: int,
 
 
 def _pick_before_after(cfg) -> Optional[str]:
+    selected = str(getattr(cfg, "_before_after_path", "") or "").strip()
+    if selected:
+        selected_path = _existing_file(selected)
+        if selected_path:
+            return str(selected_path)
+        log.warning("Selected before/after image is missing: %s", selected)
+        return None
     ba_dir = _existing_dir(getattr(cfg, "BEFORE_AFTER_DIR", "assets/before_after"))
     if not ba_dir:
         log.warning("Before/after folder not found: %s", getattr(cfg, "BEFORE_AFTER_DIR", "assets/before_after"))
@@ -3138,11 +3635,80 @@ def _split_hook_text_lines(text: str, max_chars_per_line: int = 18) -> list[str]
     return best_lines[:2]
 
 
+def _headline_animation_options(
+    animation: str,
+    font_size: int,
+    line_y: int,
+    start_t: float,
+) -> tuple[str, str, str]:
+    """Return drawtext fontsize, alpha, and Y expressions for a headline entrance."""
+    animation = str(animation or "current").strip().casefold()
+    if animation == "pop_overshoot":
+        return str(font_size), "1", str(line_y)
+    if animation == "soft_pop":
+        return str(font_size), "1", str(line_y)
+    if animation == "punch":
+        return str(font_size), "1", str(line_y)
+    if animation in {"fade_up", "slide_up"}:
+        duration = 0.28 if animation == "fade_up" else 0.20
+        distance = 28 if animation == "fade_up" else 64
+        end_t = start_t + duration
+        progress = f"min(1,max(0,(t-{start_t:.3f})/{duration:.3f}))"
+        alpha = progress
+        return str(font_size), alpha, f"{line_y}+{distance}*(1-({progress}))"
+    return str(font_size), "1", str(line_y)
+
+
+def _headline_animation_segments(
+    animation: str,
+    font_size: int,
+    line_y: int,
+    start_t: float,
+    end_t: float,
+) -> list[tuple[int, float, float, str, str]]:
+    """Use fixed-size entrance steps to avoid unstable dynamic drawtext font sizing."""
+    animation = str(animation or "current").strip().casefold()
+    if animation == "pop_overshoot":
+        cuts = (
+            (0.72, start_t, min(end_t, start_t + 0.07)),
+            (1.40, start_t + 0.07, min(end_t, start_t + 0.16)),
+            (0.92, start_t + 0.16, min(end_t, start_t + 0.26)),
+            (1.00, start_t + 0.26, end_t),
+        )
+    elif animation == "soft_pop":
+        cuts = (
+            (0.84, start_t, min(end_t, start_t + 0.10)),
+            (1.07, start_t + 0.10, min(end_t, start_t + 0.19)),
+            (1.00, start_t + 0.19, end_t),
+        )
+    elif animation == "punch":
+        cuts = (
+            (1.28, start_t, min(end_t, start_t + 0.12)),
+            (1.00, start_t + 0.12, end_t),
+        )
+    else:
+        fontsize, alpha, y_expr = _headline_animation_options(animation, font_size, line_y, start_t)
+        return [(max(1, int(float(fontsize))), start_t, end_t, alpha, y_expr)]
+
+    segments = []
+    for scale, segment_start, segment_end in cuts:
+        if segment_end <= segment_start:
+            continue
+        alpha = (
+            f"min(1,max(0,(t-{start_t:.3f})/0.06))"
+            if segment_start == start_t
+            else "1"
+        )
+        segments.append((max(1, int(round(font_size * scale))), segment_start, segment_end, alpha, str(line_y)))
+    return segments
+
+
 def _add_hook_text_block(
     fc: list[str],
     vid: str,
     text: str,
     frame_width: int,
+    frame_height: int,
     font_path: str | Path | None,
     font_size: int,
     font_color: str,
@@ -3155,6 +3721,10 @@ def _add_hook_text_block(
     block_tag: str,
     width_ratio: float = 0.9,
     x_expr: str = "(w-text_w)/2",
+    animation: str = "current",
+    rotation_degrees: float = 0.0,
+    shadow_x: int = 3,
+    shadow_y: int = 3,
 ) -> str:
     clean_text = " ".join(str(text or "").upper().split())
     if not clean_text:
@@ -3172,16 +3742,329 @@ def _add_hook_text_block(
         safe_hook = _escape_drawtext(line)
         line_y = first_line_y + (idx - 1) * line_gap_px
         line_tag = f"{block_tag}{idx}"
-        fc.append(
-            f"{vid}drawtext=text='{safe_hook}'{font_arg}"
-            f":fontsize={draw_fs}:fontcolor={font_color}"
-            f":borderw={stroke_width}:bordercolor={stroke_color}"
-            f":shadowcolor={shadow_color}:shadowx=3:shadowy=3"
-            f":x={x_expr}:y={line_y}"
-            f":enable='between(t,{start_t:.2f},{end_t:.2f})'[{line_tag}]"
+        fit_fs = int((frame_width * width_ratio * 0.94) / max(len(line) * 0.72, 1.0))
+        line_draw_fs = max(28, min(draw_fs, fit_fs))
+        segments = _headline_animation_segments(
+            animation,
+            line_draw_fs,
+            line_y,
+            start_t,
+            end_t,
         )
+        if abs(float(rotation_degrees or 0.0)) > 0.01:
+            layer = f"{line_tag}layer"
+            rotated = f"{line_tag}rot"
+            fc.append(
+                f"color=c=black@0.0:s={frame_width}x{frame_height}:d={max(end_t, 0.1):.3f},"
+                f"format=rgba[{layer}]"
+            )
+            current_layer = f"[{layer}]"
+            for segment_index, (segment_fs, segment_start, segment_end, alpha_expr, y_expr) in enumerate(segments):
+                drawn = f"{line_tag}draw{segment_index}"
+                fc.append(
+                    f"{current_layer}drawtext=text='{safe_hook}'{font_arg}"
+                    f":fontsize={segment_fs}:fontcolor={font_color}"
+                    f":borderw={stroke_width}:bordercolor={stroke_color}"
+                    f":shadowcolor={shadow_color}:shadowx={shadow_x}:shadowy={shadow_y}"
+                    f":x={x_expr}:y='{y_expr}':alpha='{alpha_expr}'"
+                    f":enable='between(t,{segment_start:.3f},{segment_end:.3f})'[{drawn}]"
+                )
+                current_layer = f"[{drawn}]"
+            angle = float(rotation_degrees) * math.pi / 180.0
+            fc.append(f"{current_layer}rotate={angle:.8f}:fillcolor=none:ow=iw:oh=ih[{rotated}]")
+            fc.append(
+                f"{vid}[{rotated}]overlay=x=0:y=0:"
+                f"enable='between(t,{start_t:.2f},{end_t:.2f})'[{line_tag}]"
+            )
+        else:
+            current_vid = vid
+            for segment_index, (segment_fs, segment_start, segment_end, alpha_expr, y_expr) in enumerate(segments):
+                drawn = line_tag if segment_index == len(segments) - 1 else f"{line_tag}draw{segment_index}"
+                fc.append(
+                    f"{current_vid}drawtext=text='{safe_hook}'{font_arg}"
+                    f":fontsize={segment_fs}:fontcolor={font_color}"
+                    f":borderw={stroke_width}:bordercolor={stroke_color}"
+                    f":shadowcolor={shadow_color}:shadowx={shadow_x}:shadowy={shadow_y}"
+                    f":x={x_expr}:y='{y_expr}':alpha='{alpha_expr}'"
+                    f":enable='between(t,{segment_start:.3f},{segment_end:.3f})'[{drawn}]"
+                )
+                current_vid = f"[{drawn}]"
         vid = f"[{line_tag}]"
 
+    return vid
+
+
+def _resolved_dynamic_items(plan: dict, cfg) -> list[dict]:
+    items = [
+        item
+        for item in (plan.get("items", []) if isinstance(plan, dict) else [])
+        if isinstance(item, dict)
+    ]
+    if not items:
+        return []
+    try:
+        from dynamic_text import resolve_dynamic_text_layout
+
+        return resolve_dynamic_text_layout(
+            items,
+            clip_id=str(plan.get("clip_id") or plan.get("product_key") or ""),
+            variant_index=int(getattr(cfg, "_variant_index", 0) or 0),
+            subtitle_position=str(getattr(cfg, "_variant_subtitle_position", "bottom") or "bottom"),
+            letterbox_top_frac=float(getattr(cfg, "_letterbox_top_frac", 0.0) or 0.0),
+            letterbox_bottom_frac=float(getattr(cfg, "_letterbox_bottom_frac", 0.0) or 0.0),
+        )
+    except Exception:
+        return items
+
+
+def _wrap_dynamic_display_text(text: str, max_chars: int) -> list[str]:
+    words = str(text or "").split()
+    if not words:
+        return []
+    rows: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if current and len(candidate) > max(8, int(max_chars)):
+            rows.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        rows.append(current)
+    return rows
+
+
+def _dynamic_band_center(band: str, frame_height: int, cfg) -> int:
+    centers = {"upper": 0.24, "middle": 0.48, "lower": 0.70}
+    center = float(centers.get(str(band or "").casefold(), 0.48))
+    letterbox_enabled = bool(getattr(cfg, "_letterbox_enabled", False))
+    top_frac = float(getattr(cfg, "_letterbox_top_frac", 0.0) or 0.0) if letterbox_enabled else 0.0
+    bottom_frac = float(getattr(cfg, "_letterbox_bottom_frac", 0.0) or 0.0) if letterbox_enabled else 0.0
+    top_safe = max(0.08, min(0.44, top_frac + 0.055))
+    bottom_safe = min(0.86, max(0.56, 1.0 - bottom_frac - 0.075))
+    return int(frame_height * max(top_safe, min(bottom_safe, center)))
+
+
+def _dynamic_role_setting(cfg, item: dict) -> dict:
+    role = str(item.get("content_role") or ("cta" if item.get("role") == "closing_cta" else ""))
+    settings = getattr(cfg, "_dynamic_text_settings", {})
+    raw = settings.get(role) if isinstance(settings, dict) else None
+    return raw if isinstance(raw, dict) else {}
+
+
+def _render_dynamic_side_item(
+    fc: list[str],
+    vid: str,
+    item: dict,
+    item_index: int,
+    start_t: float,
+    end_t: float,
+    frame_width: int,
+    frame_height: int,
+    cfg,
+    *,
+    headline_font_arg: str,
+    body_font_arg: str,
+    check_font_arg: str,
+    check_font: str | None,
+    white: str,
+    accent: str,
+    green: str,
+    stroke: str,
+    shadow: str,
+) -> str:
+    role = str(item.get("role") or "fact_badge")
+    headline = " ".join(str(item.get("headline") or "").split())
+    text = " ".join(str(item.get("text") or "").split())
+    lines = [" ".join(str(line).split()) for line in item.get("lines", []) or [] if str(line).strip()]
+    layout = item.get("layout") if isinstance(item.get("layout"), dict) else {}
+    side = str(layout.get("side") or ("left" if item_index % 2 else "right")).casefold()
+    band = str(layout.get("band") or "middle").casefold()
+    width_ratio = max(0.38, min(0.42, float(layout.get("max_width_ratio") or 0.40)))
+    font_scale = max(0.82, min(1.0, float(layout.get("font_scale") or 0.94)))
+    role_setting = _dynamic_role_setting(cfg, item)
+    configured_size = role_setting.get("font_size")
+    animation = str(role_setting.get("animation") or "current")
+    scale = max(0.20, frame_height / 1920.0)
+    margin = max(8, int(frame_width * 0.065))
+    slide_distance = max(12, int(frame_width * 0.045))
+    shadow_offset = max(1, int(round(2 * scale)))
+    max_width = max(80, int(frame_width * width_ratio))
+    from dynamic_text import dynamic_text_typography
+
+    typography = dynamic_text_typography(frame_height, role, font_scale, configured_size)
+    headline_size = typography["headline"]
+    body_size = typography["body"]
+    if role == "closing_cta":
+        headline = text or headline
+        text = ""
+        lines = []
+
+    headline_chars = max(9, int(max_width / max(1.0, headline_size * 0.56)))
+    body_chars = max(10, int(max_width / max(1.0, body_size * 0.55)))
+    column_x = frame_width - margin - max_width if side == "right" else margin
+
+    def column_x_expr(progress: str, indent: int = 0) -> str:
+        direction = "+" if side == "right" else "-"
+        return f"{column_x + indent}{direction}{slide_distance}*(1-({progress}))"
+
+    def animated_position(progress: str, base_y: int, indent: int = 0) -> tuple[str, str, str]:
+        if animation in {"fade_up", "slide_up"}:
+            distance = max(10, int(frame_height * (0.014 if animation == "slide_up" else 0.010)))
+            return str(column_x + indent), f"{base_y}+{distance}*(1-({progress}))", progress
+        if animation == "staggered_reveal":
+            return str(column_x + indent), str(base_y), progress
+        if animation == "wipe":
+            direction = "+" if side == "right" else "-"
+            return f"{column_x + indent}{direction}{max(8, slide_distance // 2)}*(1-({progress}))", str(base_y), progress
+        return column_x_expr(progress, indent), str(base_y), progress
+
+    headline_rows = _wrap_dynamic_display_text(headline, headline_chars)
+    body_rows: list[tuple[str, bool, int]] = []
+    if role == "checklist" and lines:
+        for fact_index, fact in enumerate(lines[:3]):
+            wrapped = _wrap_dynamic_display_text(fact, max(8, body_chars - 2))
+            body_rows.extend(
+                (row, row_index == 0, fact_index)
+                for row_index, row in enumerate(wrapped)
+            )
+    else:
+        for body_value in ([text] if text else []) + lines[:1]:
+            body_rows.extend(
+                (row, False, 0)
+                for row in _wrap_dynamic_display_text(body_value, body_chars)
+            )
+
+    headline_line_height = max(19, int(headline_size * 1.16))
+    body_line_height = max(16, int(body_size * 1.24))
+    headline_height = len(headline_rows) * headline_line_height
+    body_gap = max(5, int(14 * scale)) if headline_rows and body_rows else 0
+    total_height = max(
+        headline_line_height,
+        headline_height + body_gap + len(body_rows) * body_line_height,
+    )
+    center_y = _dynamic_band_center(band, frame_height, cfg)
+    top_y = max(0, center_y - total_height // 2)
+    block_tag = f"vdyn{item_index}"
+
+    for row_index, row in enumerate(headline_rows):
+        row_start = min(end_t - 0.12, start_t + row_index * 0.06)
+        progress = f"min(1,max(0,(t-{row_start:.3f})/0.18))"
+        row_y = top_y + row_index * headline_line_height
+        x_expr, y_expr, alpha_expr = animated_position(progress, row_y)
+        text_tag = f"{block_tag}head{row_index}"
+        fc.append(
+            f"{vid}drawtext=text='{_escape_drawtext(row)}'{headline_font_arg}:"
+            f"fontsize={headline_size}:fontcolor={accent}:borderw={max(1, int(3 * scale))}:"
+            f"bordercolor={stroke}:shadowcolor={shadow}:shadowx={shadow_offset}:shadowy={shadow_offset}:"
+            f"x='{x_expr}':y='{y_expr}':alpha='{alpha_expr}':"
+            f"enable='between(t,{row_start:.3f},{end_t:.3f})'[{text_tag}]"
+        )
+        vid = f"[{text_tag}]"
+
+    body_y = top_y + headline_height + body_gap
+    reveal_offsets = item.get("reveal_offsets", []) if isinstance(item.get("reveal_offsets"), list) else []
+    for line_index, (line, first_fact_row, fact_index) in enumerate(body_rows):
+        if role == "checklist":
+            reveal_offset = (
+                float(reveal_offsets[fact_index])
+                if fact_index < len(reveal_offsets)
+                else fact_index * 0.22
+            )
+            line_start = min(end_t - 0.12, start_t + 0.12 + reveal_offset)
+        else:
+            line_start = min(end_t - 0.12, start_t + 0.12 + line_index * 0.10)
+        progress = f"min(1,max(0,(t-{line_start:.3f})/0.18))"
+        line_y = body_y + line_index * body_line_height
+        text_indent = body_size if role == "checklist" else 0
+        if role == "checklist" and first_fact_row:
+            check_tag = f"{block_tag}check{line_index}"
+            check_symbol = "\u2713" if check_font else "+"
+            check_x = str(column_x)
+            fc.append(
+                f"{vid}drawtext=text='{_escape_drawtext(check_symbol)}'{check_font_arg}:"
+                f"fontsize={body_size + max(2, int(5 * scale))}:fontcolor={green}:"
+                f"borderw={max(1, int(1.5 * scale))}:bordercolor={stroke}:"
+                f"x='{check_x}':y={line_y}:alpha='{progress}':"
+                f"enable='between(t,{line_start:.3f},{end_t:.3f})'[{check_tag}]"
+            )
+            vid = f"[{check_tag}]"
+        text_tag = f"{block_tag}body{line_index}"
+        x_expr, y_expr, alpha_expr = animated_position(progress, line_y, text_indent)
+        fc.append(
+            f"{vid}drawtext=text='{_escape_drawtext(line)}'{body_font_arg}:"
+            f"fontsize={body_size}:fontcolor={white}:borderw={max(1, int(2 * scale))}:"
+            f"bordercolor={stroke}:shadowcolor={shadow}:shadowx={shadow_offset}:shadowy={shadow_offset}:"
+            f"x='{x_expr}':y='{y_expr}':alpha='{alpha_expr}':"
+            f"enable='between(t,{line_start:.3f},{end_t:.3f})'[{text_tag}]"
+        )
+        vid = f"[{text_tag}]"
+    return vid
+
+
+def _add_dynamic_text_filters(
+    fc: list[str],
+    vid: str,
+    plan: dict,
+    clip_duration: float,
+    frame_width: int,
+    frame_height: int,
+    cfg,
+) -> str:
+    items = _resolved_dynamic_items(plan, cfg)
+    if not items:
+        return vid
+
+    headline_font = _font_file_with_fallback(
+        getattr(cfg, "FONT_HOOK", ""),
+        getattr(cfg, "FONT_HOOK_FALLBACKS", []),
+    )
+    body_font = _existing_file(getattr(cfg, "FONT_PRODUCT", "")) or headline_font
+    check_font = _existing_file(r"C:\Windows\Fonts\seguisym.ttf") or body_font
+    headline_font_arg = f":fontfile='{_escape_drawtext_path(headline_font)}'" if headline_font else ""
+    body_font_arg = f":fontfile='{_escape_drawtext_path(body_font)}'" if body_font else ""
+    check_font_arg = f":fontfile='{_escape_drawtext_path(check_font)}'" if check_font else ""
+    white = _css_to_ffmpeg_color(getattr(cfg, "_variant_font_color", "#FFFFFF"))
+    accent = _css_to_ffmpeg_color(getattr(cfg, "_variant_highlight_color", "#FFD600"))
+    green = _css_to_ffmpeg_color("#32D583")
+    stroke = _css_to_ffmpeg_color("#000000")
+    shadow = _css_to_ffmpeg_color(getattr(cfg, "HOOK_SHADOW_COLOR", "#000000"))
+
+    for item_index, item in enumerate(items, start=1):
+        start_t = max(0.0, min(float(item.get("start") or 0.0), clip_duration))
+        end_t = max(start_t, min(float(item.get("end") or start_t), clip_duration))
+        if end_t <= start_t + 0.2:
+            continue
+        role_setting = _dynamic_role_setting(cfg, item)
+        role_headline_font = _existing_file(str(role_setting.get("headline_font_id") or "")) or headline_font
+        role_body_font = _existing_file(str(role_setting.get("body_font_id") or "")) or body_font
+        role_headline_font_arg = (
+            f":fontfile='{_escape_drawtext_path(role_headline_font)}'" if role_headline_font else ""
+        )
+        role_body_font_arg = (
+            f":fontfile='{_escape_drawtext_path(role_body_font)}'" if role_body_font else ""
+        )
+        vid = _render_dynamic_side_item(
+            fc,
+            vid,
+            item,
+            item_index,
+            start_t,
+            end_t,
+            frame_width,
+            frame_height,
+            cfg,
+            headline_font_arg=role_headline_font_arg,
+            body_font_arg=role_body_font_arg,
+            check_font_arg=check_font_arg,
+            check_font=check_font,
+            white=white,
+            accent=accent,
+            green=green,
+            stroke=stroke,
+            shadow=shadow,
+        )
     return vid
 
 
@@ -3246,12 +4129,25 @@ def _tail_temp_file(path: str | None, limit: int = 500) -> str:
 
 def _cpu_encode_fallback_cmd(cmd: list, cfg) -> list:
     fallback = list(cmd)
-    remove_next_for = {"-cq", "-rc", "-b:v"}
+    remove_next_for = {
+        "-cq",
+        "-rc",
+        "-tune",
+        "-multipass",
+        "-spatial-aq",
+        "-temporal-aq",
+        "-aq-strength",
+    }
     cleaned = []
     skip_next = False
-    for item in fallback:
+    removed_zero_bitrate = False
+    for index, item in enumerate(fallback):
         if skip_next:
             skip_next = False
+            continue
+        if item == "-b:v" and index + 1 < len(fallback) and fallback[index + 1] == "0":
+            skip_next = True
+            removed_zero_bitrate = True
             continue
         if item in remove_next_for:
             skip_next = True
@@ -3270,7 +4166,7 @@ def _cpu_encode_fallback_cmd(cmd: list, cfg) -> list:
     except (ValueError, IndexError):
         cleaned.extend(["-preset", "fast"])
 
-    if "-crf" not in cleaned:
+    if removed_zero_bitrate and "-crf" not in cleaned:
         output_path = cleaned[-1] if cleaned else None
         crf = str(getattr(cfg, "OUTPUT_CRF", 23))
         if output_path:

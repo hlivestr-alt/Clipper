@@ -277,6 +277,7 @@ def check_compliance(
     lm_client: Any | None = None,
     lm_callable: Callable[[list[dict[str, str]], Any], str] | None = None,
     call_lm: bool = True,
+    overlay_text: str | dict | list | None = None,
 ) -> dict[str, Any]:
     """Check one clip transcript and return a JSON-serializable compliance result."""
     if cfg is None:
@@ -288,7 +289,12 @@ def check_compliance(
     transcript_text, word_spans = transcript_to_text_with_spans(transcript)
     transcript_text = " ".join(transcript_text.split())
     hook_display_text = hook_to_text(hook_text)
-    combined_text, sections = _combined_text_sections(transcript_text, hook_display_text)
+    overlay_display_text = hook_to_text(overlay_text)
+    combined_text, sections = _combined_text_sections(
+        transcript_text,
+        hook_display_text,
+        overlay_display_text,
+    )
     keyword_matches = pre_scan_keywords(combined_text)
     _annotate_keyword_matches(keyword_matches, sections)
     now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -300,12 +306,13 @@ def check_compliance(
             violations=[],
             cleaned_transcript=transcript_text,
             cleaned_hook_text=hook_display_text,
+            cleaned_overlay_text=overlay_display_text,
             auto_fixed=False,
             source="keyword_prescan",
             qwen_called=False,
             keyword_matches=[],
             checked_at=now,
-            checked_fields=_checked_fields(transcript_text, hook_display_text),
+            checked_fields=_checked_fields(transcript_text, hook_display_text, overlay_display_text),
         )
 
     keyword_violations = keyword_scan_violations(combined_text)
@@ -352,20 +359,29 @@ def check_compliance(
         auto_fix=bool(getattr(cfg, "COMPLIANCE_AUTO_FIX", True)) if cfg is not None else True,
         qwen_cleaned="",
     )
+    cleaned_overlay_text, overlay_auto_fixed = build_cleaned_field_text(
+        overlay_display_text,
+        merged_violations,
+        source_field="overlay",
+        field_offset=_section_offset(sections, "overlay"),
+        auto_fix=bool(getattr(cfg, "COMPLIANCE_AUTO_FIX", True)) if cfg is not None else True,
+        qwen_cleaned="",
+    )
     result = _finalize_result(
         transcript_text=transcript_text,
         hook_text=hook_display_text,
         violations=merged_violations,
         cleaned_transcript=cleaned_transcript,
         cleaned_hook_text=cleaned_hook_text,
-        auto_fixed=transcript_auto_fixed or hook_auto_fixed,
+        cleaned_overlay_text=cleaned_overlay_text,
+        auto_fixed=transcript_auto_fixed or hook_auto_fixed or overlay_auto_fixed,
         source="qwen_keyword" if qwen_called else "keyword_fallback",
         qwen_called=qwen_called,
         keyword_matches=keyword_matches,
         checked_at=now,
         qwen_error=qwen_error,
         compliance_summary=qwen_summary,
-        checked_fields=_checked_fields(transcript_text, hook_display_text),
+        checked_fields=_checked_fields(transcript_text, hook_display_text, overlay_display_text),
     )
     if word_spans:
         result["_word_span_count"] = len(word_spans)
@@ -399,7 +415,11 @@ def hook_to_text(hook_text: str | dict | list | None) -> str:
     return " ".join(str(hook_text).split())
 
 
-def _combined_text_sections(transcript_text: str, hook_display_text: str) -> tuple[str, list[dict[str, Any]]]:
+def _combined_text_sections(
+    transcript_text: str,
+    hook_display_text: str,
+    overlay_display_text: str = "",
+) -> tuple[str, list[dict[str, Any]]]:
     combined = transcript_text or ""
     sections: list[dict[str, Any]] = []
     if transcript_text:
@@ -409,15 +429,30 @@ def _combined_text_sections(transcript_text: str, hook_display_text: str) -> tup
         hook_start = len(combined) + len(prefix)
         combined = combined + prefix + hook_display_text
         sections.append({"field": "hook", "start": hook_start, "end": hook_start + len(hook_display_text)})
+    if overlay_display_text:
+        prefix = "\n\n[OVERLAY]\n" if combined else "[OVERLAY]\n"
+        overlay_start = len(combined) + len(prefix)
+        combined = combined + prefix + overlay_display_text
+        sections.append({
+            "field": "overlay",
+            "start": overlay_start,
+            "end": overlay_start + len(overlay_display_text),
+        })
     return combined, sections
 
 
-def _checked_fields(transcript_text: str, hook_display_text: str) -> list[str]:
+def _checked_fields(
+    transcript_text: str,
+    hook_display_text: str,
+    overlay_display_text: str = "",
+) -> list[str]:
     fields = []
     if transcript_text:
         fields.append("transcript")
     if hook_display_text:
         fields.append("hook")
+    if overlay_display_text:
+        fields.append("overlay")
     return fields
 
 
@@ -844,10 +879,19 @@ def scan_output_dir(
         else:
             clip_words = _get_words_for_clip_indexed(word_index, row.get("start"), row.get("end"))
             hook_source = row.get("hook_overlay") if isinstance(row.get("hook_overlay"), dict) else row.get("hook", "")
+            try:
+                from dynamic_text import dynamic_plan_text
+
+                overlay_source = dynamic_plan_text(
+                    row.get("dynamic_text_plan") if isinstance(row.get("dynamic_text_plan"), dict) else {}
+                )
+            except Exception:
+                overlay_source = ""
             result = check_compliance(
                 clip_words,
                 str(row.get("product") or "general"),
                 hook_text=hook_source,
+                overlay_text=overlay_source,
                 cfg=cfg,
             )
             result["blocked"] = should_block_result(result, cfg)
@@ -1049,6 +1093,7 @@ def _finalize_result(
     violations: list[dict[str, Any]],
     cleaned_transcript: str,
     cleaned_hook_text: str,
+    cleaned_overlay_text: str,
     auto_fixed: bool,
     source: str,
     qwen_called: bool,
@@ -1073,6 +1118,7 @@ def _finalize_result(
         "hook_text": hook_text,
         "cleaned_transcript": cleaned_transcript,
         "cleaned_hook_text": cleaned_hook_text,
+        "cleaned_overlay_text": cleaned_overlay_text,
         "compliance_summary": compliance_summary,
         "auto_fixed": bool(auto_fixed),
         "source": source,

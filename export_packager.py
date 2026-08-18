@@ -192,18 +192,37 @@ def _package_export_batches_impl(
         if item.get("content_md5_64k")
     }
     strategy = _export_batch_strategy(cfg)
+    if bool(getattr(cfg, "WHATSAPP_DELIVERY_ENABLED", False)) and strategy != DIVERSITY_STRATEGY:
+        raise ValueError(
+            "WhatsApp canonical packaging requires diversity_first_rolling "
+            "so complete numeric batches publish atomically"
+        )
     one_variant_per_clip = bool(getattr(cfg, "EXPORT_PACK_ONE_VARIANT_PER_CLIP", False))
 
     raw_candidates = _discover_export_ready_candidates(
         root,
         batch_root,
         source_output_dir=source_output_dir,
+        require_delivery_compliance=bool(
+            getattr(cfg, "WHATSAPP_DELIVERY_ENABLED", False)
+        ),
     )
     existing_counts = (
         _fast_existing_batch_counts(batch_root, existing_items, manifest.get("counts_by_batch"))
         if strategy == DIVERSITY_STRATEGY
         else _existing_batch_counts(batch_root, existing_items)
     )
+    if bool(getattr(cfg, "WHATSAPP_DELIVERY_ENABLED", False)):
+        try:
+            from clipper_app.application.whatsapp_delivery import WhatsAppDeliveryService
+
+            packaging_floor = WhatsAppDeliveryService.from_config(cfg).packaging_floor()
+            if packaging_floor > 0:
+                existing_counts.setdefault(packaging_floor, 0)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not read authoritative WhatsApp packaging floor: {exc}"
+            ) from exc
     legacy_batch_folder_cutoff, cutoff_needs_persist = _resolve_legacy_batch_folder_cutoff(
         manifest,
         existing_counts,
@@ -418,6 +437,7 @@ def _package_export_batches_impl(
             batch_root=batch_root,
             move_plans=move_plans,
             batch_size=size,
+            cfg=cfg,
         )
         moved_items.extend(diversity_moved)
         errors.extend(diversity_errors)
@@ -543,6 +563,8 @@ def _discover_export_ready_candidates(
     root: Path,
     batch_root: Path,
     source_output_dir: str | Path | None = None,
+    *,
+    require_delivery_compliance: bool = False,
 ) -> list[ExportCandidate]:
     if not root.exists():
         return []
@@ -577,7 +599,12 @@ def _discover_export_ready_candidates(
                 # clip_path is inconsistent or unsafe, do not fall back to a
                 # less-specific manifest row and accidentally authorize it.
                 seen_clip_ids.add(score_clip_id)
-            candidate = _candidate_from_score(source_dir, score, manifest_by_clip)
+            candidate = _candidate_from_score(
+                source_dir,
+                score,
+                manifest_by_clip,
+                require_delivery_compliance=require_delivery_compliance,
+            )
             if candidate is not None:
                 candidates.append(candidate)
                 seen_clip_ids.add(candidate.clip_id)
@@ -587,7 +614,11 @@ def _discover_export_ready_candidates(
             clip_id = str(row.get("clip_id") or "")
             if not clip_id or clip_id in seen_clip_ids:
                 continue
-            candidate = _candidate_from_manifest_row(source_dir, row)
+            candidate = _candidate_from_manifest_row(
+                source_dir,
+                row,
+                require_delivery_compliance=require_delivery_compliance,
+            )
             if candidate is not None:
                 candidates.append(candidate)
     return candidates
@@ -598,6 +629,7 @@ def _execute_diversity_move_plans(
     batch_root: Path,
     move_plans: list[tuple[ExportCandidate, Path, Path, str, dict[str, Any]]],
     batch_size: int,
+    cfg=None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     moved_items: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -618,9 +650,11 @@ def _execute_diversity_move_plans(
             )
             continue
         final_folder = resolve_within_root(batch_root, batch_root / str(folder_number))
+        staging_parent = resolve_within_root(batch_root, batch_root / "_tmp" / "packager")
+        staging_parent.mkdir(parents=True, exist_ok=True)
         staging_folder = resolve_within_root(
             batch_root,
-            batch_root / f".staging-{folder_number}-{uuid4().hex}",
+            staging_parent / f"{folder_number}-{uuid4().hex}",
         )
         if final_folder.exists():
             errors.append(f"diversity batch destination already exists: {final_folder}")
@@ -665,7 +699,42 @@ def _execute_diversity_move_plans(
                 pass
             continue
 
+        if bool(getattr(cfg, "WHATSAPP_DELIVERY_ENABLED", False)):
+            try:
+                _register_whatsapp_ready_batch(final_folder, folder_number, cfg)
+            except Exception as exc:
+                errors.append(
+                    f"delivery validation/publication {final_folder}: {exc}"
+                )
+                for staged_path, source_path in reversed(staged):
+                    published_path = final_folder / staged_path.name
+                    try:
+                        shutil.move(str(published_path), str(source_path))
+                    except Exception as rollback_exc:
+                        errors.append(
+                            f"rollback {published_path} -> {source_path}: {rollback_exc}"
+                        )
+                try:
+                    final_folder.rmdir()
+                except OSError:
+                    pass
+                continue
+
         for candidate, _source_path_before, destination, relative_destination, item_payload in plans:
+            item_payload.update(
+                {
+                    "canonical_batch_number": folder_number,
+                    "media_ready": bool(
+                        getattr(cfg, "WHATSAPP_DELIVERY_ENABLED", False)
+                    ),
+                    "affiliate_delivery_state": (
+                        "unassigned"
+                        if bool(getattr(cfg, "WHATSAPP_DELIVERY_ENABLED", False))
+                        else None
+                    ),
+                    "affiliate_assignment_id": None,
+                }
+            )
             try:
                 _update_source_manifest(candidate.source_dir, candidate.clip_id, relative_destination, item_payload)
                 _update_source_scores_summary(candidate.source_dir, candidate.clip_id, relative_destination, destination)
@@ -673,6 +742,49 @@ def _execute_diversity_move_plans(
                 errors.append(f"source metadata update for {candidate.clip_id}: {exc}")
             moved_items.append(item_payload)
     return moved_items, errors
+
+
+def _register_whatsapp_ready_batch(final_folder: Path, folder_number: int, cfg) -> None:
+    from clipper_app.application.whatsapp_delivery import WhatsAppDeliveryService
+    from whatsapp_media import (
+        MediaPolicy,
+        ProcessingAction,
+        source_identity,
+        validate_delivery,
+    )
+
+    policy = MediaPolicy.from_config(cfg)
+    files: list[dict[str, Any]] = []
+    for media_path in sorted(final_folder.rglob("*.mp4")):
+        compliance = validate_delivery(
+            media_path,
+            policy=policy,
+            action=ProcessingAction.DIRECT_RENDERED,
+            require_target_size=False,
+            decode=True,
+        )
+        if not compliance.compliant:
+            raise RuntimeError(
+                f"{media_path.name}: {','.join(compliance.failure_codes)}"
+            )
+        identity = source_identity(media_path)
+        files.append(
+            {
+                "relative_path": str(media_path.relative_to(final_folder)),
+                "size_bytes": identity["size_bytes"],
+                "fingerprint": identity["fast_fingerprint"],
+                "compliance": compliance.to_dict(),
+            }
+        )
+    if not files:
+        raise RuntimeError("published batch contains no MP4 files")
+    WhatsAppDeliveryService.from_config(cfg).register_media_batch(
+        folder_number,
+        final_folder,
+        files,
+        media_state="complete",
+        ready_for_delivery=True,
+    )
 
 
 def _candidate_current_path(root: Path, batch_root: Path, candidate: ExportCandidate) -> Path:
@@ -705,12 +817,16 @@ def _candidate_from_score(
     source_dir: Path,
     score: dict[str, Any],
     manifest_by_clip: dict[str, dict[str, Any]],
+    *,
+    require_delivery_compliance: bool = False,
 ) -> ExportCandidate | None:
     clip_id = str(score.get("clip_id") or "")
     if not clip_id:
         return None
     manifest_row = manifest_by_clip.get(clip_id, {})
     if _is_blocked_or_failed(score) or _is_blocked_or_failed(manifest_row):
+        return None
+    if require_delivery_compliance and not _delivery_row_is_current(manifest_row):
         return None
     output_file = str(score.get("output_file") or manifest_row.get("output_file") or "")
     clip_path = str(score.get("clip_path") or "")
@@ -729,8 +845,15 @@ def _candidate_from_score(
     )
 
 
-def _candidate_from_manifest_row(source_dir: Path, row: dict[str, Any]) -> ExportCandidate | None:
+def _candidate_from_manifest_row(
+    source_dir: Path,
+    row: dict[str, Any],
+    *,
+    require_delivery_compliance: bool = False,
+) -> ExportCandidate | None:
     if _is_blocked_or_failed(row):
+        return None
+    if require_delivery_compliance and not _delivery_row_is_current(row):
         return None
     clip_id = str(row.get("clip_id") or "")
     output_file = str(row.get("output_file") or "")
@@ -749,6 +872,25 @@ def _candidate_from_manifest_row(source_dir: Path, row: dict[str, Any]) -> Expor
         product=str(row.get("product") or ""),
         clip_type=str(row.get("clip_type") or ""),
     )
+
+
+def _delivery_row_is_current(row: dict[str, Any]) -> bool:
+    if not bool(row.get("delivery_compliant", False)):
+        return False
+    revision = str(
+        row.get("delivery_policy_revision")
+        or (row.get("delivery_compliance") or {}).get("policy_revision")
+        or ""
+    )
+    if not revision:
+        return False
+    diagnostics = row.get("delivery_diagnostics")
+    if not isinstance(diagnostics, dict):
+        diagnostics = (row.get("delivery_compliance") or {}).get("diagnostics") or {}
+    failure_codes = row.get("delivery_failure_codes")
+    if failure_codes is None:
+        failure_codes = (row.get("delivery_compliance") or {}).get("failure_codes") or []
+    return not failure_codes and bool(diagnostics.get("full_decode_passed", False))
 
 
 def _build_candidate(

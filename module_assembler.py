@@ -242,19 +242,50 @@ def _render_modular_assemblies_locked(
                     _write_json_atomic(manifest_path, manifest)
                     continue
 
-            from ffmpeg_editor import edit_clip
+            from ffmpeg_editor import edit_clip, render_clip
+            from whatsapp_media import (
+                DeliveryComplianceResult,
+                ProcessingAction,
+                RenderResult,
+            )
 
             edit_cfg = _variant_edit_cfg(job, cfg)
             clip_words = _variant_adjusted_words(job)
             product_events = _variant_adjusted_product_events(job)
-            ok = edit_clip(
-                raw_clip_path=job["raw_path"],
-                output_path=job["output_path"],
-                moment=job["moment"],
-                clip_words=clip_words,
-                product_events=product_events,
-                cfg=edit_cfg,
+            render_kwargs = {
+                "raw_clip_path": job["raw_path"],
+                "output_path": job["output_path"],
+                "moment": job["moment"],
+                "clip_words": clip_words,
+                "product_events": product_events,
+                "cfg": edit_cfg,
+            }
+            if bool(getattr(cfg, "WHATSAPP_DELIVERY_ENABLED", False)):
+                render_result = render_clip(**render_kwargs)
+            else:
+                legacy_ok = edit_clip(**render_kwargs)
+                render_result = RenderResult(
+                    ok=bool(legacy_ok),
+                    output_path=Path(job["output_path"]) if legacy_ok else None,
+                    delivery_compliance=DeliveryComplianceResult(
+                        compliant=bool(legacy_ok),
+                        policy_revision="delivery-disabled",
+                        action=ProcessingAction.DIRECT_RENDERED.value,
+                        diagnostics={"delivery_validation_disabled": True},
+                        failure_codes=[] if legacy_ok else ["render_failed"],
+                    ),
+                    failure_stage=None if legacy_ok else "render",
+                    error_code=None if legacy_ok else "render_failed",
+                )
+            job["delivery_compliance"] = (
+                render_result.delivery_compliance.to_dict()
+                if render_result.delivery_compliance
+                else None
             )
+            job["render_failure_stage"] = render_result.failure_stage
+            job["render_error_code"] = render_result.error_code
+            job["render_error_message"] = render_result.error_message
+            ok = render_result.ok
             row = _manifest_row(job, "ok" if ok else "failed")
             manifest.append(row)
             if ok:
@@ -1012,7 +1043,12 @@ def _score_modular_outputs(jobs: list[dict[str, Any]], manifest: list[dict[str, 
     for job in jobs:
         row = rows_by_clip.get(job.get("clip_id"))
         output_path = Path(str(job.get("output_path") or ""))
-        if not row or row.get("status") in {"failed", "compliance_blocked"} or not output_path.exists():
+        if (
+            not row
+            or row.get("status") in {"failed", "compliance_blocked"}
+            or not bool(row.get("delivery_compliant", False))
+            or not output_path.exists()
+        ):
             continue
         entries.append(
             {
@@ -1232,6 +1268,19 @@ def _manifest_row(job: dict[str, Any], status: str) -> dict[str, Any]:
         row["blocked_reason"] = _blocked_reason(result) if result.get("blocked") else ""
         if job.get("compliance_json_path"):
             row["compliance_file"] = job["compliance_json_path"]
+    delivery = job.get("delivery_compliance")
+    if isinstance(delivery, dict):
+        row["delivery_compliance"] = copy.deepcopy(delivery)
+        row["delivery_compliant"] = bool(delivery.get("compliant", False))
+        row["delivery_policy_revision"] = str(delivery.get("policy_revision") or "")
+        row["processing_action"] = str(delivery.get("action") or "")
+        row["delivery_diagnostics"] = copy.deepcopy(delivery.get("diagnostics") or {})
+        row["delivery_failure_codes"] = list(delivery.get("failure_codes") or [])
+    else:
+        row["delivery_compliant"] = False
+    row["failure_stage"] = job.get("render_failure_stage")
+    row["error_code"] = job.get("render_error_code")
+    row["error_message"] = job.get("render_error_message")
     return row
 
 

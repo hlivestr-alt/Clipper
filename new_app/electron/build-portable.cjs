@@ -1,4 +1,5 @@
 const { spawnSync } = require("node:child_process");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -8,6 +9,54 @@ const unpacked = path.join(outputRoot, "win-unpacked");
 const unpackedTmp = path.join(outputRoot, "win-unpacked.tmp");
 const appStage = path.join(outputRoot, "app-stage");
 const portableExe = path.join(outputRoot, `Clipper-${readPackageJson().version}-portable.exe`);
+
+function cachedElectronArchive() {
+  const electronPackage = require("electron/package.json");
+  const electronChecksums = require("electron/checksums.json");
+  const archiveName = `electron-v${electronPackage.version}-win32-x64.zip`;
+  const expectedChecksum = electronChecksums[archiveName];
+  if (!expectedChecksum) {
+    return null;
+  }
+  const cacheRoots = [
+    process.env.ELECTRON_CACHE,
+    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "electron", "Cache")
+  ].filter(Boolean);
+
+  for (const cacheRoot of cacheRoots) {
+    if (!fs.existsSync(cacheRoot)) {
+      continue;
+    }
+    const pending = [cacheRoot];
+    while (pending.length > 0) {
+      const current = pending.pop();
+      for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+        const candidate = path.join(current, entry.name);
+        if (entry.isDirectory()) {
+          pending.push(candidate);
+        } else if (entry.isFile() && entry.name === archiveName && fs.statSync(candidate).size > 0) {
+          const actualChecksum = crypto.createHash("sha256").update(fs.readFileSync(candidate)).digest("hex");
+          if (actualChecksum === expectedChecksum) {
+            return candidate;
+          }
+          console.warn(`Ignoring cached Electron archive with invalid checksum: ${candidate}`);
+        }
+      }
+    }
+  }
+  return null;
+}
+
+async function extractCachedElectron(archive, destination) {
+  const extractorPath = require.resolve("@electron-internal/extract-zip", {
+    paths: [require.resolve("electron")]
+  });
+  const extractor = require(extractorPath);
+  const extract = extractor.extract || extractor.default || extractor;
+  removeGenerated(destination);
+  fs.mkdirSync(destination, { recursive: true });
+  await extract(archive, { dir: destination });
+}
 
 function readPackageJson() {
   return JSON.parse(fs.readFileSync(path.join(projectRoot, "package.json"), "utf8"));
@@ -156,7 +205,13 @@ async function main() {
     renameWithRetry(assertInsideProject(unpackedTmp), assertInsideProject(unpacked));
     await createFallbackAppPackage(assertInsideProject(unpacked));
   } else {
-    process.exit(first.status || 1);
+    const cachedArchive = cachedElectronArchive();
+    if (!cachedArchive) {
+      process.exit(first.status || 1);
+    }
+    console.warn(`Electron download failed; extracting cached runtime from ${cachedArchive} and retrying with --prepackaged.`);
+    await extractCachedElectron(cachedArchive, assertInsideProject(unpacked));
+    await createFallbackAppPackage(assertInsideProject(unpacked));
   }
 
   const second = electronBuilder(["--win", "portable", "--prepackaged", unpacked]);

@@ -73,6 +73,28 @@ export type DashboardSummary = {
   rows: QueueRunRow[];
 };
 
+export type WhatsAppDeliveryStatus = {
+  cutover: {
+    direct_pc_delivery_enabled: boolean;
+    legacy_drive_workflow_disabled: boolean;
+    claims_enabled: boolean;
+    blocking_reason?: string | null;
+  };
+  counts: Record<string, number>;
+  assignments: Array<{
+    affiliate_assignment_id: string;
+    batch_number: number;
+    affiliate_name: string;
+    affiliate_identifier: string;
+    delivery_status: string;
+    canonical_folder_path: string;
+    version: number;
+    assigned_at: string;
+    sent_at?: string | null;
+    delivery_error?: string | null;
+  }>;
+};
+
 export type QueueDetail = {
   state_path: string;
   updated_at?: string | null;
@@ -303,11 +325,26 @@ export type VariationVariant = {
   visual_mode: "host" | "broll_audio";
   random_broll_enabled: boolean;
   before_after_mode: "fullscreen";
+  text_style_id: "current" | "creator_bold_pop" | "native_clean" | "premium_skincare" | "sales_karaoke" | "urgency_stack";
   font_id: string;
+  headline_font_id: string;
+  caption_font_id: string;
   font_color: string;
   highlight_color: string;
   subtitle_position: "top" | "center" | "bottom";
-  subtitle_size: "small" | "medium" | "large";
+  subtitle_size: "compact" | "small" | "medium" | "large";
+  subtitle_stroke_color: string;
+  subtitle_stroke_width: number;
+  subtitle_highlight_enabled: boolean;
+  subtitle_animation: "current" | "phrase_cut";
+  headline_animation: "current" | "pop_overshoot" | "soft_pop" | "fade_up" | "punch" | "slide_up";
+  caption_animation: "current" | "staggered_reveal" | "fade_up" | "wipe" | "slide_up";
+  headline_stroke_width: number;
+  headline_shadow_color: string;
+  headline_shadow_x: number;
+  headline_shadow_y: number;
+  headline_rotation_degrees: number;
+  caption_stroke_width: number;
   color_grade: string;
   bgm_mode: "auto" | "none" | "selected";
   bgm_path: string;
@@ -315,6 +352,18 @@ export type VariationVariant = {
   zoom_intensity: "none" | "subtle" | "normal" | "strong";
   product_zoom_enabled: boolean;
   subtitle_enabled: boolean;
+  dynamic_text_mode: "off" | "minimal" | "balanced" | "high_energy";
+  dynamic_text_roles: Array<"ingredients" | "benefits" | "usage" | "cta">;
+  dynamic_text_settings: Record<
+    "ingredients" | "benefits" | "usage" | "cta",
+    {
+      headline_font_id: string;
+      body_font_id: string;
+      font_size: number;
+      animation: "current" | "staggered_reveal" | "fade_up" | "wipe" | "slide_up";
+      duration_seconds: number;
+    }
+  >;
   letterbox_enabled: boolean;
   mirror_enabled: boolean;
   subtitle_y_frac: number;
@@ -337,11 +386,226 @@ export type VariationProfile = {
   name?: string;
 };
 
+export type TrendConfiguration = {
+  app_configured: boolean;
+  access_configured: boolean;
+  media_dir: string;
+  media_dir_exists: boolean;
+  qwen_enabled: boolean;
+  ytdlp_available: boolean;
+  ytdlp_version: string;
+  download_concurrency: number;
+  download_timeout_seconds: number;
+  download_min_free_bytes: number;
+  media_free_bytes: number;
+  disk_reserve_satisfied: boolean;
+  oauth?: TikTokOAuthStatus;
+};
+
+export type TikTokOAuthStatus = {
+  app_configured: boolean;
+  redirect_configured: boolean;
+  redirect_uri: string;
+  callback_supported: boolean;
+  storage_path: string;
+  storage_encrypted: boolean;
+  connected: boolean;
+  authorization_required: boolean;
+  configuration_error: string;
+  storage_error: string;
+  flow?: string | null;
+  refresh_supported?: boolean;
+  access_token_expires_at?: string | null;
+  refresh_token_expires_at?: string | null;
+  advertiser_ids?: string[];
+  selected_advertiser_id?: string | null;
+  updated_at?: string | null;
+};
+
+export type TikTokOAuthStart = {
+  authorization_url: string;
+  redirect_uri: string;
+  expires_in: number;
+};
+
+export type TrendSnapshot = {
+  snapshot_id: string;
+  retrieved_at: string;
+  country_code: string;
+  date_range: string;
+  category_name: string;
+  provider_request_id?: string;
+};
+
+export type TrendHashtag = {
+  hashtag_id: string;
+  hashtag_name: string;
+  normalized_name?: string;
+  source?: string;
+  source_category?: string;
+  original_rank?: number;
+  display_rank?: number;
+  relevance_type?: "topic" | "skin_concern" | "product" | "ingredient" | "routine" | "treatment" | "beauty_brand" | "personal_care_brand";
+  matched_brand?: string | null;
+  classification_reason?: string;
+  rank_position: number;
+  rank_change?: string;
+  views?: number | null;
+  posts?: number | null;
+};
+
+export type TrendHashtagClassification = {
+  hashtag: string;
+  normalized_name: string;
+  source: string;
+  source_category: string;
+  original_rank: number;
+  display_rank?: number | null;
+  relevant: boolean;
+  relevance_type: string;
+  classification_reason: string;
+  matched_brand?: string | null;
+};
+
+export type TrendHashtagDiagnostics = {
+  source: string;
+  source_category: string;
+  total_candidates_returned: number;
+  accepted_topical: number;
+  accepted_brands: number;
+  excluded: number;
+  deduplicated: number;
+  stored: number;
+  backend_returned: number;
+  selection_limit: number;
+  classifications: TrendHashtagClassification[];
+  exclusions: TrendHashtagClassification[];
+};
+
+export type TrendVideo = {
+  snapshot_id: string;
+  hashtag_id: string;
+  hashtag_name: string;
+  rank_position: number;
+  video_id: string;
+  provider_ordinal: number;
+  original_provider_rank?: number;
+  final_rank: number;
+  share_url: string;
+  embed_url: string;
+  media_type: "video" | "image" | "carousel" | "unknown";
+  is_available: boolean | number;
+  classification_evidence: string;
+  availability_evidence: string;
+  video_duration_seconds?: number | null;
+  image_count?: number | null;
+  playable_url_count: number;
+  provider_aweme_type?: number | null;
+  exclusion_reason?: "image_or_carousel" | "unknown" | "unavailable" | null;
+  relative_path?: string | null;
+  file_sha256?: string | null;
+  media_status?: "media_ready" | "analyzing" | "analyzed" | "failed" | null;
+  media_error?: string | null;
+  download_status?: "queued" | "downloading" | "downloaded" | "failed" | "interrupted" | null;
+  download_error?: string | null;
+  downloaded_relative_path?: string | null;
+};
+
+export type TrendVideoCandidateDiagnostic = {
+  video_id: string;
+  original_tiktok_rank: number;
+  final_rank?: number | null;
+  media_type: "video" | "image" | "carousel" | "unknown";
+  is_available: boolean;
+  classification_evidence: string;
+  availability_evidence: string;
+  exclusion_reason?: "image_or_carousel" | "unknown" | "unavailable" | null;
+};
+
+export type TrendVideoDiagnostics = {
+  hashtag_id: string;
+  hashtag_name: string;
+  total_candidates_returned: number;
+  video_posts_detected: number;
+  image_carousel_posts_excluded: number;
+  unknown_posts_excluded: number;
+  unavailable_posts_excluded: number;
+  valid_videos_stored: number;
+  sent_to_frontend: number;
+  pagination_available: boolean;
+  candidate_limit: number;
+  endpoint: string;
+  candidates: TrendVideoCandidateDiagnostic[];
+};
+
+export type TrendDownloadSummary = {
+  targets: number;
+  queued: number;
+  downloading: number;
+  downloaded: number;
+  reused: number;
+  approved: number;
+  failed: number;
+  interrupted: number;
+};
+
+export type TrendRecommendation = {
+  value: unknown;
+  support_count: number;
+  sample_count: number;
+  confidence: number;
+  applied_to_suggestion: boolean;
+};
+
+export type TrendPattern = {
+  pattern_id: string;
+  snapshot_id: string;
+  created_at: string;
+  analyzer_version: string;
+  base_profile_revision: string;
+  sample_count: number;
+  recommendations: Record<string, TrendRecommendation>;
+  suggested_profile: VariationProfile;
+  failures?: Array<{ video_id: string; error: string }>;
+};
+
+export type TrendPageData = {
+  configuration: TrendConfiguration;
+  snapshot: TrendSnapshot | null;
+  hashtags: TrendHashtag[];
+  hashtag_diagnostics: TrendHashtagDiagnostics;
+  videos: TrendVideo[];
+  video_diagnostics: TrendVideoDiagnostics[];
+  download_summary: TrendDownloadSummary | null;
+  latest_pattern: TrendPattern | null;
+  warnings: string[];
+};
+
+export type TrendMediaFile = {
+  relative_path: string;
+  name: string;
+  size: number;
+  mtime_ns: number;
+};
+
+export type TrendMediaFiles = {
+  root: string;
+  exists: boolean;
+  files: TrendMediaFile[];
+};
+
 export type VariationOption = {
   id?: string;
   label: string;
   path?: string;
   exists?: boolean;
+};
+
+export type VariationTextStyle = {
+  id: VariationVariant["text_style_id"];
+  label: string;
+  description: string;
+  defaults: Partial<VariationVariant>;
 };
 
 export type VariationPresetRef = {
@@ -382,12 +646,16 @@ export type ProductBrollPreviewData = {
 export type VariationPageData = {
   profile: VariationProfile;
   fonts: VariationOption[];
+  text_styles: VariationTextStyle[];
   bgm_tracks: VariationOption[];
   hook_types: string[];
   visual_modes: Array<VariationVariant["visual_mode"]>;
   before_after_modes: Array<VariationVariant["before_after_mode"]>;
   subtitle_positions: string[];
   subtitle_sizes: Array<VariationVariant["subtitle_size"]>;
+  dynamic_text_modes: Array<VariationVariant["dynamic_text_mode"]>;
+  dynamic_text_roles: VariationVariant["dynamic_text_roles"];
+  dynamic_text_animations: Array<VariationVariant["dynamic_text_settings"]["ingredients"]["animation"]>;
   color_grades: string[];
   bgm_modes: string[];
   zoom_intensities: string[];
@@ -405,12 +673,61 @@ export type VariationPageData = {
   };
 };
 
-export type VariationPreviewImage = {
+export type ProductInformationSource = {
+  path: string;
+  extension: string;
+  size: number;
+  sha256: string;
+  status: string;
+  cached: boolean;
+  extraction_method: "llm" | "rules" | "rules_fallback";
+  page_count: number;
+  warnings: string[];
+  products: string[];
+  eligible_fact_count: number;
+  fact_counts: Record<string, number>;
+  unassigned_count: number;
+};
+
+export type ProductInformationProduct = {
+  product_key: string;
+  label: string;
+  eligible_fact_count: number;
+  fact_counts: Record<string, number>;
+};
+
+export type ProductInformationStatus = {
+  schema_version: number;
+  revision: string;
+  scanned_at: string;
+  root: string;
+  sources: ProductInformationSource[];
+  products: ProductInformationProduct[];
+  unassigned_count: number;
+  conflict_count: number;
+  unassigned: Array<{
+    role: string;
+    text: string;
+    source_file: string;
+    locator: Record<string, unknown>;
+    reason: string;
+  }>;
+  conflicts: Array<{
+    product: string;
+    role: string;
+    key: string;
+    fact_ids: string[];
+    reason: string;
+  }>;
+  warnings: string[];
+};
+
+export type VariationPreviewMedia = {
   variant_index: number;
   variant_name: string;
   path: string;
   url: string;
-  kind: "image";
+  kind: "image" | "video";
   exists: boolean;
 };
 
@@ -418,8 +735,10 @@ export type VariationPreviewResult = {
   profile_revision: string;
   source_clip: string;
   preview_source: VariationPreviewSource;
-  previews: VariationPreviewImage[];
+  previews: VariationPreviewMedia[];
   message: string;
+  product_information_revision?: string;
+  preview_product_key?: string;
 };
 
 export type ControlJobStatus =
@@ -439,7 +758,10 @@ export type ControlOperation =
   | "compliance_scan"
   | "module_assembly"
   | "export_batches"
-  | "module_review";
+  | "module_review"
+  | "trend_refresh"
+  | "trend_download"
+  | "trend_analysis";
 
 export type DesktopRuntimeStatus = {
   backend_running: boolean;

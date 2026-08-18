@@ -12,6 +12,11 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from content_topics import (
+    CONTENT_PATTERNS as _CONTENT_PATTERNS,
+    collect_content_hits as _collect_content_hits,
+    dominant_focus as _dominant_focus,
+)
 from hook_text import build_hook_payload
 from utils import lm_studio_openai_chat_kwargs
 
@@ -129,51 +134,6 @@ def _parse_moments_json(raw: str) -> list:
     return []
 
 
-_CONTENT_PATTERNS = {
-    "product": [
-        r"\bproya\b", r"\b5x\b", r"\bproduk\b", r"\bserum\b", r"\btoner\b",
-        r"\bcleanser\b", r"\bmoisturi[sz]er\b", r"\beye\s*cream\b",
-        r"\bkrim\b", r"\bcream\b", r"\bsheet\s*mask\b", r"\bmasker\b",
-        r"\bskincare\b", r"\bpaket\b", r"\bvarian\b", r"\btekstur\b",
-        r"\bkemasan\b",
-    ],
-    "benefit": [
-        r"\bmencerah\w*\b", r"\bcerah\w*\b", r"\bglow\w*\b",
-        r"\blemb[ae]p\w*\b", r"\bmoist\w*\b", r"\bjerawat\b", r"\bacne\b",
-        r"\bflek\b", r"\bnoda\b", r"\bkusam\b", r"\bpori\w*\b",
-        r"\bberuntus\w*\b", r"\bkemerahan\b", r"\bhalus\b", r"\bbersih\w*\b",
-        r"\bsegar\b", r"\bfresh\b", r"\bkenyal\b", r"\bkencang\b",
-        r"\bantioksidan\b", r"\bhidras\w*\b", r"\bhydrat\w*\b",
-        r"\bmemudar\w*\b", r"\bpudar\b", r"\bmenyamarkan\b",
-        r"\bmeredakan\b", r"\bmenghilangkan\b", r"\bbekas\b",
-        r"\bminyak\w*\b", r"\boily\b",
-    ],
-    "ingredient": [
-        r"\bvitamin\s*c\b", r"\balpha\s*arbutin\b", r"\barbutin\b",
-        r"\btranexamic\b", r"\bniacinamide\b", r"\bsalicylic\b",
-        r"\bhyaluronic\b", r"\bcollagen\b", r"\bkolagen\b",
-        r"\bcentella\b", r"\bpeptide\b", r"\bretinol\b", r"\bceramide\b",
-        r"\btea\s*tree\b", r"\bkandungan\b", r"\bmengandung\b",
-        r"\bingredient\w*\b", r"\bbahan\b", r"\bextract\b", r"\bekstrak\b",
-        r"\bacid\b", r"\basam\b",
-    ],
-    "how_to": [
-        r"\bpakai\w*\b", r"\bpake\w*\b", r"\bdipakai\b", r"\bpemakaian\b",
-        r"\bcara\b", r"\bgunakan\b", r"\bapply\b", r"\baplikasi\w*\b",
-        r"\boles\w*\b", r"\bsemprot\w*\b", r"\bspray\b", r"\bbilas\b",
-        r"\bcuci\s*muka\b", r"\bstep\b", r"\brutin\b", r"\bpagi\b",
-        r"\bmalam\b", r"\bsehari\b", r"\btetes\w*\b", r"\btuang\b",
-    ],
-    "promo_price": [
-        r"\bpromo\b", r"\bdiskon\b", r"\bharga\w*\b", r"\bvoucher\b",
-        r"\bgratis\s*ongkir\b", r"\bongkir\b", r"\bcheckout\b",
-        r"\bcheck\s*out\b", r"\bco\b", r"\betalase\b", r"\bkeranjang\b",
-        r"\bnomor\b", r"\bstok\b", r"\bbeli\b", r"\border\b", r"\bcod\b",
-        r"\bbundling\b", r"\bhemat\b", r"\bribu\b", r"\brupiah\b",
-        r"\brp\s*\d+", r"\b\d+\s*%", r"\b\d+\s*(?:ribu|rb|k)\b",
-    ],
-}
-
 _FOCUS_TO_RENDERER_CATEGORY = {
     "product": "attention_benefits",
     "benefit": "attention_benefits",
@@ -273,34 +233,6 @@ def _segments_for_range(chunk: dict, start: float, end: float, cfg) -> tuple[flo
         return None
 
     return records[first]["start"], records[last]["end"], selected_records, text
-
-
-def _collect_content_hits(text: str) -> dict[str, list[str]]:
-    normalized = str(text or "").lower()
-    hits = {category: [] for category in _CONTENT_PATTERNS}
-    for category, patterns in _CONTENT_PATTERNS.items():
-        seen = set()
-        for pattern in patterns:
-            for match in re.finditer(pattern, normalized, flags=re.IGNORECASE):
-                word = " ".join(match.group(0).strip().split())
-                if word and word not in seen:
-                    seen.add(word)
-                    hits[category].append(word)
-    return hits
-
-
-def _dominant_focus(hits: dict[str, list[str]]) -> str:
-    priority = {
-        "benefit": 50,
-        "ingredient": 40,
-        "how_to": 30,
-        "promo_price": 20,
-        "product": 10,
-    }
-    active = [category for category, words in hits.items() if words]
-    if not active:
-        return "unknown"
-    return max(active, key=lambda category: (len(hits[category]), priority.get(category, 0)))
 
 
 def _has_product_sales_focus(hits: dict[str, list[str]], word_count: int) -> bool:

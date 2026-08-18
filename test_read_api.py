@@ -24,10 +24,12 @@ class ReadApiTests(unittest.TestCase):
         output = root / "output"
         working = root / "working"
         modules = root / "modules"
+        information = root / "information"
         vods = root / "vods"
         output.mkdir()
         working.mkdir()
         modules.mkdir()
+        information.mkdir()
         vods.mkdir()
         self.vod_file = vods / "selected.mp4"
         self.vod_file.write_bytes(b"vod")
@@ -75,6 +77,9 @@ class ReadApiTests(unittest.TestCase):
             FONT_HOOK_FALLBACKS=[],
             SUBTITLE_FONT_DIR="assets/fonts",
             BGM_DIR=str(root / "bgm"),
+            PRODUCT_INFORMATION_DIR=str(information),
+            WHATSAPP_DIRECT_PC_DELIVERY_ENABLED=True,
+            WHATSAPP_LEGACY_DRIVE_WORKFLOW_DISABLED=True,
         )
         service = ReadDashboardService(LegacyConfigProvider(config))
         jobs = ControlJobService(config, run_async=False)
@@ -140,6 +145,54 @@ class ReadApiTests(unittest.TestCase):
             self.assertEqual(response.status_code, 401)
 
         self.assertEqual(self.queue_controls.execute.call_count, 0)
+
+    def test_whatsapp_claim_endpoint_is_protected_and_idempotent(self):
+        from clipper_app.application.whatsapp_delivery import WhatsAppDeliveryService
+
+        mirror = Path(self.config.OUTPUT_DIR) / "export_batches_whatsapp"
+        batch = mirror / "21"
+        batch.mkdir(parents=True)
+        delivery = WhatsAppDeliveryService(
+            mirror / "_whatsapp_state.sqlite3",
+            mirror,
+        )
+        delivery.register_media_batch(
+            21,
+            batch,
+            [
+                {
+                    "relative_path": "clip.mp4",
+                    "size_bytes": 123,
+                    "fingerprint": "abc",
+                    "compliance": {"compliant": True},
+                }
+            ],
+        )
+        self.assertEqual(
+            self.public_client.get("/api/whatsapp-delivery/status").status_code,
+            401,
+        )
+        payload = {
+            "affiliate_name": "Affiliate A",
+            "affiliate_identifier": "sheet-row-21",
+            "idempotency_key": "api-claim-key-0001",
+        }
+        first = self.client.post(
+            "/api/whatsapp-delivery/claims", json=payload
+        )
+        second = self.client.post(
+            "/api/whatsapp-delivery/claims", json=payload
+        )
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        first_data = first.json()["data"]
+        second_data = second.json()["data"]
+        self.assertEqual(
+            first_data["affiliate_assignment_id"],
+            second_data["affiliate_assignment_id"],
+        )
+        self.assertEqual(first_data["batch_number"], 21)
+        self.assertTrue(batch.is_dir())
 
     def test_public_compact_reads_remain_available_without_token(self):
         for path in ("/api/health", "/api/dashboard", "/api/overview", "/api/modules/library"):
@@ -435,6 +488,15 @@ class ReadApiTests(unittest.TestCase):
         self.assertIn("preview_source", data)
         self.assertEqual(data["preview_source"]["kind"], "video")
         self.assertIn("before_after_modes", data)
+        self.assertIn("dynamic_text_modes", data)
+        self.assertEqual(profile["variants"][0]["dynamic_text_mode"], "balanced")
+
+        information = self.client.get("/api/product-information")
+        self.assertEqual(information.status_code, 200)
+        self.assertEqual(information.json()["data"]["sources"], [])
+        rescanned = self.client.post("/api/product-information/rescan", json={})
+        self.assertEqual(rescanned.status_code, 200)
+        self.assertTrue(Path(rescanned.json()["data"]["root"]).is_dir())
 
         profile["variant_count"] = 2
         profile["variants"].append(dict(profile["variants"][0]))
