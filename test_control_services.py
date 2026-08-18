@@ -31,7 +31,6 @@ class ControlServiceTests(unittest.TestCase):
         return SimpleNamespace(
             OUTPUT_DIR=str(root / "output"),
             WORKING_DIR=str(root / "working"),
-            MODULE_LIBRARY_DIR=str(root / "modules"),
             MIN_SCORE=7.0,
             MAX_PARALLEL_CLIPS=4,
             QUEUE_START_RUN_NUMBER=12,
@@ -361,7 +360,7 @@ class ControlServiceTests(unittest.TestCase):
                 )
             with self.assertRaises(JobCapacityError) as caught:
                 service.submit(
-                    operation=ControlOperation.MODULE_REVIEW,
+                    operation=ControlOperation.SETTINGS_DELETE,
                     request={},
                     executor=lambda: {},
                 )

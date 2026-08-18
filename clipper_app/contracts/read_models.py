@@ -204,64 +204,6 @@ class ComplianceIndexPage(StrictReadModel):
     filter_options: dict[str, tuple[str, ...]] = Field(default_factory=dict)
 
 
-class ModuleReadinessRow(StrictReadModel):
-    product: str
-    product_key: str
-    hook: int = Field(default=0, ge=0)
-    main: int = Field(default=0, ge=0)
-    cta: int = Field(default=0, ge=0)
-    total: int = Field(default=0, ge=0)
-    readiness: Literal["ready", "partial", "empty"]
-    visual_total: int = Field(default=0, ge=0)
-    visual_passed: int = Field(default=0, ge=0)
-    visual_failed: int = Field(default=0, ge=0)
-    visual_not_run: int = Field(default=0, ge=0)
-    zoom_ready_candidates: int = Field(default=0, ge=0)
-
-
-class ModuleReadiness(StrictReadModel):
-    library_dir: str
-    index_path: str
-    index_exists: bool
-    index_updated_at: str = ""
-    index_module_count: int = Field(default=0, ge=0)
-    thresholds: dict[str, int] = Field(default_factory=dict)
-    rows: tuple[ModuleReadinessRow, ...] = ()
-
-
-class ModuleLibraryRow(StrictReadModel):
-    module_id: str
-    product: str = ""
-    product_key: str = ""
-    role: str = ""
-    source_date: str = ""
-    source_video: str = ""
-    duration: float = Field(default=0.0, ge=0)
-    confidence: float = Field(default=0.0, ge=0)
-    quality_status: str = ""
-    review_status: str = ""
-    boundary_mode: str = ""
-    visual_validation_status: str = "not_run"
-    visual_product_hits: int = Field(default=0, ge=0)
-    visual_product_confidence_max: float = Field(default=0.0, ge=0)
-    visual_validation_reason: str = ""
-    file_artifact: ArtifactRef | None = None
-
-
-class ModuleLibraryPage(StrictReadModel):
-    library_dir: str
-    rows: tuple[ModuleLibraryRow, ...] = ()
-    total: int = Field(default=0, ge=0)
-    limit: int = Field(ge=1)
-    offset: int = Field(ge=0)
-    filter_options: dict[str, tuple[str, ...]] = Field(default_factory=dict)
-
-
-class ModuleDetail(StrictReadModel):
-    selected: ModuleLibraryRow | None = None
-    transcript_text: str = ""
-
-
 class OverviewScoreTrendPoint(StrictReadModel):
     date: str
     average_score: float = Field(ge=0, le=10)

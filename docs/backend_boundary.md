@@ -5,7 +5,7 @@
 ## Package Structure
 
 - `clipper_app/contracts/`: strict Pydantic pipeline, queue, read, control, event, variation, trend, and WhatsApp delivery models.
-- `clipper_app/application/services.py`: pipeline, queue, scoring, compliance, module, export, and health facades.
+- `clipper_app/application/services.py`: pipeline, queue, scoring, compliance, export, and health facades.
 - `clipper_app/application/read_services.py`: legacy-filesystem and optional catalog-backed dashboard reads.
 - `clipper_app/application/control_services.py`: safe settings persistence and bounded background jobs.
 - `clipper_app/application/catalog.py`: rebuildable SQLite read model, change events, and trend records.
@@ -34,7 +34,7 @@ Storage migration is controlled separately:
 
 - `CLIPPER_CATALOG_MODE=legacy` (default): reads come from filesystem artifacts.
 - `CLIPPER_CATALOG_MODE=shadow`: legacy reads remain authoritative while the catalog is indexed and compared.
-- `CLIPPER_CATALOG_MODE=catalog`: supported score, compliance, module, overview, and output reads use SQLite.
+- `CLIPPER_CATALOG_MODE=catalog`: supported score, compliance, overview, and output reads use SQLite.
 - `CLIPPER_QUEUE_STORAGE_MODE=json` (default): legacy queue JSON is authoritative.
 - `CLIPPER_QUEUE_STORAGE_MODE=dual`: JSON reads plus SQLite/history writes.
 - `CLIPPER_QUEUE_STORAGE_MODE=sqlite`: SQLite is authoritative and an active-only compatibility JSON snapshot is refreshed.
@@ -59,7 +59,7 @@ All non-safe HTTP methods and sensitive reads require `Authorization: Bearer <CL
 
 Electron generates a fresh token and injects it only for the managed loopback origin. `run_new_app.ps1` does the same through the Vite development proxy. A compiled browser-only deployment does not currently have a user-facing token mechanism; see [cloudflare_dashboard_access.md](cloudflare_dashboard_access.md).
 
-Filesystem endpoints preserve containment checks under configured output, working, module-library, and approved trend-media roots. API requests cannot select arbitrary queue-state/log paths or arbitrary module paths.
+Filesystem endpoints preserve containment checks under configured output, working, and approved trend-media roots. API requests cannot select arbitrary queue-state or log paths.
 
 ## Jobs and Audit
 
@@ -81,11 +81,13 @@ Pipeline progress is normalized into `ProgressEvent` while preserving legacy cal
 
 ## Preserved Contracts
 
-- Existing `main.py`, queue, supervisor, control CLI, and PowerShell arguments.
+- Existing normal `main.py`, queue, supervisor, control CLI, and PowerShell arguments.
 - Queue control schema version 1 and supervisor pause/stop exit behavior.
 - Legacy queue schema version 2 for rollback export; active SQLite compatibility snapshots use queue schema version 3.
 - `PipelinePaused`, retries, resume state, stage fingerprints, and render manifests.
-- `pipeline.log`, score/compliance/module/export sidecars, output naming, and filesystem authority in default modes.
+- `pipeline.log`, score/compliance/export sidecars, output naming, and filesystem authority in default modes.
 - Legacy JSON reads and immediate rollback while the catalog and queue migrations remain staged.
 
 SQLite, HTTP mutations, persistent settings, SSE, TikTok research, WhatsApp delivery state, and Electron are implemented now; they are no longer deferred boundary work.
+
+The legacy modular feature has been removed from the application boundary and production pipeline. Historical `modules_only` queue/control records and old modular control-operation enum values remain deserializable only; they have no active executor or endpoint. Removed modular keys in historical settings files are ignored with a warning, and historical `D:\proya_modules` media remains untouched.

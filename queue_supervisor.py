@@ -246,8 +246,6 @@ def build_queue_command(args, run_tag: str) -> list[str]:
         command.extend(["--min-score", str(args.min_score)])
     if args.force_rescore:
         command.append("--force-rescore")
-    if args.force_modules:
-        command.append("--force-modules")
     if args.retry_failed:
         command.append("--retry-failed")
     if args.video_path:
@@ -597,7 +595,6 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--min-score", type=float, default=None)
     parser.add_argument("--python-exe", default=sys.executable)
     parser.add_argument("--force-rescore", action="store_true")
-    parser.add_argument("--force-modules", action="store_true")
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
@@ -607,7 +604,7 @@ def parse_args(argv: list[str] | None = None):
     )
     parser.add_argument(
         "--pipeline-mode",
-        choices=["full", "clips_only", "modules_only", "raw_cuts_only"],
+        choices=["full", "clips_only", "raw_cuts_only"],
         default="full",
     )
     parser.add_argument(

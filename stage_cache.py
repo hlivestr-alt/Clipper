@@ -204,20 +204,25 @@ STAGE_CONFIG_KEYS = {
         "COMPLIANCE_AUTO_FIX",
         "COMPLIANCE_BLOCK_HIGH",
         "COMPLIANCE_LM_TIMEOUT",
-        "MODULE_EXTRACTION_ENABLED",
-        "MODULE_LIBRARY_DIR",
-        "MODULE_HOOK_MIN_DURATION",
-        "MODULE_HOOK_MAX_DURATION",
-        "MODULE_MAIN_MIN_DURATION",
-        "MODULE_MAIN_MAX_DURATION",
-        "MODULE_CTA_MIN_DURATION",
-        "MODULE_CTA_MAX_DURATION",
-        "MODULE_SENTENCE_BOUNDARY_TOLERANCE",
-        "MODULE_ASSEMBLY_ENABLED",
-        "MODULE_ASSEMBLY_RENDER_LIMIT",
-        "MODULE_DEDUPE_IOU_THRESHOLD",
-        "MODULE_PRODUCT_ZOOM_ENABLED",
     ],
+}
+
+# Read-only fingerprint compatibility for normal renders created before the
+# legacy modular feature was removed. New fingerprints never include these keys.
+_LEGACY_REMOVED_FFMPEG_SETTINGS = {
+    "MODULE_EXTRACTION_ENABLED": False,
+    "MODULE_LIBRARY_DIR": r"D:\proya_modules",
+    "MODULE_HOOK_MIN_DURATION": 4.0,
+    "MODULE_HOOK_MAX_DURATION": 8.0,
+    "MODULE_MAIN_MIN_DURATION": 15.0,
+    "MODULE_MAIN_MAX_DURATION": 45.0,
+    "MODULE_CTA_MIN_DURATION": 4.0,
+    "MODULE_CTA_MAX_DURATION": 12.0,
+    "MODULE_SENTENCE_BOUNDARY_TOLERANCE": 2.0,
+    "MODULE_ASSEMBLY_ENABLED": False,
+    "MODULE_ASSEMBLY_RENDER_LIMIT": 0,
+    "MODULE_DEDUPE_IOU_THRESHOLD": 0.5,
+    "MODULE_PRODUCT_ZOOM_ENABLED": False,
 }
 
 RENDER_ASSET_PATH_KEYS = (
@@ -287,7 +292,35 @@ def stage_fingerprint_matches(
         payload = json.loads(target.read_text(encoding="utf-8"))
     except Exception:
         return False
-    return payload.get("fingerprint") == stage_fingerprint(video_path, cfg, stage, extra=extra)
+    stored = payload.get("fingerprint")
+    current = stage_fingerprint(video_path, cfg, stage, extra=extra)
+    if stored == current:
+        return True
+    return stage == "ffmpeg" and stored == _legacy_ffmpeg_fingerprint(
+        video_path, cfg, extra=extra
+    )
+
+
+def _legacy_ffmpeg_fingerprint(
+    video_path: str | Path,
+    cfg,
+    *,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    values = {
+        key: _jsonable(getattr(cfg, key, None))
+        for key in STAGE_CONFIG_KEYS["ffmpeg"]
+    }
+    values.update({key: _jsonable(value) for key, value in _LEGACY_REMOVED_FFMPEG_SETTINGS.items()})
+    raw = json.dumps(values, sort_keys=True, ensure_ascii=False, default=str)
+    return {
+        "stage": "ffmpeg",
+        "video": _path_identity(video_path),
+        "model_name": _stage_model_name(cfg, "ffmpeg"),
+        "config_hash": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+        "extra": _jsonable(extra or {}),
+        "asset_hash": _render_asset_hash(cfg),
+    }
 
 
 def _stage_model_name(cfg, stage: str) -> str:

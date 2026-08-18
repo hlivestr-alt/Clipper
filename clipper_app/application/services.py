@@ -24,11 +24,6 @@ from clipper_app.contracts.models import (
     ComplianceScanResult,
     ExportPackagingCommand,
     ExportPackagingResult,
-    ModuleAssemblyCommand,
-    ModuleOperationResult,
-    ModuleReportCommand,
-    ModuleReviewCommand,
-    ModuleValidationCommand,
     PipelineResult,
     PipelineRunCommand,
     QueueAction,
@@ -85,8 +80,6 @@ class PipelineService:
         )
         normalized = dict(result or {})
         normalized["export_batches"] = normalized.get("export_batches") or {}
-        normalized["module_extraction"] = normalized.get("module_extraction") or {}
-        normalized["modular_assembly"] = normalized.get("modular_assembly") or {}
         return PipelineResult.model_validate(normalized)
 
 
@@ -126,6 +119,16 @@ class QueueControlService:
             snapshot, snapshot_path = self._new_run_settings_snapshot(command.control_path)
             launch_info = self._ensure_supervisor_running(command, snapshot, snapshot_path)
         elif command.action == QueueAction.CONTINUE:
+            existing = queue_control.read_status_snapshot(
+                control_path=command.control_path,
+                forever_state_path=command.forever_state_path,
+                queue_state_path=command.queue_state_path,
+            )
+            if queue_control.contains_legacy_modules_only(existing):
+                raise ValueError(
+                    "Cannot continue this run: Modules Only is a legacy unsupported pipeline mode. "
+                    "The historical state was left unchanged."
+                )
             queue_control.request_continue(command.control_path)
             snapshot, snapshot_path = self._continued_run_settings_snapshot(command.control_path)
             launch_info = self._ensure_supervisor_running(command, snapshot, snapshot_path)
@@ -653,78 +656,6 @@ class ExportPackagingService:
             trigger="manual",
         )
         return ExportPackagingResult(payload=result or {})
-
-
-class ModuleService:
-    def __init__(self, settings_provider: LegacyConfigProvider | None = None) -> None:
-        self.settings_provider = settings_provider or LegacyConfigProvider()
-
-    def assemble(self, command: ModuleAssemblyCommand, sink: EventSink | None = None) -> ModuleOperationResult:
-        from main import run_module_assembly
-
-        cfg = self.settings_provider.runtime_view(self.settings_provider.snapshot())
-
-        kwargs: dict[str, Any] = {
-            "assembly_date": command.assembly_date,
-            "module_assembly_limit": command.module_assembly_limit,
-            "module_product_zoom": command.module_product_zoom,
-        }
-        if command.product:
-            kwargs["product"] = command.product
-        if sink is not None:
-            kwargs["progress_callback"] = _progress_callback(
-                sink,
-                uuid4().hex,
-                OperationKind.MODULE_ASSEMBLY,
-            )
-        result = run_module_assembly(runtime_cfg=cfg, **kwargs)
-        return ModuleOperationResult(payload=result or {})
-
-    def validate(self, command: ModuleValidationCommand) -> ModuleOperationResult:
-        from module_visual_validator import validate_module_library_visual
-
-        cfg = self.settings_provider.runtime_view(self.settings_provider.snapshot())
-        result = validate_module_library_visual(
-            cfg,
-            product=command.product,
-            limit=command.limit,
-            force=command.force,
-            visual_status=command.visual_status,
-            role=command.role,
-            approved_only=command.approved_only,
-            priority=command.priority,
-        )
-        return ModuleOperationResult(payload=result or {})
-
-    def review(self, command: ModuleReviewCommand) -> ModuleOperationResult:
-        from module_review import update_module_review
-
-        cfg = self.settings_provider.runtime_view(self.settings_provider.snapshot())
-        result = update_module_review(
-            command.identifier,
-            command.status,
-            cfg,
-            note=command.note,
-            reviewer=command.reviewer,
-        )
-        return ModuleOperationResult(payload=result or {})
-
-    def report(self, command: ModuleReportCommand) -> ModuleOperationResult:
-        cfg = self.settings_provider.runtime_view(self.settings_provider.snapshot())
-        payload: dict[str, Any] = {}
-        if command.include_library_report:
-            from module_report import build_module_library_report
-
-            payload["report"] = build_module_library_report(cfg)
-        if command.include_review_queue:
-            from module_review import build_module_review_queue
-
-            payload["review_queue"] = build_module_review_queue(
-                cfg,
-                status=command.review_filter,
-                limit=command.review_limit,
-            )
-        return ModuleOperationResult(payload=payload)
 
 
 class HealthService:

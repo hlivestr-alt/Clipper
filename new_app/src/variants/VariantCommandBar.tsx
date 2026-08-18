@@ -67,10 +67,11 @@ export function VariantCommandBar({
           </span>
           {conflict && <span className="variant-command-status conflict" role="alert">Revision conflict</span>}
         </div>
-        <p>Configure how future clips are generated</p>
+        <p>Configure how clips are transformed and rendered.</p>
         {conflict && <small className="variant-command-conflict">{conflict}</small>}
       </div>
       <div className="variant-command-meta" aria-label="Active variation profile">
+        <span>Default profile</span>
         <span>{variantCount} {variantCount === 1 ? "variant" : "variants"}</span>
         <span>Rev {revision ? revision.slice(0, 12) : "new"}</span>
       </div>

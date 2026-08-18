@@ -15,7 +15,7 @@ The catalog and queue migrations are deliberately feature-flagged. The current d
 - TikTok encrypted credentials: `working/secrets/tiktok_oauth.tokens` by default; this is separate from the catalog.
 - WhatsApp delivery database: `D:\output_clips\export_batches_whatsapp\_whatsapp_state.sqlite3` by current configuration; this is a separate authoritative store.
 
-The shared catalog currently uses schema version 12. It contains rebuildable sources/revisions/snapshots/repairs; outputs, clips, scores, compliance, modules, and export status; optional queue active/history state; durable change events; and TikTok snapshots, hashtags, videos, downloads, media links, fingerprints, and patterns.
+The shared catalog currently uses schema version 12. It contains rebuildable sources/revisions/snapshots/repairs; outputs, clips, scores, compliance, and export status; optional queue active/history state; durable change events; and TikTok snapshots, hashtags, videos, downloads, media links, fingerprints, and patterns. An existing database may retain an inert legacy `modules` table; current code neither creates, reads, updates, nor drops it.
 
 SQLite uses WAL mode, foreign keys, a busy timeout, and bounded retries. Queue journals are append-only and checksummed. In SQLite queue mode, the compatibility JSON snapshot contains active state in schema version 3; a schema-version-2 export with embedded history can be generated for rollback or external legacy tools.
 
@@ -68,7 +68,7 @@ Always record the backup/export location and verify the replacement before delet
 
 3. **Catalog read cutover**
 
-   Set `CLIPPER_CATALOG_MODE=shadow` for a soak, then `catalog` after comparisons remain clean. Scores, compliance, modules, overview, and supported output reads use the indexed model. Revert immediately to `legacy` if a query or count disagrees; catalog reads do not modify legacy artifacts.
+   Set `CLIPPER_CATALOG_MODE=shadow` for a soak, then `catalog` after comparisons remain clean. Scores, compliance, overview, and supported output reads use the indexed model. Revert immediately to `legacy` if a query or count disagrees; catalog reads do not modify legacy artifacts.
 
 4. **Queue read cutover**
 

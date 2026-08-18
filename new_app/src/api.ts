@@ -224,65 +224,6 @@ export type ComplianceIndexPage = {
   filter_options: Record<string, string[]>;
 };
 
-export type ModuleReadinessRow = {
-  product: string;
-  product_key: string;
-  hook: number;
-  main: number;
-  cta: number;
-  total: number;
-  readiness: "ready" | "partial" | "empty";
-  visual_total: number;
-  visual_passed: number;
-  visual_failed: number;
-  visual_not_run: number;
-  zoom_ready_candidates: number;
-};
-
-export type ModuleReadiness = {
-  library_dir: string;
-  index_path: string;
-  index_exists: boolean;
-  index_updated_at: string;
-  index_module_count: number;
-  thresholds: Record<string, number>;
-  rows: ModuleReadinessRow[];
-};
-
-export type ModuleLibraryRow = {
-  module_id: string;
-  product: string;
-  product_key: string;
-  role: string;
-  source_date: string;
-  source_video: string;
-  duration: number;
-  confidence: number;
-  quality_status: string;
-  review_status: string;
-  boundary_mode?: string;
-  visual_validation_status: string;
-  visual_product_hits: number;
-  visual_product_confidence_max?: number;
-  visual_validation_reason?: string;
-  file_artifact?: ArtifactRef | null;
-  transcript_text?: string;
-};
-
-export type ModuleDetail = {
-  selected?: ModuleLibraryRow | null;
-  transcript_text: string;
-};
-
-export type ModuleLibraryPage = {
-  library_dir: string;
-  rows: ModuleLibraryRow[];
-  total: number;
-  limit: number;
-  offset: number;
-  filter_options: Record<string, string[]>;
-};
-
 export type LogTail = {
   path: string;
   exists: boolean;

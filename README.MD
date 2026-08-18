@@ -1,8 +1,8 @@
 # PROYA VOD Clipper
 
-Windows-first local production system for turning long Indonesian PROYA skincare livestream VODs into vertical short-video variants. The repository includes the video pipeline, resumable multi-VOD queue, scoring and compliance, reusable modules, variation profiles and previews, TikTok trend research, WhatsApp-ready export/delivery state, a FastAPI control API, a React operator app, and a portable Electron shell.
+Windows-first local production system for turning long Indonesian PROYA skincare livestream VODs into vertical short-video variants. The repository includes the video pipeline, resumable multi-VOD queue, scoring and compliance, variation profiles and previews, TikTok trend research, WhatsApp-ready export/delivery state, a FastAPI control API, a React operator app, and a portable Electron shell.
 
-The default production sources of truth are still the files under `working/`, `D:\output_clips`, and `D:\proya_modules`. A rebuildable SQLite catalog and SQLite queue authority are available behind rollout flags; see [docs/long_term_storage_rollout.md](docs/long_term_storage_rollout.md).
+The default production sources of truth are still the files under `working/` and `D:\output_clips`. A rebuildable SQLite catalog and SQLite queue authority are available behind rollout flags; see [docs/long_term_storage_rollout.md](docs/long_term_storage_rollout.md). Historical media under `D:\proya_modules` is intentionally preserved but is no longer read or modified by Clipper.
 
 ## Prerequisites
 
@@ -13,7 +13,7 @@ The default production sources of truth are still the files under `working/`, `D
 - A CUDA-capable PyTorch/Whisper/YOLO environment for the configured GPU paths.
 - Trained YOLO weights at `models/proya_best.pt`.
 
-The checked-in defaults are machine-specific: VODs are read from `D:\VOD`, finished clips go to `D:\output_clips`, reusable modules go to `D:\proya_modules`, and temporary/cached state goes under `working/`. Review `config.py` before a production run.
+The checked-in defaults are machine-specific: VODs are read from `D:\VOD`, finished clips go to `D:\output_clips`, and temporary/cached state goes under `working/`. Review `config.py` before a production run.
 
 ## Quick Start
 
@@ -82,20 +82,15 @@ For continuous supervised operation and graceful control:
 .\run_queue_control.ps1 continue
 ```
 
-The queue supports `single_video`, `folder_once`, and `folder_repeat`; `full`, `clips_only`, `modules_only`, and `raw_cuts_only`; and `all`, `original`, or a custom variant count. JSON queue state remains the default. The rollout and maintenance commands are documented in [docs/long_term_storage_rollout.md](docs/long_term_storage_rollout.md).
+The queue supports `single_video`, `folder_once`, and `folder_repeat`; `full`, `clips_only`, and `raw_cuts_only`; and `all`, `original`, or a custom variant count. Historical `modules_only` state remains readable but is explicitly unsupported and cannot be started or continued. JSON queue state remains the default. The rollout and maintenance commands are documented in [docs/long_term_storage_rollout.md](docs/long_term_storage_rollout.md).
 
-## Modules, Review, and Export
+## Modular Status and Export
 
 ```powershell
-python main.py --video "D:\VOD\livestream.mp4" --extract-modules-only
-.\run_module_assembly.ps1 -DryRun
-python main.py --module-library-report
-python main.py --module-review-queue
-python main.py --validate-modules-visual-only
 python main.py --package-export-batches --dry-run
 ```
 
-Module extraction and assembly are implemented but disabled in the normal `config.py` path; the explicit commands enable the intended one-off workflows. Export packaging uses append-only numbered folders, duplicate protection, and diversity-first rolling allocation. With `WHATSAPP_DELIVERY_ENABLED=True`, newly published batches are also registered in the WhatsApp delivery state.
+The legacy modular extraction, review, validation, catalog, API, and assembly system has been removed. Modular functionality is temporarily unavailable; `/modules` is a neutral placeholder until a replacement is designed in a separate project. The production pipeline has no modular dependency, and historical `D:\proya_modules` data is preserved in place. Export packaging uses append-only numbered folders, duplicate protection, and diversity-first rolling allocation. With `WHATSAPP_DELIVERY_ENABLED=True`, newly published batches are also registered in the WhatsApp delivery state.
 
 ## Variants, Product Information, and Trends
 

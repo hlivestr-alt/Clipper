@@ -67,13 +67,7 @@ import {
   DesktopRuntimeStatus,
   getJson,
   LogTail,
-  ModuleDetail,
-  ModuleLibraryPage,
-  ModuleLibraryRow,
-  ModuleReadiness,
-  ModuleReadinessRow,
   OverviewData,
-  OverviewTopClip,
   ProductInformationStatus,
   query,
   QueueDetail,
@@ -187,13 +181,16 @@ type NavItem = {
 };
 
 const mainNav: NavItem[] = [
-  { label: "Overview", path: "/overview", match: "/overview", icon: LayoutDashboard, detail: "Production, quality, compliance, and delivery health" },
-  { label: "Production", path: "/production/live", match: "/production", icon: Gauge, detail: "Current run, queue progress, and launch controls" },
-  { label: "Review", path: "/review/clips", match: "/review", icon: Video, detail: "Clip quality, variants, and policy review" },
-  { label: "Trends", path: "/trends", match: "/trends", icon: TrendingUp, detail: "TikTok discovery, approved media, and editing fingerprints" },
-  { label: "Variants", path: "/variants", match: "/variants", icon: SlidersHorizontal, detail: "Global variant profiles and previews" },
-  { label: "Modules", path: "/modules", match: "/modules", icon: Library, detail: "Reusable hook, main, and CTA inventory" },
-  { label: "Deliveries", path: "/deliveries", match: "/deliveries", icon: PackageCheck, detail: "Automatic batching and recovery" }
+  { label: "Home", path: "/overview", match: "/overview", icon: LayoutDashboard, detail: "What needs attention and recent production work." },
+  { label: "Production", path: "/production/live", match: "/production", icon: Play, detail: "Run your pipeline to generate and process clips." },
+  { label: "Review", path: "/review/clips", match: "/review", icon: Video, detail: "Review and approve clips from your production runs." },
+  { label: "Variants", path: "/variants", match: "/variants", icon: SlidersHorizontal, detail: "Configure how clips are transformed and rendered." },
+  { label: "Deliveries", path: "/deliveries", match: "/deliveries", icon: PackageCheck, detail: "Manage and track clip deliveries." }
+];
+
+const toolNav: NavItem[] = [
+  { label: "Trends", path: "/trends", match: "/trends", icon: TrendingUp, detail: "TikTok discovery and editing recommendations." },
+  { label: "Modules", path: "/modules", match: "/modules", icon: Library, detail: "Modular workspace is being rebuilt." }
 ];
 
 const secondaryNav: NavItem[] = [
@@ -201,7 +198,7 @@ const secondaryNav: NavItem[] = [
   { label: "Settings", path: "/settings/configuration", match: "/settings", icon: Settings, detail: "Configuration and local diagnostics" }
 ];
 
-const allNav = [...mainNav, ...secondaryNav];
+const allNav = [...mainNav, ...toolNav, ...secondaryNav];
 
 const contextTabs: Array<{ match: string; items: Array<{ label: string; path: string; icon: LucideIcon }> }> = [
   {
@@ -342,6 +339,9 @@ function compactJson(value?: Record<string, unknown> | null): string {
 }
 
 function operationLabel(value: string): string {
+  if (value === "module_assembly" || value === "module_review") {
+    return `${value.replace(/_/g, " ")} (legacy unsupported)`;
+  }
   return value.replace(/_/g, " ");
 }
 
@@ -358,7 +358,6 @@ const runModeOptions: Array<{ value: QueueRunMode; label: string }> = [
 const pipelineModeOptions: Array<{ value: QueuePipelineMode; label: string }> = [
   { value: "full", label: "Full Pipeline" },
   { value: "clips_only", label: "Clips Only" },
-  { value: "modules_only", label: "Modules Only" },
   { value: "raw_cuts_only", label: "Raw Cuts Only" }
 ];
 
@@ -383,7 +382,9 @@ function launchSummary(config?: Partial<QueueLaunchConfig>, fallback = "Folder R
     return fallback;
   }
   const run = runModeOptions.find((item) => item.value === config.run_mode)?.label ?? config.run_mode;
-  const pipeline = pipelineModeOptions.find((item) => item.value === config.pipeline_mode)?.label ?? config.pipeline_mode;
+  const pipeline = config.pipeline_mode === "modules_only"
+    ? "Modules Only (legacy unsupported)"
+    : pipelineModeOptions.find((item) => item.value === config.pipeline_mode)?.label ?? config.pipeline_mode;
   const variantMode = config.pipeline_mode === "raw_cuts_only" ? "original" : (config.variant_mode ?? "all");
   const variants = variantMode === "custom"
     ? `${config.variant_count ?? 1} Variants`
@@ -532,28 +533,6 @@ function displayTime(value?: string | null): string {
   return value;
 }
 
-function dashboardDateText(): string {
-  return new Intl.DateTimeFormat("en-US", {
-    weekday: "long",
-    month: "long",
-    day: "numeric",
-    year: "numeric"
-  }).format(new Date());
-}
-
-type ProductionDay = {
-  key: string;
-  label: string;
-  count: number;
-};
-
-type ScoreTrendPoint = {
-  key: string;
-  label: string;
-  average: number;
-  count: number;
-};
-
 type ComplianceOverview = {
   scanned: number;
   passed: number;
@@ -581,104 +560,6 @@ function numericValue(value: unknown): number | undefined {
 
 function recordNumber(record: Record<string, unknown> | undefined, key: string): number | undefined {
   return numericValue(record?.[key]);
-}
-
-function parseDateValue(value?: string | null): Date | undefined {
-  const text = String(value ?? "").trim();
-  if (!text) {
-    return undefined;
-  }
-  const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
-  if (dateOnly) {
-    const [, year, month, day] = dateOnly;
-    return new Date(Number(year), Number(month) - 1, Number(day));
-  }
-  const parsed = new Date(text);
-  return Number.isNaN(parsed.getTime()) ? undefined : parsed;
-}
-
-function localDayKey(date: Date): string {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
-}
-
-function dayWithOffset(offset: number): Date {
-  const date = new Date();
-  date.setHours(0, 0, 0, 0);
-  date.setDate(date.getDate() + offset);
-  return date;
-}
-
-function shortWeekday(date: Date): string {
-  return new Intl.DateTimeFormat(undefined, { weekday: "short" }).format(date);
-}
-
-function shortMonthDay(date: Date): string {
-  return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" }).format(date);
-}
-
-function shortDateText(value?: string | null): string {
-  const date = parseDateValue(value);
-  return date ? new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric" }).format(date) : "-";
-}
-
-function buildProductionDays(rows: QueueRunRow[], days = 7): ProductionDay[] {
-  const dates = Array.from({ length: days }, (_, index) => dayWithOffset(index - (days - 1)));
-  const counts = new Map(dates.map((date) => [localDayKey(date), 0]));
-  rows.forEach((row) => {
-    const date = parseDateValue(row.completed_at || row.started_at);
-    if (!date) {
-      return;
-    }
-    const key = localDayKey(date);
-    if (!counts.has(key)) {
-      return;
-    }
-    counts.set(key, (counts.get(key) ?? 0) + Math.max(0, row.clips_generated ?? 0));
-  });
-  return dates.map((date) => {
-    const key = localDayKey(date);
-    return {
-      key,
-      label: shortWeekday(date),
-      count: counts.get(key) ?? 0
-    };
-  });
-}
-
-function buildScoreTrendPoints(rows: ScoreRow[], days = 14): ScoreTrendPoint[] {
-  const earliest = dayWithOffset(-(days - 1)).getTime();
-  const groups = new Map<string, { total: number; count: number; date: Date }>();
-  rows.forEach((row) => {
-    const score = numericValue(row.total_score);
-    const date = parseDateValue(row.scored_at || row.source_date);
-    if (score === undefined || !date || date.getTime() < earliest) {
-      return;
-    }
-    const key = localDayKey(date);
-    const current = groups.get(key) ?? { total: 0, count: 0, date };
-    current.total += score;
-    current.count += 1;
-    groups.set(key, current);
-  });
-  return Array.from(groups.entries())
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([key, group]) => ({
-      key,
-      label: shortMonthDay(group.date),
-      average: group.total / Math.max(1, group.count),
-      count: group.count
-    }));
-}
-
-function averageScore(rows: ScoreRow[]): number | undefined {
-  const values = rows.map((row) => numericValue(row.total_score)).filter((value): value is number => value !== undefined);
-  if (values.length === 0) {
-    return undefined;
-  }
-  return values.reduce((total, value) => total + value, 0) / values.length;
 }
 
 function exportReadyRows(rows: ScoreRow[]): ScoreRow[] {
@@ -767,27 +648,20 @@ function jobPollingInterval(page?: ControlJobPage): number {
 }
 
 function AppShell({ children }: { children: ReactNode }) {
-  const liveUpdates = useLiveUpdateStatus();
   const dashboard = useApiQuery<DashboardSummary>("/api/dashboard", dashboardPollingInterval, true);
-  const systemQuery = useApiQuery<SystemStats>("/api/system", 15_000, true);
   const summary = dashboard.envelope?.data;
-  const system = systemQuery.envelope?.data;
   const page = usePageInfo();
   const location = useLocation();
-  const topbarDetail = page.path === "/overview" ? dashboardDateText() : page.detail;
+  const topbarDetail = page.path === "/overview" ? "Welcome back. Here’s what’s happening with your pipeline." : page.detail;
   const variantsOwnsPageIdentity = location.pathname === "/variants";
   return (
     <div className="app-shell">
       <aside className="side-rail">
         <Link className="brand-block" to="/overview" aria-label="Clipper overview home">
-          <div className="brand-mark">C</div>
-          <div>
-            <div className="brand-title">Clipper</div>
-            <div className="brand-subtitle">Operations</div>
-          </div>
+          <div className="brand-mark" aria-hidden="true">C</div>
+          <div className="brand-title">Clipper</div>
         </Link>
 
-        <div className="nav-section-label">Workspace</div>
         <nav className="nav-list" aria-label="Main navigation">
           {mainNav.map((item) => (
             <NavLink className={() => `nav-item ${navItemIsActive(item, location.pathname) ? "active" : ""}`} key={item.path} to={item.path} aria-label={item.label} title={item.label}>
@@ -797,7 +671,6 @@ function AppShell({ children }: { children: ReactNode }) {
           ))}
         </nav>
 
-        <div className="nav-section-label utility">Utility</div>
         <nav className="nav-list secondary-nav" aria-label="Support navigation">
           {secondaryNav.map((item) => (
             <NavLink className={() => `nav-item ${navItemIsActive(item, location.pathname) ? "active" : ""}`} key={item.path} to={item.path} aria-label={item.label} title={item.label}>
@@ -806,27 +679,17 @@ function AppShell({ children }: { children: ReactNode }) {
             </NavLink>
           ))}
         </nav>
-
-        <div className="rail-metrics" aria-label="Production summary">
-          <div>
-            <span>Total clips</span>
-            <strong>{numberText(summary?.total_clips)}</strong>
-          </div>
-          <div>
-            <span>Videos</span>
-            <strong>{numberText(summary?.total_videos)}</strong>
-          </div>
-        </div>
-
-        <div className="rail-status">
-          <span className={`status-dot ${statusClass(healthText(summary))}`} />
-          <div>
-            <div className="rail-status-main">{healthText(summary)}</div>
-            <div className="rail-status-sub">
-              {system?.gpu_label || "System metrics loading"} · {liveUpdates.mode === "live" ? "Live updates" : liveUpdates.mode === "connecting" ? "Connecting" : "Polling fallback"}
-            </div>
-          </div>
-        </div>
+        <details className="sidebar-tools">
+          <summary>More</summary>
+          <nav className="nav-list" aria-label="Additional tools">
+            {toolNav.map((item) => (
+              <NavLink className={() => `nav-item ${navItemIsActive(item, location.pathname) ? "active" : ""}`} key={item.path} to={item.path}>
+                <item.icon aria-hidden="true" size={17} />
+                <span>{item.label}</span>
+              </NavLink>
+            ))}
+          </nav>
+        </details>
       </aside>
 
       <nav className="mobile-bottom-nav" aria-label="Mobile navigation">
@@ -839,7 +702,7 @@ function AppShell({ children }: { children: ReactNode }) {
         <details className="mobile-more-nav">
           <summary><Settings size={18} aria-hidden="true" /><span>More</span></summary>
           <div>
-            {[...mainNav.slice(3), ...secondaryNav].map((item) => (
+            {[...mainNav.slice(3), ...toolNav, ...secondaryNav].map((item) => (
               <Link to={item.path} key={item.path}><item.icon size={17} aria-hidden="true" />{item.label}</Link>
             ))}
           </div>
@@ -850,7 +713,6 @@ function AppShell({ children }: { children: ReactNode }) {
         <header className={`topbar ${variantsOwnsPageIdentity ? "command-page-topbar" : ""}`}>
           {!variantsOwnsPageIdentity && (
             <div>
-              <div className="eyebrow">Clipper</div>
               <h1>{page.label}</h1>
               <p>{topbarDetail}</p>
             </div>
@@ -1491,17 +1353,16 @@ function RunLauncher({
     return (
       <>
         <article className="operation-panel current-run-panel">
-          <div className="current-run-head">
-            <h2>Current Run</h2>
-            <Badge value={currentRun?.status || "Idle"} kind={currentRun ? runStatusKind(currentRun.status) : "neutral"} />
-          </div>
-
           {currentRun ? (
             <>
+              <div className="current-run-head">
+                <div><h2>Active run</h2><p>{summary}</p></div>
+                <Badge value={currentRun.status} kind={runStatusKind(currentRun.status)} />
+              </div>
               <div className="current-run-main">
                 <h3>{currentRun.video_name}</h3>
                 <div className="current-stage">
-                  <ActiveStageIcon size={28} aria-hidden="true" />
+                  <ActiveStageIcon size={20} aria-hidden="true" />
                   <strong>{activeStageMeta.label}</strong>
                 </div>
                 <div className="run-progress-line" aria-label={`Current run progress ${currentProgress}%`}>
@@ -1514,17 +1375,14 @@ function RunLauncher({
 
               <div className="current-run-meta">
                 <div className="run-meta-item">
-                  <Video size={22} aria-hidden="true" />
                   <span>Clips generated</span>
                   <strong>{numberText(currentRun.clips_generated)}</strong>
                 </div>
                 <div className="run-meta-item wide">
-                  <ListChecks size={22} aria-hidden="true" />
                   <span>Current step</span>
                   <strong>{currentRun.current_step || activeStageMeta.label}</strong>
                 </div>
                 <div className="run-meta-item">
-                  <Clock size={22} aria-hidden="true" />
                   <span>Elapsed</span>
                   <strong>{currentRun.duration || "-"}</strong>
                 </div>
@@ -1542,7 +1400,7 @@ function RunLauncher({
                   </button>
                   <button className="danger-button" disabled={!active} onClick={() => setConfirmStop(true)}>
                     <Square size={16} aria-hidden="true" />
-                    Stop Queue
+                    Stop run
                   </button>
                 </div>
               </div>
@@ -1550,77 +1408,78 @@ function RunLauncher({
           ) : (
             <div className="operation-empty current-run-empty">
               <span className="operation-empty-mark">
-                <Clock size={30} aria-hidden="true" />
+                <Play size={28} aria-hidden="true" />
               </span>
               <strong>No active run</strong>
-              <span>Queue activity will appear here when production starts.</span>
+              <span>You don’t have any runs in progress.</span>
+              <button className="primary-button" onClick={() => document.getElementById("new-run-form")?.scrollIntoView({ behavior: "smooth" })}>Start a run</button>
             </div>
           )}
         </article>
 
-        <article className="operation-panel next-run-panel">
+        {!active && <article className="operation-panel next-run-panel" id="new-run-form">
           <div className="next-run-head">
-            <h2>Next Run</h2>
-            <p>Set the next queue pass before production starts.</p>
+            <h2>Configure a new run</h2>
           </div>
-          <div className="next-run-options">
-            <div className="next-run-control-card">
-              <SegmentedControl label="Run mode" value={runMode} options={runModeOptions} onChange={setRunMode} disabled={active} />
-            </div>
+          <div className="run-form-rows">
+            <label className="run-form-row">
+              <span>Source</span>
+              <select value={runMode} onChange={(event) => setRunMode(event.target.value as QueueRunMode)}>
+                {runModeOptions.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}
+              </select>
+              <small>{runMode === "folder_repeat" ? "Process all folders and keep watching for new work." : runMode === "folder_once" ? "Process the source folder once." : "Process one selected video."}</small>
+            </label>
             {needsVod && (
-              <div className="next-run-control-card wide">
-                <FilterField label="VOD">
-                  <select value={videoPath} disabled={active} onChange={(event) => setVideoPath(event.target.value)}>
-                    <option value="">Select VOD</option>
-                    {files.map((file) => (
-                      <option value={file.path} key={file.path}>{file.name}</option>
-                    ))}
-                  </select>
-                </FilterField>
-              </div>
+              <label className="run-form-row">
+                <span>Video</span>
+                <select value={videoPath} onChange={(event) => setVideoPath(event.target.value)}>
+                  <option value="">Select video</option>
+                  {files.map((file) => <option value={file.path} key={file.path}>{file.name}</option>)}
+                </select>
+                <small>Select a video from the configured source folder.</small>
+              </label>
             )}
-            <div className="next-run-control-card wide">
-              <SegmentedControl label="Pipeline" value={pipelineMode} options={pipelineModeOptions} onChange={setPipelineMode} disabled={active} />
-            </div>
-            <div className="next-run-control-card">
-              <SegmentedControl
-                label="Variants"
-                value={effectiveVariantMode}
-                options={variantModeOptions}
-                onChange={setVariantMode}
-                disabled={active || pipelineMode === "raw_cuts_only"}
-              />
-            </div>
+            <label className="run-form-row">
+              <span>Pipeline</span>
+              <select value={pipelineMode} onChange={(event) => setPipelineMode(event.target.value as QueuePipelineMode)}>
+                {pipelineModeOptions.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}
+              </select>
+              <small>{pipelineMode === "full" ? "Include transcription, curation, scanning, and rendering." : "Run only the selected pipeline stages."}</small>
+            </label>
+            <label className="run-form-row">
+              <span>Variants</span>
+              <select value={effectiveVariantMode} disabled={pipelineMode === "raw_cuts_only"} onChange={(event) => setVariantMode(event.target.value as QueueVariantMode)}>
+                {variantModeOptions.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}
+              </select>
+              <small>{pipelineMode === "raw_cuts_only" ? "Raw cuts use the original output only." : "Choose which configured variants to render."}</small>
+            </label>
+            <label className="run-form-row">
+              <span>Max clips</span>
+              <input type="number" min={0} value={maxClips} onChange={(event) => setMaxClips(event.target.value)} />
+              <small>0 means unlimited.</small>
+            </label>
             {effectiveVariantMode === "custom" && (
-              <div className="next-run-control-card compact">
-                <FilterField label="Variant count">
-                  <select value={variantCount} disabled={active} onChange={(event) => setVariantCount(Number.parseInt(event.target.value, 10))}>
-                    {[1, 2, 3, 4, 5, 6].map((count) => (
-                      <option value={count} key={count}>{count}</option>
-                    ))}
-                  </select>
-                </FilterField>
-              </div>
+              <label className="run-form-row">
+                <span>Variant count</span>
+                <select value={variantCount} onChange={(event) => setVariantCount(Number.parseInt(event.target.value, 10))}>
+                  {[1, 2, 3, 4, 5, 6].map((count) => <option value={count} key={count}>{count}</option>)}
+                </select>
+                <small>Render this many variants for each clip.</small>
+              </label>
             )}
           </div>
+          <details className="advanced-options">
+            <summary>Advanced options</summary>
+            <div className="advanced-options-body"><span>Run setup</span><strong>{draftSummary}</strong></div>
+          </details>
           <div className="next-run-action-row">
-            <div className="next-run-summary">
-              <span>Ready setup</span>
-              <strong>{draftSummary}</strong>
-            </div>
-            <FilterField label="Max clips">
-              <input type="number" min={0} value={maxClips} disabled={active} onChange={(event) => setMaxClips(event.target.value)} />
-            </FilterField>
-            <button className="primary-button" disabled={!canStart} onClick={startQueue}>
-              <Play size={16} aria-hidden="true" />
-              Start Queue
-            </button>
+            <button className="secondary-button" type="button" onClick={() => { setRunMode("folder_repeat"); setPipelineMode("full"); setVariantMode("all"); setVariantCount(2); setMaxClips("0"); setVideoPath(""); }}>Reset</button>
+            <button className="primary-button" disabled={!canStart} onClick={startQueue}><Play size={16} aria-hidden="true" />Start run</button>
           </div>
-          {active && <StateBlock kind="info" detail={summary} />}
           {needsVod && vods.error && <StateBlock kind="bad" detail={vods.error} />}
-          {needsVod && !vods.loading && files.length === 0 && <StateBlock kind="warn" detail="No supported VOD files found." />}
+          {needsVod && !vods.loading && files.length === 0 && <StateBlock kind="warn" detail="No supported video files found." />}
           <ActionNotice message={message} />
-        </article>
+        </article>}
         <ConfirmDialog
           open={confirmStop}
           title="Stop the production queue?"
@@ -1737,6 +1596,7 @@ function OperationsPage() {
   const recentJobs = jobs?.jobs ?? [];
   const currentRun = pickCurrentRun(rows, summary?.queue_status);
   const activeStage = stageKeyForRun(currentRun);
+  const activeProduction = Boolean(currentRun) || isQueueStatusActive(summary?.queue_status);
 
   return (
     <section className="page-stack operations-page">
@@ -1745,6 +1605,7 @@ function OperationsPage() {
       <StateBlock kind="warn" warnings={dashboard.envelope?.warnings} />
       <RunLauncher onQueueRefresh={dashboard.refresh} surface="operations" />
 
+      {activeProduction ? <>
       <article className="operation-panel pipeline-progress-panel">
         <h2>Pipeline Progress</h2>
         <div className="operation-stage-grid">
@@ -1846,6 +1707,16 @@ function OperationsPage() {
           </div>
         </article>
       </div>
+      </> : (
+        <section className="home-section production-recent-runs">
+          <h2>Recent runs</h2>
+          {rows.length ? <div className="table-wrap"><table><thead><tr><th>Run</th><th>Status</th><th>Started</th><th>Duration</th></tr></thead><tbody>
+            {[...rows].sort((left, right) => runTime(right) - runTime(left)).slice(0, 5).map((row) => (
+              <tr key={`${row.video_name}-${row.started_at}`}><td className="strong">{row.video_name}</td><td><Badge value={row.status} /></td><td>{displayTime(row.started_at)}</td><td>{row.duration || "—"}</td></tr>
+            ))}
+          </tbody></table></div> : <EmptyState icon={ListChecks} title="No runs yet" detail="Completed production runs will appear here." />}
+        </section>
+      )}
     </section>
   );
 }
@@ -1897,50 +1768,17 @@ function DetailItem({ label, value }: { label: string; value: ReactNode }) {
 
 function DashboardPage() {
   const dashboard = useApiQuery<DashboardSummary>("/api/dashboard", dashboardPollingInterval, true);
-  const overview = useApiQuery<OverviewData>(
-    "/api/overview",
-    (data) => data?.queue_active ? 10_000 : 30_000,
-    true
-  );
+  const overview = useApiQuery<OverviewData>("/api/overview", 30_000, true);
   const summary = dashboard.envelope?.data;
   const overviewData = overview.envelope?.data;
-  const complianceOverview: ComplianceOverview = {
-    scanned: overviewData?.compliance.scanned ?? 0,
-    passed: overviewData?.compliance.passed ?? 0,
-    blocked: overviewData?.compliance.blocked ?? 0,
-    rate: overviewData?.compliance.rate ?? 0
-  };
   const exportOverview = buildExportOverview(overviewData?.export);
-  const exportStatusLabel = exportOverview.available
-    ? reviewFlagLabel(exportOverview.status || (exportOverview.dryRun ? "preflight" : "completed"))
-    : "Awaiting reconciliation";
-  const exportHint = !exportOverview.available
-    ? "Awaiting the next packaging pass"
-    : exportOverview.pending > 0
-      ? `${numberText(exportOverview.pending)} clip(s) require reconciliation`
-      : "Automatic batching is current";
-  const productionDays = summary?.production_days?.length
-    ? summary.production_days.map((point) => {
-        const date = new Date(`${point.date}T12:00:00`);
-        return { key: point.date, label: shortWeekday(date), count: point.clips };
-      })
-    : buildProductionDays(summary?.rows ?? []);
-  const productionTotal = productionDays.reduce((total, day) => total + day.count, 0);
-  const topRows = overviewData?.top_clips ?? [];
-  const trendPoints: ScoreTrendPoint[] = (overviewData?.score_trend ?? []).map((point) => ({
-    key: point.date,
-    label: shortMonthDay(new Date(`${point.date}T12:00:00`)),
-    average: point.average_score,
-    count: point.scored_count
-  }));
-  const scoreAverage = overviewData?.average_score ?? undefined;
-  const firstTrend = trendPoints[0]?.average;
-  const latestTrend = trendPoints[trendPoints.length - 1]?.average;
-  const scoreDelta = firstTrend !== undefined && latestTrend !== undefined ? latestTrend - firstTrend : undefined;
-  const complianceRateText = complianceOverview.scanned > 0 ? `${complianceOverview.rate.toFixed(1)}%` : "-";
-  const scoreHint = scoreDelta === undefined
-    ? `${numberText(overviewData?.scored_count)} scored clips`
-    : `${scoreDelta >= 0 ? "+" : "-"}${Math.abs(scoreDelta).toFixed(1)} vs chart start`;
+  const rows = summary?.rows ?? [];
+  const recentRuns = [...rows].sort((left, right) => runTime(right) - runTime(left)).slice(0, 6);
+  const readyForReview = (overviewData?.top_clips ?? []).filter((clip) => statusClass(clip.status) === "good").length;
+  const stoppedRuns = rows.filter((row) => ["stopped", "failed", "interrupted"].some((value) => row.status.toLowerCase().includes(value))).length;
+  const totalDuration = recentRuns.map((row) => row.duration).find(Boolean) || "—";
+  const hour = new Date().getHours();
+  const greeting = hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
 
   return (
     <section className="page-stack overview-page">
@@ -1949,150 +1787,34 @@ function DashboardPage() {
       {overview.error && <StateBlock kind="bad" title="Overview read failed" detail={overview.error} />}
       <StateBlock kind="warn" warnings={[...(dashboard.envelope?.warnings ?? []), ...(overview.envelope?.warnings ?? [])]} />
 
-      <div className="overview-kpi-grid">
-        <OverviewKpiCard
-          label="Clips Today"
-          value={numberText(summary?.clips_today ?? summary?.clips_last_24h)}
-          hint={`${numberText(summary?.clips_per_hour, 1)} per hour / ${numberText(summary?.clips_last_24h)} in 24h`}
-          icon={TrendingUp}
-          kind="good"
-        />
-        <OverviewKpiCard
-          label="Pending Export Packaging"
-          value={exportOverview.available ? numberText(exportOverview.pending) : "—"}
-          hint={exportHint}
-          icon={FolderOpen}
-          kind={!exportOverview.available ? "info" : exportOverview.pending > 0 || exportOverview.errorCount > 0 ? "bad" : "good"}
-        />
-        <OverviewKpiCard
-          label="Compliance Rate"
-          value={complianceRateText}
-          hint={`${numberText(complianceOverview.blocked)} blocked clips`}
-          icon={ShieldCheck}
-          kind={complianceOverview.blocked > 0 ? "bad" : "good"}
-        />
-        <OverviewKpiCard
-          label="Avg Score"
-          value={scoreAverage === undefined ? "-" : scoreAverage.toFixed(1)}
-          hint={scoreHint}
-          icon={Gauge}
-          kind="good"
-          highlight
-        />
-      </div>
+      <section className="home-hero">
+        <div><h2>{greeting}</h2><p>You’re all set to create and process clips.</p></div>
+        <Link className="primary-button" to="/production/live"><Play size={16} aria-hidden="true" />Start production</Link>
+      </section>
 
-      <div className="overview-two-column">
-        <article className="overview-panel overview-production-panel">
-          <div className="overview-panel-head">
-            <div>
-              <h2>Last 7 Days Production</h2>
-              <p>Completed clips from queue runs</p>
-            </div>
-          </div>
-          <OverviewProductionBars days={productionDays} />
-          <div className="overview-panel-footer">
-            Total this week: <strong>{numberText(productionTotal)}</strong> clips
-          </div>
-        </article>
+      <section className="home-section">
+        <h2>Needs attention</h2>
+        <div className="attention-list">
+          <Link to="/review/clips"><Video size={18} aria-hidden="true" /><span><strong>{numberText(readyForReview)} clips</strong> are ready for review</span><ChevronRight size={17} /></Link>
+          <Link to="/deliveries"><PackageCheck size={18} aria-hidden="true" /><span><strong>{numberText(exportOverview.pending)} deliveries</strong> are waiting</span><ChevronRight size={17} /></Link>
+          <Link to="/activity/jobs?status=failed"><Activity size={18} aria-hidden="true" /><span><strong>{numberText(stoppedRuns)} runs</strong> are stopped or failed</span><ChevronRight size={17} /></Link>
+        </div>
+      </section>
 
-        <article className="overview-panel overview-export-panel">
-          <div className="overview-panel-head">
-            <div>
-              <h2>Export Batches</h2>
-              <p>Affiliate distribution packaging</p>
-            </div>
-            <Badge
-              value={exportStatusLabel}
-              kind={!exportOverview.available ? "neutral" : exportOverview.errorCount > 0 ? "bad" : exportOverview.pending > 0 ? "warn" : "good"}
-            />
-          </div>
-          <div className="overview-export-stats">
-            <OverviewStatLine label="Actionable at last pass" value={exportOverview.available ? numberText(exportOverview.actionable) : "—"} />
-            <OverviewStatLine label="Moved last pass" value={exportOverview.available ? numberText(exportOverview.packagedLastRun) : "—"} />
-            <OverviewStatLine label="Remaining now" value={exportOverview.available ? numberText(exportOverview.pending) : "—"} />
-            <OverviewStatLine label="Cumulative assignments" value={exportOverview.available ? numberText(exportOverview.packagedTotal) : "—"} />
-            <OverviewStatLine label="Batch size" value={exportOverview.batchSize > 0 ? numberText(exportOverview.batchSize) : "-"} />
-          </div>
-          <div className="overview-progress-caption">
-            {!exportOverview.available
-              ? "No operational snapshot exists yet. The next automatic pass or recovery preflight will create one."
-              : `${numberText(exportOverview.packagedLastRun)} of ${numberText(exportOverview.actionable)} actionable clips handled; ${numberText(exportOverview.pending)} remain.${exportOverview.updatedAt ? ` Updated ${new Date(exportOverview.updatedAt).toLocaleString()}.` : ""}`}
-          </div>
-        </article>
-      </div>
-
-      <div className="overview-bottom-grid">
-        <article className="overview-panel overview-top-clips-panel">
-          <div className="overview-panel-head">
-            <div>
-              <h2>Top Scoring Clips</h2>
-              <p>Highest total scores from the latest score index</p>
-            </div>
-          </div>
-          <OverviewTopClips rows={topRows} loading={overview.loading} />
-        </article>
-
-        <article className="overview-panel overview-quality-panel">
-          <div className="overview-panel-head">
-            <div>
-              <h2>Quality Over Time</h2>
-              <p>Daily average total score</p>
-            </div>
-          </div>
-          <OverviewQualityChart points={trendPoints} />
-          <div className="overview-panel-footer">
-            Average score is <strong>{scoreAverage === undefined ? "-" : scoreAverage.toFixed(1)}</strong> across {numberText(overviewData?.scored_count)} scored clips.
-          </div>
-        </article>
-      </div>
+      <section className="home-section recent-runs-section">
+        <h2>Recent runs</h2>
+        {recentRuns.length ? (
+          <div className="table-wrap"><table><thead><tr><th>Run</th><th>Clips</th><th>Status</th><th>Started</th><th>Duration</th></tr></thead><tbody>
+            {recentRuns.map((row) => <tr key={`${row.video_name}-${row.started_at}`}><td className="strong">{row.video_name}</td><td>{numberText(row.clips_generated)}</td><td><Badge value={row.status} /></td><td>{displayTime(row.started_at)}</td><td>{row.duration || "—"}</td></tr>)}
+          </tbody></table></div>
+        ) : <EmptyState icon={Video} title="No recent runs" detail="Your completed and active production runs will appear here." />}
+        <div className="home-summary" aria-label="Production summary">
+          <div><strong>{numberText(rows.length)}</strong><span>Runs in total</span></div>
+          <div><strong>{numberText(summary?.total_clips)}</strong><span>Clips processed</span></div>
+          <div><strong>{totalDuration}</strong><span>Recent runtime</span></div>
+        </div>
+      </section>
     </section>
-  );
-}
-
-function OverviewKpiCard({
-  label,
-  value,
-  hint,
-  icon: Icon,
-  kind,
-  highlight = false
-}: {
-  label: string;
-  value: string;
-  hint: string;
-  icon: LucideIcon;
-  kind: BadgeKind;
-  highlight?: boolean;
-}) {
-  return (
-    <article className={`overview-kpi-card ${kind} ${highlight ? "highlight" : ""}`}>
-      <div className="overview-kpi-top">
-        <span>{label}</span>
-        <Icon size={28} aria-hidden="true" />
-      </div>
-      <strong>{value}</strong>
-      <p>{hint}</p>
-    </article>
-  );
-}
-
-function OverviewProductionBars({ days }: { days: ProductionDay[] }) {
-  const max = Math.max(1, ...days.map((day) => day.count));
-  return (
-    <div className="overview-bar-chart" aria-label="Last 7 days production">
-      {days.map((day) => {
-        const height = day.count === 0 ? 3 : Math.max(12, Math.round((day.count / max) * 100));
-        return (
-          <div className="overview-bar-column" key={day.key}>
-            <span className="overview-bar-value">{numberText(day.count)}</span>
-            <div className="overview-bar-slot">
-              <span style={{ height: `${height}%` }} />
-            </div>
-            <span className="overview-bar-label">{day.label}</span>
-          </div>
-        );
-      })}
-    </div>
   );
 }
 
@@ -2101,99 +1823,6 @@ function OverviewStatLine({ label, value }: { label: string; value: string }) {
     <div className="overview-stat-line">
       <span>{label}</span>
       <strong>{value}</strong>
-    </div>
-  );
-}
-
-function OverviewTopClips({ rows, loading }: { rows: OverviewTopClip[]; loading: boolean }) {
-  if (loading && rows.length === 0) {
-    return <SkeletonLines count={5} />;
-  }
-  if (rows.length === 0) {
-    return <EmptyState icon={Video} title="No scored clips yet" detail="Top performers appear after scoring completes." />;
-  }
-  return (
-    <div className="overview-clip-list">
-      <div className="overview-clip-header">
-        <span />
-        <span>Product</span>
-        <span>Score</span>
-        <span>Status</span>
-        <span>Date</span>
-      </div>
-      {rows.map((row) => (
-        <Link className="overview-clip-row" to={`/review/clips?score=${encodeURIComponent(row.score_key)}`} key={row.score_key}>
-          <OverviewClipThumb row={row} />
-          <div className="overview-clip-product">
-            <strong>{row.product || "Product"}</strong>
-            <span>{row.clip_id || row.source_video}</span>
-          </div>
-          <span className="overview-score-pill">{scoreText(row.total_score)}</span>
-          <span>{row.status || "scored"}</span>
-          <time>{shortDateText(row.scored_at || row.source_date)}</time>
-        </Link>
-      ))}
-    </div>
-  );
-}
-
-function OverviewClipThumb({ row }: { row: OverviewTopClip }) {
-  const artifact = row.artifact;
-  const productInitial = (row.product || "C").trim().slice(0, 1).toUpperCase() || "C";
-  if (artifact?.exists && artifact.kind === "image") {
-    return <img className="overview-clip-thumb" src={artifact.url} alt={row.product || "Clip thumbnail"} />;
-  }
-  if (artifact?.exists && artifact.kind === "video") {
-    return <video className="overview-clip-thumb" src={artifact.url} muted playsInline preload="metadata" aria-label={row.product || "Clip preview"} />;
-  }
-  return <span className="overview-clip-thumb overview-clip-fallback">{productInitial}</span>;
-}
-
-function OverviewQualityChart({ points }: { points: ScoreTrendPoint[] }) {
-  if (points.length < 2) {
-    return <EmptyState icon={TrendingUp} title="No score trend yet" detail="At least two scored days are needed for this chart." />;
-  }
-
-  const width = 680;
-  const height = 240;
-  const padding = { top: 18, right: 18, bottom: 28, left: 42 };
-  const scores = points.map((point) => point.average);
-  const minScore = Math.max(0, Math.min(...scores) - 0.4);
-  const maxScore = Math.min(10, Math.max(...scores) + 0.4);
-  const range = Math.max(1, maxScore - minScore);
-  const plotWidth = width - padding.left - padding.right;
-  const plotHeight = height - padding.top - padding.bottom;
-  const xFor = (index: number) => padding.left + (plotWidth * index) / Math.max(1, points.length - 1);
-  const yFor = (score: number) => padding.top + plotHeight - ((score - minScore) / range) * plotHeight;
-  const linePath = points.map((point, index) => `${index === 0 ? "M" : "L"} ${xFor(index).toFixed(1)} ${yFor(point.average).toFixed(1)}`).join(" ");
-  const areaPath = `${linePath} L ${xFor(points.length - 1).toFixed(1)} ${height - padding.bottom} L ${padding.left} ${height - padding.bottom} Z`;
-  const ticks = [maxScore, (maxScore + minScore) / 2, minScore];
-  const labelPoints = [points[0], points[Math.floor(points.length / 2)], points[points.length - 1]];
-
-  return (
-    <div className="overview-quality-chart">
-      <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Quality score trend">
-        <defs>
-          <linearGradient id="overviewQualityFill" x1="0" x2="0" y1="0" y2="1">
-            <stop offset="0%" stopColor="currentColor" stopOpacity="0.28" />
-            <stop offset="100%" stopColor="currentColor" stopOpacity="0.02" />
-          </linearGradient>
-        </defs>
-        {ticks.map((tick) => (
-          <Fragment key={tick}>
-            <line className="overview-chart-grid" x1={padding.left} x2={width - padding.right} y1={yFor(tick)} y2={yFor(tick)} />
-            <text className="overview-chart-tick" x={4} y={yFor(tick) + 4}>{tick.toFixed(1)}</text>
-          </Fragment>
-        ))}
-        <path className="overview-chart-area" d={areaPath} />
-        <path className="overview-chart-line" d={linePath} />
-        {points.map((point, index) => (
-          <circle className="overview-chart-point" cx={xFor(index)} cy={yFor(point.average)} r={index === points.length - 1 ? 4 : 2.6} key={point.key} />
-        ))}
-      </svg>
-      <div className="overview-chart-labels">
-        {labelPoints.map((point) => <span key={point.key}>{point.label}</span>)}
-      </div>
     </div>
   );
 }
@@ -2986,411 +2615,27 @@ function ViolationPanel({
   );
 }
 
-function ModulesPage({ active }: { active: boolean }) {
-  const limit = 50;
-  const readiness = useApiQuery<ModuleReadiness>("/api/modules/readiness", 10_000, active);
-  const [search, setSearch] = useState("");
-  const [qualityStatus, setQualityStatus] = useState("");
-  const [reviewFilter, setReviewFilter] = useState("");
-  const [visualStatus, setVisualStatus] = useState("");
-  const [product, setProduct] = useState("");
-  const [sort, setSort] = useState("product");
-  const [direction, setDirection] = useState<SortDirection>("asc");
-  const [offset, setOffset] = useState(0);
-  const debouncedSearch = useDebouncedValue(search, 300);
-  const libraryPath = `/api/modules/library${query({
-    limit,
-    offset,
-    search: debouncedSearch,
-    quality_status: qualityStatus,
-    review_status: reviewFilter,
-    visual_status: visualStatus,
-    product,
-    sort,
-    direction
-  })}`;
-  const library = useApiQuery<ModuleLibraryPage>(libraryPath, 10_000, active);
-  const [assemblyOpen, setAssemblyOpen] = useState(false);
-  const [assemblyLimit, setAssemblyLimit] = useState("");
-  const [assemblyProduct, setAssemblyProduct] = useState("");
-  const [assemblyZoom, setAssemblyZoom] = useState(false);
-  const [assemblyConfirmOpen, setAssemblyConfirmOpen] = useState(false);
-  const [selectedModule, setSelectedModule] = useState<ModuleLibraryRow | null>(null);
-  const [reviewStatus, setReviewStatus] = useState("approved");
-  const [note, setNote] = useState("");
-  const [message, setMessage] = useState<ActionMessage>();
-  const moduleDetail = useApiQuery<ModuleDetail>(
-    `/api/modules/${encodeURIComponent(selectedModule?.module_id ?? "")}`,
-    false,
-    active && Boolean(selectedModule)
-  );
-
-  useEffect(() => {
-    setOffset(0);
-  }, [search, qualityStatus, reviewFilter, visualStatus, product, sort, direction]);
-
-  useEffect(() => {
-    if (selectedModule) {
-      setReviewStatus(selectedModule.review_status || "approved");
-      setNote("");
-    }
-  }, [selectedModule?.module_id]);
-
-  const libraryData = library.envelope?.data;
-  const rows = libraryData?.rows ?? [];
-  const selectedModuleWithDetail = selectedModule ? {
-    ...selectedModule,
-    ...(moduleDetail.envelope?.data.selected ?? {}),
-    transcript_text: moduleDetail.envelope?.data.transcript_text ?? selectedModule.transcript_text ?? ""
-  } : null;
-  const readyProducts = readiness.envelope?.data.rows.filter((row) => row.readiness === "ready") ?? [];
-  const productOptions = libraryData?.filter_options.product ?? uniqueOptions(rows.map((row) => row.product_key || row.product));
-  const qualityOptions = libraryData?.filter_options.quality_status ?? [];
-  const reviewOptions = libraryData?.filter_options.review_status ?? [];
-  const visualOptions = libraryData?.filter_options.visual_validation_status ?? [];
-
-  function refreshAll() {
-    readiness.refresh();
-    library.refresh();
-    if (selectedModule) {
-      moduleDetail.refresh();
-    }
-  }
-
-  function openAssembly(productKey?: string) {
-    setAssemblyProduct(productKey ?? "");
-    setAssemblyOpen(true);
-  }
-
-  function submitAssembly() {
-    const limitValue = assemblyLimit ? Number(assemblyLimit) : null;
-    void submitMutation(
-      () => sendJson<ControlJob>("POST", "/api/operations/module-assembly", {
-        product: assemblyProduct || null,
-        module_assembly_limit: limitValue,
-        module_product_zoom: assemblyZoom
-      }),
-      setMessage,
-      refreshJobQueries,
-      [refreshAll]
-    );
-  }
-
-  function submitReview() {
-    if (!selectedModule) {
-      return;
-    }
-    void submitMutation(
-      () => sendJson<ControlJob>("POST", `/api/modules/${encodeURIComponent(selectedModule.module_id)}/review`, {
-        status: reviewStatus,
-        note
-      }),
-      setMessage,
-      refreshJobQueries,
-      [refreshAll]
-    );
-  }
-
+function ModulesPage() {
   return (
     <section className="page-stack">
-      <PageTitle title="Modules" detail="Readiness, inventory, assembly, and module review in one workspace." onRefresh={refreshAll}>
-        <button className="primary-button" disabled={readyProducts.length === 0} onClick={() => openAssembly()}>
-          <Archive size={16} aria-hidden="true" />
-          Assemble
-        </button>
-      </PageTitle>
-      <ActionNotice message={message} />
-      <StateBlock kind="warn" warnings={[...(readiness.envelope?.warnings ?? []), ...(library.envelope?.warnings ?? [])]} />
-      {(readiness.loading || library.loading) && <SkeletonLines count={4} />}
-      {(readiness.error || library.error) && <StateBlock kind="bad" title="Module read failed" detail={readiness.error || library.error} />}
-
-      <div className="module-grid">
-        {(readiness.envelope?.data.rows ?? []).map((row) => (
-          <ReadinessCard row={row} key={row.product_key} onAssemble={() => openAssembly(row.product_key)} />
-        ))}
-      </div>
-
-      <div className="index-toolbar">
-        <SearchInput value={search} onChange={setSearch} placeholder="Search modules, transcripts, sources..." />
-        <FilterField label="Product">
-          <select value={product} onChange={(event) => setProduct(event.target.value)}>
-            <option value="">All products</option>
-            {productOptions.map((item) => <option value={item} key={item}>{item}</option>)}
-          </select>
-        </FilterField>
-        <FilterField label="Quality">
-          <select value={qualityStatus} onChange={(event) => setQualityStatus(event.target.value)}>
-            <option value="">All quality states</option>
-            {qualityOptions.map((item) => <option value={item} key={item}>{item}</option>)}
-          </select>
-        </FilterField>
-        <FilterField label="Review">
-          <select value={reviewFilter} onChange={(event) => setReviewFilter(event.target.value)}>
-            <option value="">All review states</option>
-            {reviewOptions.map((item) => <option value={item} key={item}>{item}</option>)}
-          </select>
-        </FilterField>
-        <FilterField label="Visual">
-          <select value={visualStatus} onChange={(event) => setVisualStatus(event.target.value)}>
-            <option value="">All visual states</option>
-            {visualOptions.map((item) => <option value={item} key={item}>{item}</option>)}
-          </select>
-        </FilterField>
-        <FilterField label="Sort">
-          <select value={sort} onChange={(event) => setSort(event.target.value)}>
-            <option value="product">Product</option>
-            <option value="source_date">Source date</option>
-            <option value="duration">Duration</option>
-            <option value="confidence">Confidence</option>
-            <option value="role">Role</option>
-            <option value="status">Status</option>
-          </select>
-        </FilterField>
-        <FilterField label="Direction">
-          <select value={direction} onChange={(event) => setDirection(event.target.value as SortDirection)}>
-            <option value="asc">Ascending</option>
-            <option value="desc">Descending</option>
-          </select>
-        </FilterField>
-      </div>
-
-      <ModuleLibraryTable page={libraryData} selected={selectedModule?.module_id ?? ""} setSelected={setSelectedModule} />
-      <Pagination total={libraryData?.total ?? 0} limit={limit} offset={offset} setOffset={setOffset} />
-
-      <Drawer open={assemblyOpen} title="Assemble modules" detail="Build reusable clips from ready module inventory." onClose={() => setAssemblyOpen(false)}>
-        <div className="detail-list">
-          <DetailItem label="Ready products" value={readyProducts.length ? readyProducts.map((row) => row.product).join(", ") : "None ready"} />
-        </div>
-        <div className="form-stack">
-          <FilterField label="Product">
-            <select value={assemblyProduct} onChange={(event) => setAssemblyProduct(event.target.value)}>
-              <option value="">All ready products</option>
-              {readyProducts.map((row) => <option value={row.product_key} key={row.product_key}>{row.product}</option>)}
-            </select>
-          </FilterField>
-          <FilterField label="Limit">
-            <input value={assemblyLimit} onChange={(event) => setAssemblyLimit(event.target.value)} placeholder="optional" inputMode="numeric" />
-          </FilterField>
-          <label className="confirm-check">
-            <input type="checkbox" checked={assemblyZoom} onChange={(event) => setAssemblyZoom(event.target.checked)} />
-            Product zoom
-          </label>
-          <button className="primary-button" disabled={readyProducts.length === 0} onClick={() => setAssemblyConfirmOpen(true)}>
-            <Archive size={16} aria-hidden="true" />
-            Create assembly job
-          </button>
-        </div>
-      </Drawer>
-
-      <ModuleDetailDrawer
-        module={selectedModuleWithDetail}
-        detailLoading={moduleDetail.loading && Boolean(selectedModule)}
-        detailError={moduleDetail.error}
-        reviewStatus={reviewStatus}
-        setReviewStatus={setReviewStatus}
-        note={note}
-        setNote={setNote}
-        onSubmit={submitReview}
-        onClose={() => setSelectedModule(null)}
+      <PageTitle
+        title="Modules"
+        detail="The legacy modular system has been removed from Clipper."
       />
-      <ConfirmDialog
-        open={assemblyConfirmOpen}
-        title="Assemble ready modules?"
-        detail={`Create an assembly job for ${assemblyProduct || "all ready products"}${assemblyLimit ? ` with a limit of ${assemblyLimit}` : ""}.`}
-        confirmLabel="Create assembly job"
-        onClose={() => setAssemblyConfirmOpen(false)}
-        onConfirm={() => {
-          setAssemblyConfirmOpen(false);
-          setAssemblyOpen(false);
-          submitAssembly();
-        }}
+      <EmptyState
+        icon={Library}
+        title="Modular workspace is being rebuilt."
+        detail="Modular functionality is temporarily unavailable. A replacement will be designed separately."
       />
     </section>
   );
 }
-
-function ReadinessCard({ row, onAssemble }: { row: ModuleReadinessRow; onAssemble: () => void }) {
-  return (
-    <article className="module-card">
-      <div className="panel-head">
-        <div>
-          <h3>{row.product}</h3>
-          <p>{row.total} text modules, {row.visual_total} visual records</p>
-        </div>
-        <Badge value={row.readiness} />
-      </div>
-      <div className="stage-counts">
-        <span>Hook {row.hook}</span>
-        <span>Main {row.main}</span>
-        <span>CTA {row.cta}</span>
-        <span>Zoom {row.zoom_ready_candidates}</span>
-      </div>
-      <div className="module-visual-summary">
-        <span className="good">{row.visual_passed} visual passed</span>
-        <span className={row.visual_failed ? "bad" : "muted"}>{row.visual_failed} failed</span>
-        <span className="muted">{row.visual_not_run} not run</span>
-      </div>
-      <button className="secondary-button module-action" disabled={row.readiness !== "ready"} onClick={onAssemble}>
-        <Archive size={16} aria-hidden="true" />
-        Assemble
-      </button>
-    </article>
-  );
-}
-
-function ModuleLibraryTable({
-  page,
-  selected,
-  setSelected
-}: {
-  page?: ModuleLibraryPage;
-  selected: string;
-  setSelected: (row: ModuleLibraryRow) => void;
-}) {
-  const rows = page?.rows ?? [];
-  if (rows.length === 0) {
-    return <EmptyState icon={Library} title="No modules indexed" detail="Module inventory will appear after extraction and indexing." />;
-  }
-  return (
-    <article className="panel">
-      <div className="panel-head">
-        <div>
-          <h2>Library inventory</h2>
-          <p>{numberText(page?.total)} modules indexed.</p>
-        </div>
-      </div>
-      <div className="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Module</th>
-              <th>Product</th>
-              <th>Role</th>
-              <th>Duration</th>
-              <th>Quality</th>
-              <th>Review</th>
-              <th>Visual</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((row) => (
-              <tr className={selected === row.module_id ? "selected-row" : ""} key={row.module_id} onClick={() => setSelected(row)}>
-                <td>
-                  <div className="strong">{row.module_id}</div>
-                  <div className="muted">{row.source_video}</div>
-                </td>
-                <td>{row.product}</td>
-                <td>{row.role}</td>
-                <td>{row.duration.toFixed(1)}s</td>
-                <td>{row.quality_status || "-"}</td>
-                <td>{row.review_status || "-"}</td>
-                <td>{row.visual_validation_status}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </article>
-  );
-}
-
-function ModuleDetailDrawer({
-  module,
-  detailLoading,
-  detailError,
-  reviewStatus,
-  setReviewStatus,
-  note,
-  setNote,
-  onSubmit,
-  onClose
-}: {
-  module: ModuleLibraryRow | null;
-  detailLoading: boolean;
-  detailError?: string;
-  reviewStatus: string;
-  setReviewStatus: (value: string) => void;
-  note: string;
-  setNote: (value: string) => void;
-  onSubmit: () => void;
-  onClose: () => void;
-}) {
-  const [blockDialogOpen, setBlockDialogOpen] = useState(false);
-  return (
-    <>
-      <Drawer open={Boolean(module)} title={module?.module_id ?? "Module detail"} detail={module?.product} onClose={onClose}>
-        {module && (
-          <>
-          {module.file_artifact?.exists && (
-            <a className="secondary-button full-width" href={module.file_artifact.url} target="_blank" rel="noreferrer">
-              <Eye size={16} aria-hidden="true" />
-              Open artifact
-            </a>
-          )}
-          <div className="detail-grid">
-            <MetricCard label="Role" value={module.role || "-"} hint={module.product} icon={Layers3} />
-            <MetricCard label="Duration" value={`${module.duration.toFixed(1)}s`} hint="Module length" icon={Clock} />
-            <MetricCard label="Confidence" value={scoreText(module.confidence)} hint="Extraction confidence" icon={Gauge} />
-            <MetricCard label="Visual hits" value={numberText(module.visual_product_hits)} hint={module.visual_validation_status} icon={Eye} />
-          </div>
-          <div className="detail-list">
-            <DetailItem label="Boundary mode" value={module.boundary_mode || "-"} />
-            <DetailItem label="Visual confidence" value={module.visual_product_confidence_max == null ? "-" : module.visual_product_confidence_max.toFixed(2)} />
-            <DetailItem label="Validation reason" value={module.visual_validation_reason || "No validation reason recorded."} />
-            <DetailItem label="Source date" value={module.source_date || "-"} />
-          </div>
-          <section className="drawer-section">
-            <h3>Transcript</h3>
-            {detailLoading && <SkeletonLines count={2} />}
-            {detailError && <StateBlock kind="bad" title="Module detail failed" detail={detailError} />}
-            {!detailLoading && !detailError && <p className="transcript-box">{module.transcript_text || "No transcript text available."}</p>}
-          </section>
-          <section className="drawer-section">
-            <h3>Review action</h3>
-            <div className="form-stack">
-              <FilterField label="Status">
-                <select value={reviewStatus} onChange={(event) => setReviewStatus(event.target.value)}>
-                  <option value="approved">Approve</option>
-                  <option value="needs_review">Needs review</option>
-                  <option value="blocked">Block</option>
-                </select>
-              </FilterField>
-              <FilterField label="Note">
-                <input value={note} onChange={(event) => setNote(event.target.value)} placeholder="optional" />
-              </FilterField>
-              <button
-                className="primary-button"
-                onClick={() => reviewStatus === "blocked" ? setBlockDialogOpen(true) : onSubmit()}
-              >
-                <BadgeCheck size={16} aria-hidden="true" />
-                Submit review
-              </button>
-            </div>
-          </section>
-          </>
-        )}
-      </Drawer>
-      <ConfirmDialog
-        open={blockDialogOpen}
-        title="Block this module?"
-        detail={`${module?.module_id ?? "This module"} will be excluded from approved assembly workflows.`}
-        confirmLabel="Block module"
-        danger
-        onClose={() => setBlockDialogOpen(false)}
-        onConfirm={() => {
-          setBlockDialogOpen(false);
-          onSubmit();
-        }}
-      />
-    </>
-  );
-}
-
 function ExportsPage() {
   const [outputRoot, setOutputRoot] = useState("");
   const [batchSize, setBatchSize] = useState("");
   const [dryRun, setDryRun] = useState(true);
   const [packagingConfirmOpen, setPackagingConfirmOpen] = useState(false);
+  const [selectedAssignmentId, setSelectedAssignmentId] = useState("");
   const [message, setMessage] = useState<ActionMessage>();
   const overview = useApiQuery<OverviewData>("/api/overview", 30_000, true);
   const whatsappDelivery = useApiQuery<WhatsAppDeliveryStatus>(
@@ -3400,6 +2645,8 @@ function ExportsPage() {
   );
   const exportHistory = useApiQuery<ControlJobPage>("/api/control/jobs?limit=100&operation=export_batches", jobPollingInterval, true);
   const exportJobs = exportHistory.envelope?.data.jobs ?? [];
+  const assignments = whatsappDelivery.envelope?.data.assignments ?? [];
+  const selectedAssignment = assignments.find((item) => item.affiliate_assignment_id === selectedAssignmentId) ?? assignments[0];
   const exportOverview = buildExportOverview(overview.envelope?.data.export);
   const statusLabel = exportOverview.available
     ? reviewFlagLabel(exportOverview.status || (exportOverview.dryRun ? "preflight" : "completed"))
@@ -3439,26 +2686,35 @@ function ExportsPage() {
           detail={whatsappDelivery.envelope.data.cutover.blocking_reason || "Complete the legacy workflow cutover before claiming batches."}
         />
       )}
-      <article className="panel delivery-status-panel">
-        <div className="panel-head">
-          <div>
-            <h2>Canonical WhatsApp batches</h2>
-            <p>Media readiness and affiliate delivery are tracked separately. Numeric folders remain permanent.</p>
-          </div>
-          <Badge
-            value={`${numberText(whatsappDelivery.envelope?.data.counts.ready_batches ?? 0)} ready`}
-            kind={(whatsappDelivery.envelope?.data.counts.delivery_failed ?? 0) > 0 ? "bad" : "good"}
-          />
-        </div>
-        <div className="overview-export-stats delivery-status-stats">
-          <OverviewStatLine label="Complete media batches" value={numberText(whatsappDelivery.envelope?.data.counts.media_complete ?? 0)} />
-          <OverviewStatLine label="Ready for delivery" value={numberText(whatsappDelivery.envelope?.data.counts.ready_batches ?? 0)} />
-          <OverviewStatLine label="Assigned" value={numberText(whatsappDelivery.envelope?.data.counts.assigned ?? 0)} />
-          <OverviewStatLine label="Sending" value={numberText(whatsappDelivery.envelope?.data.counts.sending ?? 0)} />
-          <OverviewStatLine label="Sent" value={numberText(whatsappDelivery.envelope?.data.counts.sent ?? 0)} />
-          <OverviewStatLine label="Delivery failed" value={numberText(whatsappDelivery.envelope?.data.counts.delivery_failed ?? 0)} />
-        </div>
-      </article>
+      <section className="delivery-summary" aria-label="Delivery status summary">
+        <div><Clock size={19} aria-hidden="true" /><span>Pending<strong>{numberText((whatsappDelivery.envelope?.data.counts.ready_batches ?? 0) + (whatsappDelivery.envelope?.data.counts.assigned ?? 0) + (whatsappDelivery.envelope?.data.counts.sending ?? 0))}</strong><small>Awaiting delivery</small></span></div>
+        <div><CheckCircle2 size={19} aria-hidden="true" /><span>Sent<strong>{numberText(whatsappDelivery.envelope?.data.counts.sent ?? 0)}</strong><small>Delivered successfully</small></span></div>
+        <div><X size={19} aria-hidden="true" /><span>Failed<strong>{numberText(whatsappDelivery.envelope?.data.counts.delivery_failed ?? 0)}</strong><small>Delivery failed</small></span></div>
+      </section>
+
+      <section className="delivery-workspace">
+        <article className="panel delivery-list-panel">
+          <div className="panel-head"><div><h2>Deliveries</h2><p>{numberText(assignments.length)} canonical WhatsApp batches</p></div></div>
+          {assignments.length ? <div className="table-wrap"><table><thead><tr><th>Folder</th><th>Recipient</th><th>Channel</th><th>Status</th><th>Sent at</th></tr></thead><tbody>
+            {assignments.map((assignment) => <tr className={selectedAssignment?.affiliate_assignment_id === assignment.affiliate_assignment_id ? "selected-row" : ""} key={assignment.affiliate_assignment_id} onClick={() => setSelectedAssignmentId(assignment.affiliate_assignment_id)}>
+              <td className="strong">Batch {assignment.batch_number}</td><td>{assignment.affiliate_name || assignment.affiliate_identifier}</td><td>WhatsApp</td><td><Badge value={assignment.delivery_status} /></td><td>{assignment.sent_at ? displayTime(assignment.sent_at) : "—"}</td>
+            </tr>)}
+          </tbody></table></div> : <EmptyState icon={PackageCheck} title="No deliveries yet" detail="Assigned delivery batches will appear here." />}
+        </article>
+        <aside className="panel delivery-detail-panel">
+          <div className="panel-head"><div><h2>Delivery details</h2><p>{selectedAssignment ? `Batch ${selectedAssignment.batch_number}` : "Select a delivery"}</p></div></div>
+          {selectedAssignment ? <div className="detail-list">
+            <DetailItem label="Folder" value={selectedAssignment.canonical_folder_path} />
+            <DetailItem label="Recipient" value={selectedAssignment.affiliate_name || selectedAssignment.affiliate_identifier} />
+            <DetailItem label="Identifier" value={selectedAssignment.affiliate_identifier} />
+            <DetailItem label="Channel" value="WhatsApp" />
+            <DetailItem label="Status" value={<Badge value={selectedAssignment.delivery_status} />} />
+            <DetailItem label="Assigned" value={displayTime(selectedAssignment.assigned_at)} />
+            <DetailItem label="Sent" value={selectedAssignment.sent_at ? displayTime(selectedAssignment.sent_at) : "—"} />
+            {selectedAssignment.delivery_error && <StateBlock kind="bad" title="Delivery error" detail={selectedAssignment.delivery_error} />}
+          </div> : <p className="muted-copy">Select a delivery to inspect its current state.</p>}
+        </aside>
+      </section>
       <article className="panel delivery-status-panel">
         <div className="panel-head">
           <div>
@@ -4987,8 +4243,7 @@ function settingDescription(entry: SettingsReadEntry): string {
     selection: "Controls how candidate moments become clips.",
     render: "Controls video, audio, and encoder output.",
     scoring: "Controls automated quality scoring and review thresholds.",
-    compliance: "Controls policy scanning and automatic corrections.",
-    modules: "Controls reusable-module extraction, validation, and assembly."
+    compliance: "Controls policy scanning and automatic corrections."
   };
   const description = scope[entry.category] || "Operator-safe pipeline setting.";
   return entry.category === "queue" ? `${description} Applies on the next queue start.` : description;
@@ -5002,7 +4257,7 @@ function SettingsPage({ active }: { active: boolean }) {
   const [draft, setDraft] = useState<Record<string, string>>({});
   const [message, setMessage] = useState<ActionMessage>();
   const [search, setSearch] = useState("");
-  const [categoryFilter, setCategoryFilter] = useState("");
+  const [categoryFilter, setCategoryFilter] = useState("queue");
   const [deleteTarget, setDeleteTarget] = useState("");
 
   useEffect(() => {
@@ -5124,22 +4379,13 @@ function SettingsPage({ active }: { active: boolean }) {
       <ActionNotice message={message} />
       <div className="settings-toolbar">
         <SearchInput value={search} onChange={setSearch} placeholder="Search settings by name or purpose..." />
-        <FilterField label="Category">
-          <select value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)}>
-            <option value="">All categories</option>
-            {Object.keys(groups).map((category) => <option value={category} key={category}>{settingLabel(category)}</option>)}
-          </select>
-        </FilterField>
       </div>
-      <article className="panel">
-        <div className="panel-head">
-          <div>
-            <h2>Override editor</h2>
-            <p>Revision {revision ? revision.slice(0, 12) : "loading"}. Values save to the app override file.</p>
-          </div>
-          <Badge value={changedEntries.length ? `${changedEntries.length} dirty` : "Clean"} kind={changedEntries.length ? "warn" : "good"} />
-        </div>
-      </article>
+      <div className="settings-layout">
+        <aside className="settings-subnav" aria-label="Settings categories">
+          <button className={!categoryFilter ? "active" : ""} onClick={() => setCategoryFilter("")}>All settings</button>
+          {Object.keys(groups).map((category) => <button className={categoryFilter === category ? "active" : ""} onClick={() => setCategoryFilter(category)} key={category}>{settingLabel(category)}</button>)}
+          <small>Revision {revision ? revision.slice(0, 12) : "loading"}</small>
+        </aside>
       <div className="settings-grid">
         {Object.entries(visibleGroups).map(([category, groupEntries]) => (
           <article className="panel" key={category}>
@@ -5187,6 +4433,7 @@ function SettingsPage({ active }: { active: boolean }) {
           </article>
         ))}
       </div>
+      </div>
       <ConfirmDialog
         open={Boolean(deleteTarget)}
         title="Reset this setting override?"
@@ -5214,7 +4461,7 @@ function RoutedApp() {
         <Route path="/review/compliance" element={<CompliancePage active />} />
         <Route path="/trends" element={<TrendsPage active />} />
         <Route path="/variants" element={<VariationsPage active />} />
-        <Route path="/modules" element={<ModulesPage active />} />
+        <Route path="/modules" element={<ModulesPage />} />
         <Route path="/deliveries" element={<ExportsPage />} />
         <Route path="/activity" element={<Navigate to="/activity/jobs" replace />} />
         <Route path="/activity/jobs" element={<JobsPage active />} />

@@ -5,11 +5,11 @@ This document began as the Phase 2 “read-first” design. The same FastAPI + R
 ## Architecture
 
 - `clipper_app.application.read_services.ReadDashboardService` returns typed data from legacy artifacts or the feature-flagged SQLite catalog.
-- `clipper_app.application.container.ApplicationServiceContainer` composes reads, settings, jobs, queue controls, scoring, compliance, modules, exports, and WhatsApp delivery.
+- `clipper_app.application.container.ApplicationServiceContainer` composes reads, settings, jobs, queue controls, scoring, compliance, exports, and WhatsApp delivery.
 - `clipper_app.web_api` exposes the services under `/api`, enforces auth/origin/host rules, serves artifacts safely, emits SSE invalidation, and serves the built SPA when available.
 - `new_app/` contains the React/Vite/TypeScript operator app and Electron shell.
 
-The default read authorities remain queue JSON, manifests, score summaries, compliance files, module indexes, logs, job files, variation/product-information files, and media artifacts. `CLIPPER_CATALOG_MODE=catalog` moves supported indexed reads to SQLite only after the rollout procedure.
+The default read authorities remain queue JSON, manifests, score summaries, compliance files, logs, job files, variation/product-information files, and media artifacts. `CLIPPER_CATALOG_MODE=catalog` moves supported indexed reads to SQLite only after the rollout procedure.
 
 Every JSON read uses this envelope:
 
@@ -29,7 +29,6 @@ Read responses can include ETags/revisions. List endpoints use bounded paginatio
 - Health, catalog status, and `/api/events` live invalidation.
 - Dashboard, overview, queue detail, and queue VOD discovery.
 - Score index/detail and compliance index/detail.
-- Module readiness, library, and detail.
 - Logs, configured/effective settings, system statistics, and safe artifacts.
 - Product-information status.
 - Variation profile/options and presets.
@@ -41,7 +40,7 @@ Read responses can include ETags/revisions. List endpoints use bounded paginatio
 
 ## Mutations Added After the Read-First Phase
 
-The application now supports queue start/continue/stop, settings overrides, rescore, compliance scans, module assembly/review, export packaging, product-information rescan, variation saves/previews/presets, TikTok OAuth and advertiser selection, trend refresh/download/analysis/media linking, and WhatsApp assignment/item/outbox transitions.
+The application now supports queue start/continue/stop, settings overrides, rescore, compliance scans, export packaging, product-information rescan, variation saves/previews/presets, TikTok OAuth and advertiser selection, trend refresh/download/analysis/media linking, and WhatsApp assignment/item/outbox transitions.
 
 These actions use typed requests, path containment, revision/conflict checks, job/audit persistence where appropriate, and query/SSE invalidation. `config.py` is never written by the app.
 
@@ -53,7 +52,6 @@ Artifact serving is restricted to configured roots such as:
 
 - `OUTPUT_DIR`.
 - `WORKING_DIR`.
-- `MODULE_LIBRARY_DIR`.
 - approved trend media beneath `TREND_MEDIA_DIR` when returned through the normal artifact model.
 
 Log tailing is bounded to 1,000 lines. User-supplied queue state and log paths are rejected by the web routes.

@@ -11,7 +11,7 @@ The current routes are:
 - `/review/clips` and `/review/compliance`: paginated score/variant review, artifact previews, rescore, violations, and compliance scans.
 - `/trends`: TikTok Business OAuth/advertiser state, ranked discovery, rights-confirmed downloads, media linking, analysis, and read-only editing recommendations.
 - `/variants`: revision-safe profile editing, seven grouped editor tabs, previews, presets, product information, and asset diagnostics.
-- `/modules`: readiness, inventory/detail, review state, and assembly jobs.
+- `/modules`: neutral placeholder while the modular workspace is rebuilt separately.
 - `/deliveries`: export-batch status, preflight, and recovery packaging.
 - `/activity/jobs` and `/activity/logs`: job ledger/results and bounded log tailing.
 - `/settings/configuration` and `/settings/diagnostics`: safe settings overrides, system/catalog/SSE status, and Electron runtime diagnostics.
@@ -23,7 +23,7 @@ Legacy route names redirect to these current routes.
 New VOD work still enters through the queue. The UI supports:
 
 - `single_video`, `folder_once`, or `folder_repeat` run modes.
-- `full`, `clips_only`, `modules_only`, or `raw_cuts_only` pipeline modes.
+- `full`, `clips_only`, or `raw_cuts_only` pipeline modes. Historical `modules_only` records display as legacy unsupported and cannot be resumed.
 - all variants, original only, or a custom count from 1 through 6.
 - an optional maximum clip count.
 
@@ -31,7 +31,7 @@ Start, pause, continue, and stop requests use the existing versioned queue-contr
 
 ## Mutation and Job Model
 
-Queue controls, settings writes/deletes, rescore, compliance scan, module assembly/review, export packaging, and trend refresh/download/analysis become auditable `ControlJob` records. Those endpoints return HTTP `202`, and the UI follows job state while SSE/query invalidation refreshes affected reads.
+Queue controls, settings writes/deletes, rescore, compliance scan, export packaging, and trend refresh/download/analysis become auditable `ControlJob` records. Those endpoints return HTTP `202`, and the UI follows job state while SSE/query invalidation refreshes affected reads.
 
 Variation/profile/preset writes, preview generation, product-information rescan, TikTok advertiser selection, trend media linking, and WhatsApp delivery transitions are synchronous service mutations. They return their result directly and use revision, validation, idempotency, containment, or domain-specific audit/event rules instead of `ControlJob` metadata.
 
@@ -43,7 +43,7 @@ Storage is split so large operation results do not bloat job metadata:
 
 Default retention is 30 days/2,000 terminal metadata records and seven days/250 MiB of result files. Result bodies are capped at 5 MiB and can be marked truncated or expired. Startup converts stale queued/running jobs to `interrupted`; `CLIPPER_MIGRATE_JOB_STORAGE=1` migrates older embedded results.
 
-Interactive and batch work use fixed daemon-worker lanes with bounded pending capacity. Compute-heavy work is serialized. Conflicting rescore/compliance targets, global module assembly/export packaging, duplicate trend work, and queue controls are rejected with conflict information.
+Interactive and batch work use fixed daemon-worker lanes with bounded pending capacity. Compute-heavy work is serialized. Conflicting rescore/compliance targets, global export packaging, duplicate trend work, and queue controls are rejected with conflict information.
 
 ## Settings and Variations
 
@@ -59,15 +59,15 @@ Applying a profile affects future clip generation only. It does not rewrite alre
 
 ## API Groups
 
-Major read groups include health/catalog/events, dashboard/overview/queue/VODs, scores, compliance, modules, logs, settings, system, artifacts, product information, variations, trends, TikTok OAuth status, control jobs, and WhatsApp delivery status/outbox.
+Major read groups include health/catalog/events, dashboard/overview/queue/VODs, scores, compliance, logs, settings, system, artifacts, product information, variations, trends, TikTok OAuth status, control jobs, and WhatsApp delivery status/outbox.
 
-Major mutation groups include queue control, settings override writes/deletes, product-information rescan, variation save/preview/presets, rescore, compliance scan, module assembly/review, export packaging, trend refresh/download/analysis/media link, TikTok OAuth/advertiser selection, and WhatsApp claim/assignment/item/outbox transitions.
+Major mutation groups include queue control, settings override writes/deletes, product-information rescan, variation save/preview/presets, rescore, compliance scan, export packaging, trend refresh/download/analysis/media link, TikTok OAuth/advertiser selection, and WhatsApp claim/assignment/item/outbox transitions.
 
 The route definitions in `clipper_app/web_api.py` are the authoritative endpoint list.
 
 ## Security Boundary
 
-Every mutation and sensitive read requires `Authorization: Bearer <CLIPPER_CONTROL_TOKEN>`. Artifact, catalog, log, effective-setting, job-result, trend, TikTok integration, WhatsApp, and module-detail reads are sensitive. TikTok callback routes are deliberately unauthenticated and strip the authorization code from the normal query string before downstream handling.
+Every mutation and sensitive read requires `Authorization: Bearer <CLIPPER_CONTROL_TOKEN>`. Artifact, catalog, log, effective-setting, job-result, trend, TikTok integration, and WhatsApp reads are sensitive. TikTok callback routes are deliberately unauthenticated and strip the authorization code from the normal query string before downstream handling.
 
 Electron injects a fresh per-launch token only into requests for its exact managed `127.0.0.1:<port>` origin. The development launcher shares a token with the Vite proxy. Trusted-host, origin, and path-containment checks remain active in both cases.
 

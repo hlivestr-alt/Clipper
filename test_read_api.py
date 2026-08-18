@@ -23,12 +23,10 @@ class ReadApiTests(unittest.TestCase):
         self.root = root
         output = root / "output"
         working = root / "working"
-        modules = root / "modules"
         information = root / "information"
         vods = root / "vods"
         output.mkdir()
         working.mkdir()
-        modules.mkdir()
         information.mkdir()
         vods.mkdir()
         self.vod_file = vods / "selected.mp4"
@@ -68,7 +66,6 @@ class ReadApiTests(unittest.TestCase):
             QUEUE_CONTROL_FILE=str(working / "queue_control.json"),
             QUEUE_FOREVER_STATE_FILE=str(working / "queue_forever_state.json"),
             QUEUE_STAGE_ADMISSION_LIMIT=3,
-            MODULE_LIBRARY_DIR=str(modules),
             QUEUE_DASHBOARD_RUNNING_STALL_SECONDS=7200.0,
             QUEUE_DASHBOARD_QUEUED_STALL_SECONDS=86400.0,
             VARIANTS_PER_CLIP=1,
@@ -195,7 +192,7 @@ class ReadApiTests(unittest.TestCase):
         self.assertTrue(batch.is_dir())
 
     def test_public_compact_reads_remain_available_without_token(self):
-        for path in ("/api/health", "/api/dashboard", "/api/overview", "/api/modules/library"):
+        for path in ("/api/health", "/api/dashboard", "/api/overview"):
             response = self.public_client.get(path)
             self.assertEqual(response.status_code, 200, path)
 
@@ -248,20 +245,12 @@ class ReadApiTests(unittest.TestCase):
         )
         self.assertEqual(compliance.status_code, 422)
 
-        review = self.client.post(
-            "/api/modules/module_001/review",
-            json={"status": "approved", "reviewer": "attacker", "actor": "attacker"},
-        )
-        self.assertEqual(review.status_code, 422)
-
         schema = self.public_client.get("/openapi.json").json()["components"]["schemas"]
         forbidden_by_request = {
             "QueueControlRequest": {"actor"},
             "RescoreRequest": {"actor", "working_dir"},
             "ComplianceScanRequest": {"actor", "working_dir"},
-            "ModuleAssemblyRequest": {"actor", "working_dir"},
             "ExportBatchesRequest": {"actor", "working_dir"},
-            "ModuleReviewRequest": {"actor", "reviewer", "working_dir"},
             "SettingsOverrideWriteRequest": {"actor"},
         }
         for model_name, forbidden in forbidden_by_request.items():
@@ -297,23 +286,7 @@ class ReadApiTests(unittest.TestCase):
         unchanged = self.client.get("/api/dashboard", headers={"If-None-Match": etag})
         self.assertEqual(unchanged.status_code, 304)
 
-    def test_compact_overview_and_module_detail_contracts(self):
-        module_root = Path(self.config.MODULE_LIBRARY_DIR)
-        module_path = module_root / "module_001.mp4"
-        module_path.write_bytes(b"module")
-        (module_root / "index.json").write_text(
-            json.dumps({
-                "modules": [{
-                    "module_id": "module_001",
-                    "product": "serum",
-                    "role": "hook",
-                    "file_path": str(module_path),
-                    "transcript_text": "private transcript",
-                }]
-            }),
-            encoding="utf-8",
-        )
-
+    def test_compact_overview_contract(self):
         overview = self.client.get("/api/overview")
         self.assertEqual(overview.status_code, 200)
         data = overview.json()["data"]
@@ -325,12 +298,19 @@ class ReadApiTests(unittest.TestCase):
         self.assertLessEqual(len(data["score_trend"]), 14)
         self.assertLess(len(overview.content), 32 * 1024)
 
-        library = self.client.get("/api/modules/library").json()["data"]
-        self.assertEqual(library["total"], 1)
-        self.assertNotIn("transcript_text", library["rows"][0])
-        detail = self.client.get("/api/modules/module_001")
-        self.assertEqual(detail.status_code, 200)
-        self.assertEqual(detail.json()["data"]["transcript_text"], "private transcript")
+
+    def test_legacy_module_endpoints_are_removed(self):
+        self.assertEqual(self.client.get("/api/modules/readiness").status_code, 404)
+        self.assertEqual(self.client.get("/api/modules/library").status_code, 404)
+        self.assertEqual(self.client.get("/api/modules/module_001").status_code, 404)
+        self.assertEqual(
+            self.client.post("/api/modules/module_001/review", json={"status": "approved"}).status_code,
+            405,
+        )
+        self.assertEqual(
+            self.client.post("/api/operations/module-assembly", json={}).status_code,
+            405,
+        )
 
     def test_queue_vods_and_launch_config_validation(self):
         queue_response = self.client.get("/api/queue")
@@ -362,15 +342,24 @@ class ReadApiTests(unittest.TestCase):
         )
         self.assertEqual(denied.status_code, 400)
 
+        legacy_mode = self.client.post(
+            "/api/control/queue",
+            json={
+                "action": "start",
+                "launch_config": {
+                    "run_mode": "folder_repeat",
+                    "pipeline_mode": "modules_only",
+                    "variant_mode": "all",
+                    "variant_count": 1,
+                    "max_clips": 0,
+                },
+            },
+        )
+        self.assertEqual(legacy_mode.status_code, 400)
+        self.assertIn("legacy unsupported", legacy_mode.json()["detail"])
+
     def test_invalid_sort_and_artifact_safety(self):
         self.assertEqual(self.client.get("/api/scores?sort=bad").status_code, 400)
-        self.assertEqual(
-            self.client.get(
-                "/api/modules/library",
-                params={"quality_status": "approved", "visual_status": "passed"},
-            ).status_code,
-            200,
-        )
         self.assertEqual(self.client.get("/api/artifacts", params={"path": "../config.py"}).status_code, 403)
         self.assertEqual(self.client.get("/api/artifacts", params={"path": self.allowed_artifact}).status_code, 200)
 

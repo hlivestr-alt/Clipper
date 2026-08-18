@@ -121,7 +121,6 @@ class CatalogDatabase:
                 ("detail_payload_json", "TEXT"),
             ),
             "compliance_violations": (("ordinal", "INTEGER NOT NULL DEFAULT 0"),),
-            "modules": (("ordinal", "INTEGER NOT NULL DEFAULT 0"),),
             "trend_videos": (
                 ("final_rank", "INTEGER"),
                 ("media_type", "TEXT NOT NULL DEFAULT 'unknown'"),
@@ -293,7 +292,6 @@ class CatalogDatabase:
                 "output_runs",
                 "score_records",
                 "compliance_results",
-                "modules",
                 "queue_active_runs",
                 "queue_run_history",
                 "change_events",
@@ -426,16 +424,13 @@ class CatalogIndexer:
         self.cfg = cfg
 
     def backfill(self, *, force: bool = False) -> dict[str, int]:
-        counts = {"sources": 0, "outputs": 0, "modules": 0, "errors": 0}
-        roots = (
-            ("outputs", Path(str(getattr(self.cfg, "OUTPUT_DIR", "D:/output_clips")))),
-            ("modules", Path(str(getattr(self.cfg, "MODULE_LIBRARY_DIR", "D:/proya_modules")))),
-        )
+        counts = {"sources": 0, "outputs": 0, "errors": 0}
+        roots = (("outputs", Path(str(getattr(self.cfg, "OUTPUT_DIR", "D:/output_clips")))),)
         seen: set[str] = set()
         existing = {
             str(row["path_identity"]): row
             for row in self.database.query(
-                "SELECT path_identity, mtime_ns, size, sha256 FROM catalog_sources"
+                "SELECT path_identity, mtime_ns, size, sha256 FROM catalog_sources WHERE domain='outputs'"
             )
         }
         source_rows: list[tuple[Any, ...]] = []
@@ -444,7 +439,7 @@ class CatalogIndexer:
         for domain, root in roots:
             if not root.exists():
                 continue
-            patterns = ("manifest.json", "scores_summary.json", "compliance*.json") if domain == "outputs" else ("index.json",)
+            patterns = ("manifest.json", "scores_summary.json", "compliance*.json")
             for pattern in patterns:
                 for path in root.rglob(pattern):
                     identity, display = normalize_path(path)
@@ -510,9 +505,8 @@ class CatalogIndexer:
                 "DELETE FROM catalog_repairs WHERE source_path='post-mutation projection'"
             )
         counts["outputs"] = int(self.database.scalar("SELECT COUNT(*) FROM output_runs", default=0) or 0)
-        counts["modules"] = int(self.database.scalar("SELECT COUNT(*) FROM modules", default=0) or 0)
         if changed or force or not snapshot_ready:
-            ChangeEventRepository(self.database).publish(("outputs", "scores", "compliance", "modules"))
+            ChangeEventRepository(self.database).publish(("outputs", "scores", "compliance"))
         return counts
 
     def verify(self) -> dict[str, Any]:
@@ -539,9 +533,6 @@ class CatalogIndexer:
         )
 
     def _project_file(self, domain: str, path: Path) -> None:
-        if domain == "modules" and path.name.casefold() == "index.json":
-            self._project_modules(path)
-            return
         if path.name.casefold() == "manifest.json":
             self._project_manifest(path)
         elif path.name.casefold() == "scores_summary.json":
@@ -685,29 +676,6 @@ class CatalogIndexer:
                     ),
                 )
 
-    def _project_modules(self, path: Path) -> None:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        modules = list(payload.get("modules") or []) if isinstance(payload, Mapping) else []
-        with self.database.transaction(immediate=True) as connection:
-            connection.execute("DELETE FROM modules")
-            for index, module in enumerate(modules):
-                if not isinstance(module, Mapping):
-                    continue
-                module_id = str(module.get("module_id") or index)
-                connection.execute(
-                    "INSERT INTO modules(module_id, product, role, review_status, source_date, payload_json, ordinal) "
-                    "VALUES(?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        module_id,
-                        str(module.get("product") or ""),
-                        str(module.get("role") or ""),
-                        str(module.get("review_status") or ""),
-                        str(module.get("source_date") or ""),
-                        json.dumps(module, ensure_ascii=False),
-                        index,
-                    ),
-                )
-
     def _project_read_models(self) -> None:
         """Materialize the current API models once, outside request handling."""
         from clipper_app.application.read_services import ReadDashboardService
@@ -724,8 +692,6 @@ class CatalogIndexer:
             compliance_detail_violations.extend(detail_violations)
             for detail_row in detail_rows:
                 compliance_detail_rows[(detail_row.output_dir, detail_row.clip_id)] = detail_row
-        module_rows, modules_by_id, _signature, module_warnings = reader._module_corpus()
-        module_readiness = reader.module_readiness().data
         with self.database.transaction(immediate=True) as connection:
             synthetic_output = self._ensure_output(connection, Path(str(getattr(self.cfg, "OUTPUT_DIR", "D:/output_clips"))) / ".catalog")
             connection.execute("DELETE FROM score_records")
@@ -779,25 +745,9 @@ class CatalogIndexer:
                     "VALUES(?, ?, ?, ?, ?, ?)",
                     (violation_id, result_id_row[0], row.get("severity"), row.get("violation_type"), json.dumps(row, ensure_ascii=False), index),
                 )
-            connection.execute("DELETE FROM modules")
-            for index, row_model in enumerate(module_rows):
-                row = row_model.model_dump(mode="json")
-                raw = modules_by_id.get(row["module_id"], {})
-                if raw:
-                    row = reader._module_row(raw, include_artifact=True).model_dump(mode="json")
-                connection.execute(
-                    "INSERT INTO modules(module_id, product, role, review_status, source_date, payload_json, ordinal) VALUES(?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        row["module_id"], row["product"], row["role"], row["review_status"], row["source_date"],
-                        json.dumps({"row": row, "transcript_text": str(raw.get("transcript_text") or "")}, ensure_ascii=False),
-                        index,
-                    ),
-                )
             snapshots = {
                 "score_stats": score_stats.model_dump(mode="json"),
-                "catalog_warnings": list(dict.fromkeys((*score_warnings, *compliance_warnings, *module_warnings))),
-                "module_library_dir": str(getattr(self.cfg, "MODULE_LIBRARY_DIR", "")),
-                "module_readiness": module_readiness.model_dump(mode="json"),
+                "catalog_warnings": list(dict.fromkeys((*score_warnings, *compliance_warnings))),
                 "compliance_list_violations": [
                     violation.model_dump(mode="json") for violation in violations[:200]
                 ],
@@ -811,12 +761,10 @@ class CatalogIndexer:
         expected = {
             "scores": len(score_records),
             "compliance": len(compliance_rows),
-            "modules": len(module_rows),
         }
         actual = {
             "scores": int(self.database.scalar("SELECT COUNT(*) FROM score_records", default=0) or 0),
             "compliance": int(self.database.scalar("SELECT COUNT(*) FROM compliance_results", default=0) or 0),
-            "modules": int(self.database.scalar("SELECT COUNT(*) FROM modules", default=0) or 0),
         }
         comparison = {
             "checked": True,
@@ -1147,81 +1095,6 @@ class CatalogQueryService:
             },
         )
 
-    def modules(
-        self, *, limit: int, offset: int, search: str | None, status: str | None, quality_status: str | None,
-        review_status: str | None, visual_status: str | None, product: str | None,
-        sort: str, direction: str,
-    ) -> Any:
-        from clipper_app.contracts.read_models import ModuleLibraryPage, ModuleLibraryRow
-
-        where, params = self._where((
-            ("lower(payload_json) LIKE ?", f"%{search.casefold()}%" if search else None),
-            (
-                "(lower(json_extract(payload_json, '$.row.quality_status'))=? OR lower(review_status)=? OR lower(json_extract(payload_json, '$.row.visual_validation_status'))=?)",
-                (status.casefold(), status.casefold(), status.casefold()) if status else None,
-            ),
-            ("lower(json_extract(payload_json, '$.row.quality_status'))=?", quality_status.casefold() if quality_status else None),
-            ("lower(review_status)=?", review_status.casefold() if review_status else None),
-            ("lower(json_extract(payload_json, '$.row.visual_validation_status'))=?", visual_status.casefold() if visual_status else None),
-            ("lower(product)=?", product.casefold() if product else None),
-        ))
-        columns = {
-            "product": ("product", "source_date", "role", "module_id"),
-            "role": ("role",),
-            "source_date": ("source_date",),
-            "review_status": ("review_status",),
-            "confidence": ("json_extract(payload_json, '$.row.confidence')",),
-            "duration": ("json_extract(payload_json, '$.row.duration')",),
-            "status": (
-                "json_extract(payload_json, '$.row.quality_status')",
-                "review_status",
-            ),
-        }
-        if sort not in columns:
-            raise ValueError(f"Unsupported module sort: {sort}")
-        direction_sql = "ASC" if direction.casefold() == "asc" else "DESC"
-        order = ", ".join(f"{column} {direction_sql}" for column in columns[sort])
-        flattened: list[Any] = []
-        for value in params:
-            flattened.extend(value if isinstance(value, tuple) else (value,))
-        params = flattened
-        total = int(self.database.scalar(f"SELECT COUNT(*) FROM modules{where}", params, 0) or 0)
-        rows = self.database.query(
-            f"SELECT payload_json FROM modules{where} ORDER BY {order}, ordinal ASC LIMIT ? OFFSET ?",
-            (*params, limit, offset),
-        )
-        def distinct(path: str) -> tuple[str, ...]:
-            return tuple(str(row[0]) for row in self.database.query(f"SELECT DISTINCT {path} FROM modules WHERE {path}<>'' ORDER BY {path}"))
-        return ModuleLibraryPage(
-            library_dir=str(self._snapshot("module_library_dir", getattr(self.cfg, "MODULE_LIBRARY_DIR", ""))),
-            rows=tuple(ModuleLibraryRow.model_validate(json.loads(row["payload_json"])["row"]) for row in rows),
-            total=total, limit=limit, offset=offset,
-            filter_options={
-                "product": distinct("product"), "source_date": distinct("source_date"),
-                "quality_status": distinct("json_extract(payload_json, '$.row.quality_status')"),
-                "visual_validation_status": distinct("json_extract(payload_json, '$.row.visual_validation_status')"),
-                "review_status": distinct("review_status"),
-            },
-        )
-
-    def module_detail(self, module_id: str) -> Any:
-        from clipper_app.contracts.read_models import ModuleDetail, ModuleLibraryRow
-
-        rows = self.database.query("SELECT payload_json FROM modules WHERE module_id=?", (module_id,))
-        if not rows:
-            return ModuleDetail()
-        bundle = json.loads(rows[0]["payload_json"])
-        return ModuleDetail(
-            selected=ModuleLibraryRow.model_validate(bundle["row"]),
-            transcript_text=str(bundle.get("transcript_text") or ""),
-        )
-
-    def module_readiness(self) -> Any:
-        from clipper_app.contracts.read_models import ModuleReadiness
-
-        return ModuleReadiness.model_validate(self._snapshot("module_readiness", {}))
-
-
 def _file_digest(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -1366,16 +1239,6 @@ CREATE TABLE IF NOT EXISTS compliance_violations (
     payload_json TEXT NOT NULL DEFAULT '{}',
     ordinal INTEGER NOT NULL DEFAULT 0
 );
-CREATE TABLE IF NOT EXISTS modules (
-    module_id TEXT PRIMARY KEY,
-    product TEXT,
-    role TEXT,
-    review_status TEXT,
-    source_date TEXT,
-    payload_json TEXT NOT NULL DEFAULT '{}',
-    ordinal INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS modules_query_idx ON modules(product, role, review_status, source_date DESC);
 CREATE TABLE IF NOT EXISTS export_status (
     export_id TEXT PRIMARY KEY,
     updated_at TEXT,

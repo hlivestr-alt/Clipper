@@ -11,7 +11,6 @@ from clipper_app.application.services import (
     ComplianceService,
     ExportPackagingService,
     HealthService,
-    ModuleService,
     PipelineService,
     QueueControlService,
     QueueService,
@@ -53,10 +52,6 @@ def build_compliance_service() -> ComplianceService:
 
 def build_export_packaging_service() -> ExportPackagingService:
     return ExportPackagingService()
-
-
-def build_module_service() -> ModuleService:
-    return ModuleService()
 
 
 def build_health_service() -> HealthService:

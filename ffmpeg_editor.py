@@ -2266,7 +2266,6 @@ def _add_before_after_overlay_filters(fc, vid, extra_inputs, clip_duration, W, H
     hook_block_duration = max(
         ba_start_offset,
         max(0.0, float(getattr(cfg, "HOOK_DURATION", 0.0) or 0.0)),
-        max(0.0, float(getattr(cfg, "MODULE_HOOK_DURATION", 0.0) or 0.0)),
     )
     overlay_x = "0"
     overlay_y = "0"

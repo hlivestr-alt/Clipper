@@ -1101,242 +1101,6 @@ def _read_score_optimization_stats(summary_path: Path | None) -> dict:
     return stats if isinstance(stats, dict) else {}
 
 
-def run_module_assembly(
-    assembly_date: str | None = None,
-    product: str | None = None,
-    module_assembly_limit: int | None = None,
-    module_product_zoom: bool = False,
-    progress_callback=None,
-    runtime_cfg=None,
-) -> dict:
-    """Standalone module-library assembly run that does not depend on one source video."""
-    if runtime_cfg is None:
-        import config as base_cfg
-    else:
-        base_cfg = runtime_cfg
-    from module_assembler import build_modular_assembly_jobs, render_modular_assemblies
-    from module_extractor import PRODUCT_FOLDERS, canonical_product, read_library_index
-
-    source_date_filter = _validate_cli_date(assembly_date) if assembly_date else None
-    product_filter = canonical_product(product) if product else None
-    if product and not product_filter:
-        valid_products = ", ".join(PRODUCT_FOLDERS)
-        raise ValueError(f"Invalid --product value {product!r}; expected one of: {valid_products}")
-
-    output_date = source_date_filter or datetime.now().astimezone().date().isoformat()
-    runtime_overrides = {
-        "MODULE_ASSEMBLY_ENABLED": True,
-        "MODULE_ASSEMBLY_OUTPUT_SUBDIR": "",
-    }
-    if source_date_filter:
-        runtime_overrides["MODULE_ASSEMBLY_SOURCE_DATE"] = source_date_filter
-    if module_assembly_limit is not None:
-        runtime_overrides["MODULE_ASSEMBLY_RENDER_LIMIT"] = max(0, int(module_assembly_limit))
-    if module_product_zoom:
-        runtime_overrides["MODULE_PRODUCT_ZOOM_ENABLED"] = True
-
-    cfg = _RuntimeConfig(base_cfg, runtime_overrides)
-    _sync_lm_studio_model_ids(cfg)
-
-    output_dir = Path(cfg.OUTPUT_DIR) / "modular_assembly" / output_date
-    working_dir = Path(cfg.WORKING_DIR) / "modular_assembly" / output_date
-    output_dir.mkdir(parents=True, exist_ok=True)
-    working_dir.mkdir(parents=True, exist_ok=True)
-
-    _report(progress_callback, "modular", 0, "Standalone module assembly started")
-    log.info("=" * 70)
-    log.info("PROYA STANDALONE MODULE ASSEMBLY")
-    log.info("  Library:    %s", getattr(cfg, "MODULE_LIBRARY_DIR", r"D:\proya_modules"))
-    log.info("  Output:     %s", output_dir)
-    log.info("  Working:    %s", working_dir)
-    if source_date_filter:
-        log.info("  Source date:%s", source_date_filter)
-    if product_filter:
-        log.info("  Product:    %s", product_filter)
-    if module_assembly_limit is not None:
-        log.info("  Limit:      %s", max(0, int(module_assembly_limit)))
-    log.info("  Zoom:       %s", "enabled" if getattr(cfg, "MODULE_PRODUCT_ZOOM_ENABLED", False) else "disabled")
-    log.info("=" * 70)
-
-    _enforce_text_model_priority_at_pipeline_start(cfg)
-    pipeline_start = time.time()
-    text_model_stage_started = False
-    text_model_finished = False
-    manifest: list[dict] = []
-    manifest_path = output_dir / "manifest.json"
-    scores: list[dict] = []
-
-    try:
-        if bool(getattr(cfg, "COMPLIANCE_ENABLED", True)) or bool(getattr(cfg, "SCORER_ENABLED", True)):
-            text_model_stage_started = _start_text_model_stage(cfg)
-
-        _report(progress_callback, "modular", 10, "Loading module library index...")
-        index = read_library_index(cfg)
-        if product_filter:
-            index = _filter_module_index_for_product(index, product_filter)
-        log.info(
-            "Loaded module index: modules=%s updated_at=%s",
-            index.get("module_count", len(index.get("modules", []) or [])),
-            index.get("updated_at", ""),
-        )
-
-        _report(progress_callback, "modular", 20, "Building modular assembly jobs...")
-        jobs = build_modular_assembly_jobs(index, output_dir, cfg)
-        log.info("Built %s modular assembly candidate(s)", len(jobs))
-
-        _report(progress_callback, "modular", 35, "Rendering modular assemblies...")
-        result = render_modular_assemblies(
-            jobs,
-            cfg,
-            output_dir=output_dir,
-            working_dir=working_dir,
-            progress_callback=progress_callback,
-        )
-        manifest = result.get("manifest", []) if isinstance(result.get("manifest"), list) else []
-        manifest_path = Path(result.get("manifest_path") or manifest_path)
-        scores = result.get("scores", []) if isinstance(result.get("scores"), list) else []
-
-        vision_scoring_requested = bool(scores and getattr(cfg, "SCORER_VISION_ENABLED", False))
-        text_model_unloaded = _finish_text_model_stage_for_vision_handoff(
-            cfg,
-            text_model_stage_started=text_model_stage_started,
-            vision_scoring_requested=vision_scoring_requested,
-            active_stage="standalone module assembly text scoring",
-        )
-        if text_model_stage_started:
-            text_model_finished = True
-
-        if vision_scoring_requested:
-            if text_model_unloaded or not _model_management_enabled(cfg):
-                scores = _score_rendered_clip_host_focus(
-                    scores,
-                    manifest,
-                    str(output_dir),
-                    cfg,
-                    progress_callback,
-                )
-                result["scores"] = scores
-                _write_json_atomic(manifest_path, manifest)
-            else:
-                raise RuntimeError(
-                    "Host-focus vision scoring cannot start because "
-                    f"{_text_model_id(cfg)} is still loaded after module text scoring."
-                )
-
-        if not manifest_path.exists():
-            _write_json_atomic(manifest_path, manifest)
-
-        try:
-            from compliance_checker import update_scores_summary_with_compliance
-
-            update_scores_summary_with_compliance(output_dir, manifest)
-        except Exception as exc:
-            log.warning(f"Could not merge modular compliance fields into score summary: {exc}")
-
-        scores_summary_path = output_dir / "scores_summary.json" if scores else None
-        total_time = time.time() - pipeline_start
-        scorer_accounting = _read_score_optimization_stats(scores_summary_path)
-        log.info("\n" + "=" * 70)
-        log.info("MODULE ASSEMBLY COMPLETE")
-        log.info("  Total time:     %s", _fmt_time(total_time))
-        log.info("  Candidates:     %s", result.get("jobs", len(jobs)))
-        log.info("  Created:        %s", result.get("created", 0))
-        log.info("  Failed:         %s", result.get("failed", 0))
-        log.info("  Blocked:        %s", result.get("blocked", 0))
-        log.info("  Scored:         %s", len(scores))
-        if scorer_accounting:
-            vision_stats = scorer_accounting.get("vision_scoring", {})
-            if not isinstance(vision_stats, dict):
-                vision_stats = {}
-            log.info(
-                "  Qwen HTTP calls: text=%s vision=%s",
-                scorer_accounting.get("actual_text_qwen_calls", 0),
-                scorer_accounting.get(
-                    "actual_vision_qwen_calls",
-                    vision_stats.get("actual_vision_qwen_calls", 0),
-                ),
-            )
-        log.info("  Output dir:     %s", output_dir)
-        log.info("  Manifest:       %s", manifest_path)
-        if scores_summary_path:
-            log.info("  Scores:         %s", scores_summary_path)
-        log.info("=" * 70)
-
-        _report(
-            progress_callback,
-            "done",
-            100,
-            f"Done! {result.get('created', 0)} modular clips created in {_fmt_time(total_time)}",
-            event="module_assembly_complete",
-            clips_created=result.get("created", 0),
-            clips_failed=result.get("failed", 0),
-            clips_blocked=result.get("blocked", 0),
-            output_dir=str(output_dir),
-            manifest_path=str(manifest_path),
-            scores_summary_path=str(scores_summary_path) if scores_summary_path else None,
-        )
-
-        return {
-            **result,
-            "total_time": total_time,
-            "output_dir": str(output_dir),
-            "working_dir": str(working_dir),
-            "manifest_path": str(manifest_path),
-            "scores_summary_path": str(scores_summary_path) if scores_summary_path else None,
-            "clips_scored": len(scores),
-            "source_date_filter": source_date_filter,
-            "product_filter": product_filter,
-        }
-    finally:
-        if text_model_stage_started and not text_model_finished:
-            try:
-                _finish_text_model_stage(
-                    cfg,
-                    active_stage="standalone module assembly cleanup",
-                    required=False,
-                )
-            except Exception as exc:
-                log.warning(f"Could not unload text model after module assembly: {exc}")
-
-
-def _run_modular_assembly(output_dir: str, working_dir: str, cfg, progress_callback=None) -> dict:
-    """Run the in-pipeline modular assembly path against the current module library."""
-    from module_assembler import build_and_render_from_library
-
-    return build_and_render_from_library(
-        output_dir,
-        working_dir,
-        cfg,
-        progress_callback=progress_callback,
-    )
-
-
-def _filter_module_index_for_product(index: dict, product: str) -> dict:
-    from module_extractor import canonical_product
-
-    modules = [
-        module
-        for module in (index.get("modules", []) or [])
-        if canonical_product(module.get("product")) == product
-    ]
-    filtered = dict(index)
-    filtered["modules"] = modules
-    filtered["module_count"] = len(modules)
-    filtered["product_filter"] = product
-    return filtered
-
-
-def _validate_cli_date(value: str) -> str:
-    text = str(value or "").strip()
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
-        raise ValueError(f"Invalid --date value {value!r}; expected YYYY-MM-DD")
-    try:
-        datetime.strptime(text, "%Y-%m-%d")
-    except ValueError as exc:
-        raise ValueError(f"Invalid --date value {value!r}; expected a real YYYY-MM-DD date") from exc
-    return text
-
-
 def _apply_score_sort_moves_to_manifest(manifest: list, artifacts: dict | None) -> None:
     tier_move = (artifacts or {}).get("tier_move", {})
     moves = {
@@ -2158,12 +1922,6 @@ def _run_pipeline_impl(
     max_clips: int = None,
     min_score: float = None,
     force_rescore: bool = False,
-    extract_modules_only: bool = False,
-    force_modules: bool = False,
-    render_modules: bool = False,
-    modular_only: bool = False,
-    module_assembly_limit: int | None = None,
-    module_product_zoom: bool = False,
     output_tag: str | None = None,
     working_tag: str | None = None,
     control_path: str | None = None,
@@ -2180,18 +1938,7 @@ def _run_pipeline_impl(
     else:
         base_cfg = runtime_cfg
 
-    modular_requested = bool(render_modules or modular_only)
-    runtime_overrides = {
-        "MODULE_ASSEMBLY_ENABLED": modular_requested,
-        "MODULE_PRODUCT_ZOOM_ENABLED": False,
-    }
-    runtime_overrides.update(settings_overrides or {})
-    if not modular_requested:
-        runtime_overrides["MODULE_ASSEMBLY_RENDER_LIMIT"] = 0
-    elif module_assembly_limit is not None:
-        runtime_overrides["MODULE_ASSEMBLY_RENDER_LIMIT"] = max(0, int(module_assembly_limit))
-    if module_product_zoom:
-        runtime_overrides["MODULE_PRODUCT_ZOOM_ENABLED"] = True
+    runtime_overrides = dict(settings_overrides or {})
     if min_score is not None:
         runtime_overrides["MIN_SCORE"] = min_score
     if force_rescore:
@@ -2199,10 +1946,7 @@ def _run_pipeline_impl(
 
     cfg = _RuntimeConfig(base_cfg, runtime_overrides)
     _sync_lm_studio_model_ids(cfg)
-    module_extraction_enabled = bool(
-        extract_modules_only or getattr(cfg, "MODULE_EXTRACTION_ENABLED", True)
-    )
-    skip_vision_for_run = bool(skip_vision or extract_modules_only or modular_only)
+    skip_vision_for_run = bool(skip_vision)
 
     # ── Validate inputs ───────────────────────────────────────────────────────
     if not Path(video_path).exists():
@@ -2236,7 +1980,6 @@ def _run_pipeline_impl(
         cfg,
         skip_moments=skip_moments,
         skip_vision=skip_vision_for_run,
-        module_extraction_enabled=module_extraction_enabled,
     )
     _enforce_text_model_priority_at_pipeline_start(cfg)
 
@@ -2275,7 +2018,6 @@ def _run_pipeline_impl(
 
     if (
         (not skip_moments)
-        or module_extraction_enabled
         or bool(getattr(cfg, "SCORER_ENABLED", True))
         or bool(getattr(cfg, "COMPLIANCE_ENABLED", True))
     ):
@@ -2306,12 +2048,11 @@ def _run_pipeline_impl(
 
     write_stage_fingerprint(Path(working_dir) / "moments.json", video_path, cfg, "llm")
 
-    module_stats = None
     if not moments:
         skip_vision_for_run = True
 
     # ── Variation expansion ───────────────────────────────────────────────────
-    n_variants = 1  # legacy location disabled; expansion runs after module extraction below
+    n_variants = 1  # legacy location disabled; expansion runs after vision below
     if False:  # see note above
         try:
             from variation_engine import expand_moments_with_variants
@@ -2393,72 +2134,6 @@ def _run_pipeline_impl(
 
     _report(progress_callback, "vision", 50, f"{len(product_events)} product events loaded")
 
-    if module_extraction_enabled:
-        _report(progress_callback, "modules", 55, "Extracting reusable raw modules...")
-        log.info("\n-- MODULE LIBRARY EXTRACTION ---------------------------------------------")
-        from module_extractor import extract_modules
-
-        t0 = time.time()
-        module_stats = extract_modules(
-            video_path=video_path,
-            transcript=transcript,
-            moments=moments,
-            working_dir=working_dir,
-            cfg=cfg,
-            force=force_modules,
-        )
-        log.info(
-            "Module extraction done in %s | accepted=%s existing=%s duplicate=%s rejected=%s",
-            _fmt_time(time.time() - t0),
-            module_stats.get("accepted", 0),
-            module_stats.get("skipped_existing", 0),
-            module_stats.get("skipped_duplicate", 0),
-            module_stats.get("rejected", 0),
-        )
-        _report(
-            progress_callback,
-            "modules",
-            60,
-            (
-                f"Modules accepted={module_stats.get('accepted', 0)} "
-                f"existing={module_stats.get('skipped_existing', 0)}"
-            ),
-            event="module_extraction_complete",
-            modules_accepted=module_stats.get("accepted", 0),
-            modules_existing=module_stats.get("skipped_existing", 0),
-            modules_rejected=module_stats.get("rejected", 0),
-        )
-
-    if extract_modules_only:
-        if text_model_stage_started:
-            _finish_text_model_stage(cfg, active_stage="module extraction")
-        return {
-            "clips_created": 0,
-            "clips_failed": 0,
-            "moments_found": len(moments),
-            "module_extraction": module_stats or {},
-            "output_dir": output_dir,
-        }
-
-    modular_result = None
-    if modular_requested:
-        _report(progress_callback, "modular", 62, "Rendering modular assemblies...")
-        log.info("\n-- MODULAR ASSEMBLY ------------------------------------------------------")
-        modular_result = _run_modular_assembly(output_dir, working_dir, cfg, progress_callback)
-        if modular_only:
-            if text_model_stage_started:
-                _finish_text_model_stage(cfg, active_stage="modular assembly")
-            return {
-                "clips_created": int(modular_result.get("created", 0) or 0),
-                "clips_failed": int(modular_result.get("failed", 0) or 0),
-                "clips_skipped": int(modular_result.get("skipped", 0) or 0),
-                "clips_blocked": int(modular_result.get("blocked", 0) or 0),
-                "moments_found": len(moments),
-                "module_extraction": module_stats or {},
-                "modular_assembly": modular_result,
-                "output_dir": output_dir,
-            }
-
     if not moments:
         log.warning("No moments detected! Check your LM Studio connection and transcript quality.")
         if text_model_stage_started:
@@ -2467,12 +2142,10 @@ def _run_pipeline_impl(
             "clips_created": 0,
             "clips_failed": 0,
             "moments_found": 0,
-            "module_extraction": module_stats or {},
-            "modular_assembly": modular_result,
             "output_dir": output_dir,
         }
 
-    # Apply max_clips after extraction so the module library still sees the full candidate set.
+    # Apply max_clips after moment detection and vision context loading.
     if max_clips and len(moments) > max_clips:
         log.info(f"Limiting to top {max_clips} clips (from {len(moments)} total)")
         moments = moments[:max_clips]
@@ -2733,8 +2406,6 @@ def _run_pipeline_impl(
                 vision_stats.get("actual_vision_qwen_calls", 0),
             ),
         )
-    if module_stats is not None:
-        log.info(f"  Modules added:  {module_stats.get('accepted', 0)}")
     log.info(f"  Output dir:     {output_dir}")
     log.info(f"  Manifest:       {manifest_path}")
     if scores_summary_path:
@@ -2777,7 +2448,6 @@ def _run_pipeline_impl(
         scores_summary_path=str(scores_summary_path) if scores_summary_path else None,
         export_batch_manifest=export_batch_result.get("manifest_path") if export_batch_result else None,
         export_batches_packaged=export_batch_result.get("packaged_count", 0) if export_batch_result else 0,
-        modules_accepted=(module_stats or {}).get("accepted", 0),
     )
 
     return {
@@ -2792,8 +2462,6 @@ def _run_pipeline_impl(
         "scores_summary_path": str(scores_summary_path) if scores_summary_path else None,
         "clips_scored": len(clip_scores),
         "export_batches": export_batch_result,
-        "module_extraction": module_stats or {},
-        "modular_assembly": modular_result,
     }
 
 
@@ -2807,12 +2475,6 @@ def _pipeline_service_executor(command, runtime_cfg, progress_callback):
         max_clips=command.max_clips,
         min_score=command.min_score,
         force_rescore=command.force_rescore,
-        extract_modules_only=command.extract_modules_only,
-        force_modules=command.force_modules,
-        render_modules=command.render_modules,
-        modular_only=command.modular_only,
-        module_assembly_limit=command.module_assembly_limit,
-        module_product_zoom=command.module_product_zoom,
         output_tag=command.output_tag,
         working_tag=command.working_tag,
         control_path=command.control_path,
@@ -2831,12 +2493,6 @@ def run_pipeline(
     max_clips: int = None,
     min_score: float = None,
     force_rescore: bool = False,
-    extract_modules_only: bool = False,
-    force_modules: bool = False,
-    render_modules: bool = False,
-    modular_only: bool = False,
-    module_assembly_limit: int | None = None,
-    module_product_zoom: bool = False,
     output_tag: str | None = None,
     working_tag: str | None = None,
     control_path: str | None = None,
@@ -2854,12 +2510,6 @@ def run_pipeline(
             max_clips=max_clips,
             min_score=min_score,
             force_rescore=force_rescore,
-            extract_modules_only=extract_modules_only,
-            force_modules=force_modules,
-            render_modules=render_modules,
-            modular_only=modular_only,
-            module_assembly_limit=module_assembly_limit,
-            module_product_zoom=module_product_zoom,
             output_tag=output_tag,
             working_tag=working_tag,
             control_path=control_path,
@@ -2880,12 +2530,6 @@ def run_pipeline(
         max_clips=max_clips,
         min_score=min_score,
         force_rescore=force_rescore,
-        extract_modules_only=extract_modules_only,
-        force_modules=force_modules,
-        render_modules=render_modules,
-        modular_only=modular_only,
-        module_assembly_limit=module_assembly_limit,
-        module_product_zoom=module_product_zoom,
         output_tag=output_tag,
         working_tag=working_tag,
         control_path=control_path,
@@ -3299,7 +2943,6 @@ def _validate_startup(
     cfg,
     skip_moments: bool,
     skip_vision: bool,
-    module_extraction_enabled: bool = False,
 ) -> None:
     errors = []
     if not _command_available("ffmpeg"):
@@ -3308,12 +2951,7 @@ def _validate_startup(
         errors.append("FFprobe is not accessible on PATH")
     if not _source_has_audio(video_path):
         errors.append(f"Input video has no audio stream: {video_path}")
-    if module_extraction_enabled:
-        try:
-            import portalocker  # noqa: F401
-        except ImportError:
-            errors.append("portalocker is required for module extraction. Run: pip install portalocker")
-    if (not skip_moments or module_extraction_enabled) and not _lm_studio_responding(cfg):
+    if not skip_moments and not _lm_studio_responding(cfg):
         errors.append(f"LM Studio is not responding at {getattr(cfg, 'LM_STUDIO_BASE_URL', '')}")
     if not skip_vision and not Path(getattr(cfg, "YOLO_WEIGHTS", "")).exists():
         errors.append(f"YOLO weights not found: {getattr(cfg, 'YOLO_WEIGHTS', '')}")
@@ -3424,147 +3062,6 @@ def main():
     parser.add_argument("--min-score", type=float, default=None, help="Minimum LLM score (1-10)")
     parser.add_argument("--force-rescore", action="store_true", help="Bypass post-render score cache")
     parser.add_argument(
-        "--extract-modules-only",
-        action="store_true",
-        help="Run transcription, moment detection, and module extraction only",
-    )
-    parser.add_argument(
-        "--force-modules",
-        action="store_true",
-        help="Recut deterministic module outputs even when an existing valid module is present",
-    )
-    parser.add_argument(
-        "--render-modules",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--assemble-modules",
-        action="store_true",
-        help="Assemble clips from D:\\proya_modules into a dated modular_assembly output folder without --video",
-    )
-    parser.add_argument(
-        "--modular-only",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--module-assembly-limit",
-        type=int,
-        default=None,
-        help="Override the modular assembly render limit for this run",
-    )
-    parser.add_argument(
-        "--module-product-zoom",
-        action="store_true",
-        help="Use visually validated module product events for modular product zooms in this run",
-    )
-    parser.add_argument(
-        "--date",
-        type=str,
-        default=None,
-        metavar="YYYY-MM-DD",
-        help="Limit --assemble-modules to same-date module combinations and use that output date folder",
-    )
-    parser.add_argument(
-        "--product",
-        type=str,
-        default=None,
-        help="Limit --assemble-modules to one product, such as serum",
-    )
-    parser.add_argument(
-        "--validate-modules-visual-only",
-        action="store_true",
-        help="Run YOLO visual validation on existing module library entries without rendering",
-    )
-    parser.add_argument(
-        "--module-visual-product",
-        type=str,
-        default=None,
-        help="Limit --validate-modules-visual-only to one canonical product",
-    )
-    parser.add_argument(
-        "--module-visual-status",
-        choices=["not_run", "failed", "passed", "all"],
-        default="not_run",
-        help="Limit --validate-modules-visual-only by current visual status",
-    )
-    parser.add_argument(
-        "--module-visual-role",
-        choices=["hook", "main", "cta"],
-        default=None,
-        help="Limit --validate-modules-visual-only by module role",
-    )
-    parser.add_argument(
-        "--module-visual-approved-only",
-        action="store_true",
-        help="Limit --validate-modules-visual-only to approved modules",
-    )
-    parser.add_argument(
-        "--module-visual-priority",
-        choices=["assembly_ready", "index_order"],
-        default="assembly_ready",
-        help="Order visual validation candidates by assembly priority or raw index order",
-    )
-    parser.add_argument(
-        "--module-visual-limit",
-        type=int,
-        default=None,
-        help="Maximum modules to visually validate in this run",
-    )
-    parser.add_argument(
-        "--force-module-visual",
-        action="store_true",
-        help="Re-run module visual validation even when the stored fingerprint is current",
-    )
-    parser.add_argument(
-        "--module-library-report",
-        action="store_true",
-        help="Write modular library health reports without processing a video",
-    )
-    parser.add_argument(
-        "--module-review-queue",
-        action="store_true",
-        help="Write a modular review queue JSON/CSV without processing a video",
-    )
-    parser.add_argument(
-        "--module-review-filter",
-        choices=["needs_review", "approved", "blocked", "no_visual_events", "all"],
-        default="needs_review",
-        help="Filter used with --module-review-queue",
-    )
-    parser.add_argument(
-        "--module-review-limit",
-        type=int,
-        default=None,
-        help="Maximum rows to write with --module-review-queue",
-    )
-    parser.add_argument(
-        "--module-review-set",
-        type=str,
-        default=None,
-        metavar="MODULE_ID_OR_PATH",
-        help="Approve/block a module by module_id, media path, or sidecar path",
-    )
-    parser.add_argument(
-        "--module-review-status",
-        choices=["approved", "needs_review", "blocked"],
-        default=None,
-        help="New review status for --module-review-set",
-    )
-    parser.add_argument(
-        "--module-review-note",
-        type=str,
-        default="",
-        help="Optional note stored in the reviewed module sidecar",
-    )
-    parser.add_argument(
-        "--module-reviewer",
-        type=str,
-        default="operator",
-        help="Reviewer name stored in the reviewed module sidecar",
-    )
-    parser.add_argument(
         "--output-tag",
         type=str,
         default=None,
@@ -3626,20 +3123,6 @@ def main():
 
     args = parser.parse_args()
 
-    if args.render_modules or args.modular_only:
-        args.render_modules = True
-
-    if (args.product or args.date) and not args.assemble_modules:
-        print("Error: --product and --date are only valid with --assemble-modules")
-        sys.exit(1)
-
-    if (
-        args.module_assembly_limit is not None
-        or args.module_product_zoom
-    ) and not (args.assemble_modules or args.render_modules or args.modular_only):
-        print("Error: module assembly options require --assemble-modules, --render-modules, or --modular-only")
-        sys.exit(1)
-
     if args.package_export_batches:
         import config as cfg
         from export_packager import package_export_batches
@@ -3693,112 +3176,6 @@ def main():
     # ── Test LM Studio ────────────────────────────────────────────────────────
     if args.test_lm_studio:
         _test_lm_studio()
-        return
-
-    if args.module_library_report:
-        from clipper_app.bootstrap import build_module_service
-        from clipper_app.contracts import ModuleReportCommand
-
-        report = build_module_service().report(
-            ModuleReportCommand(include_library_report=True, include_review_queue=False)
-        ).payload["report"]
-        log.info("Module library report written:")
-        log.info("  JSON: %s", report.get("json_path"))
-        log.info("  CSV:  %s", report.get("csv_path"))
-        for row in report.get("readiness", []):
-            log.info(
-                "  %-11s ready=%s hook=%s main=%s cta=%s sources=%s reason=%s",
-                row.get("product"),
-                row.get("ready"),
-                row.get("approved_hook"),
-                row.get("approved_main"),
-                row.get("approved_cta"),
-                row.get("source_video_count"),
-                row.get("reason"),
-            )
-        return
-
-    if args.module_review_queue:
-        from clipper_app.bootstrap import build_module_service
-        from clipper_app.contracts import ModuleReportCommand
-
-        report = build_module_service().report(
-            ModuleReportCommand(
-                include_library_report=False,
-                include_review_queue=True,
-                review_filter=args.module_review_filter,
-                review_limit=args.module_review_limit,
-            )
-        ).payload["review_queue"]
-        log.info("Module review queue written:")
-        log.info("  JSON: %s", report.get("json_path"))
-        log.info("  CSV:  %s", report.get("csv_path"))
-        log.info("  Rows: %s", report.get("module_count", 0))
-        for row in report.get("counts_by_quality_status", []):
-            log.info("  %-13s %s", row.get("quality_status"), row.get("count"))
-        return
-
-    if args.module_review_set:
-        if not args.module_review_status:
-            print("Error: --module-review-set requires --module-review-status")
-            sys.exit(1)
-        from clipper_app.bootstrap import build_module_service
-        from clipper_app.contracts import ModuleReviewCommand
-
-        result = build_module_service().review(ModuleReviewCommand(
-            identifier=args.module_review_set,
-            status=args.module_review_status,
-            note=args.module_review_note,
-            reviewer=args.module_reviewer,
-        )).payload
-        log.info(
-            "Module review updated: %s review_status=%s quality_status=%s reason=%s",
-            result.get("module_id"),
-            result.get("review_status"),
-            result.get("quality_status"),
-            result.get("quality_reason"),
-        )
-        log.info("  Sidecar: %s", result.get("sidecar_path"))
-        return
-
-    if args.validate_modules_visual_only:
-        from clipper_app.bootstrap import build_module_service
-        from clipper_app.contracts import ModuleValidationCommand
-
-        result = build_module_service().validate(ModuleValidationCommand(
-            product=args.module_visual_product,
-            limit=args.module_visual_limit,
-            visual_status=args.module_visual_status,
-            role=args.module_visual_role,
-            approved_only=args.module_visual_approved_only,
-            priority=args.module_visual_priority,
-            force=args.force_module_visual,
-        )).payload
-        log.info("Module visual validation complete:")
-        log.info("  Index:   %s", result.get("index_path"))
-        log.info("  Checked: %s", result.get("validated", 0))
-        log.info("  Passed:  %s", result.get("passed", 0))
-        log.info("  Failed:  %s", result.get("failed", 0))
-        log.info("  Not run: %s", result.get("not_run", 0))
-        log.info("  Current: %s", result.get("skipped_current", 0))
-        log.info("  Filtered: %s", result.get("skipped_filter", 0))
-        log.info("  Errors:  %s", result.get("sidecar_error", 0))
-        return
-
-    if args.assemble_modules:
-        try:
-            from clipper_app.bootstrap import build_module_service
-            from clipper_app.contracts import ModuleAssemblyCommand
-
-            build_module_service().assemble(ModuleAssemblyCommand(
-                assembly_date=args.date,
-                product=args.product,
-                module_assembly_limit=args.module_assembly_limit,
-                module_product_zoom=args.module_product_zoom,
-            ))
-        except ValueError as exc:
-            print(f"Error: {exc}")
-            sys.exit(1)
         return
 
     # ── Preview word corrections ──────────────────────────────────────────────
@@ -3856,7 +3233,7 @@ def main():
 
     if not args.video:
         parser.print_help()
-        print("\nError: --video is required unless using --train-yolo, --test-lm-studio, --assemble-modules, --module-library-report, --module-review-queue, --module-review-set, --validate-modules-visual-only, --cleanup-stale-queue, --preview-ba, or --setup-sfx")
+        print("\nError: --video is required unless using --train-yolo, --test-lm-studio, --cleanup-stale-queue, --preview-ba, or --setup-sfx")
         print("       Use --package-export-batches to package existing export-ready clips without --video.")
         sys.exit(1)
 
@@ -3875,12 +3252,6 @@ def main():
         max_clips=args.max_clips,
         min_score=args.min_score,
         force_rescore=args.force_rescore,
-        extract_modules_only=args.extract_modules_only,
-        force_modules=args.force_modules,
-        render_modules=args.render_modules,
-        modular_only=args.modular_only,
-        module_assembly_limit=args.module_assembly_limit,
-        module_product_zoom=args.module_product_zoom,
         output_tag=output_tag,
         working_tag=working_tag,
     )

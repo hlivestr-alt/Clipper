@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -15,7 +16,66 @@ DEPRECATED_SETTINGS_OVERRIDES = frozenset({
     "BEFORE_AFTER_ENABLED",
     "VARIANT_FFMPEG_BAKE",
     "VARIANTS_PER_CLIP",
+    "MODULE_LIBRARY_DIR",
+    "MODULE_EXTRACTION_ENABLED",
+    "MODULE_DURATION_STRICT",
+    "MODULE_HOOK_MIN_DURATION",
+    "MODULE_HOOK_MAX_DURATION",
+    "MODULE_MAIN_MIN_DURATION",
+    "MODULE_MAIN_MAX_DURATION",
+    "MODULE_CTA_MIN_DURATION",
+    "MODULE_CTA_MAX_DURATION",
+    "MODULE_SENTENCE_BOUNDARY_TOLERANCE",
+    "MODULE_ASSEMBLY_ENABLED",
+    "MODULE_ASSEMBLY_RENDER_LIMIT",
+    "MODULE_ASSEMBLY_CANDIDATE_POOL",
+    "MODULE_ASSEMBLY_MAX_PER_PRODUCT",
+    "MODULE_ASSEMBLY_COMPLIANCE_PREFILTER",
+    "MODULE_ASSEMBLY_SAFE_HOOKS_ENABLED",
+    "MODULE_ASSEMBLY_SAME_DATE_ONLY",
+    "MODULE_ASSEMBLY_VISUAL_EVENT_BONUS",
+    "MODULE_ASSEMBLY_ZOOM_READY_MIN_EVENTS",
+    "MODULE_ASSEMBLY_REQUIRE_ZOOM_READY",
+    "MODULE_REBUILD_INDEX_BEFORE_ASSEMBLY",
+    "MODULE_OUTPUT_LOCK_TIMEOUT",
+    "MODULE_EXTRACT_FFMPEG_TIMEOUT",
+    "MODULE_DEDUPE_IOU_THRESHOLD",
+    "MODULE_PRODUCT_ZOOM_ENABLED",
+    "MODULE_VALIDATE_ON_EXTRACT",
+    "MODULE_VISUAL_VALIDATION_MIN_CONFIDENCE",
+    "MODULE_VISUAL_VALIDATION_SAMPLE_FPS",
+    "MODULE_VISUAL_VALIDATION_MIN_HITS",
+    "MODULE_WORD_FALLBACK_REVIEW_REQUIRED",
+    "MODULE_ASSEMBLY_REQUIRE_APPROVED",
+    "MODULE_ASSEMBLY_MIN_SOURCE_VIDEOS",
+    "MODULAR_ASSEMBLY_READY_MIN_HOOK",
+    "MODULAR_ASSEMBLY_READY_MIN_MAIN",
+    "MODULAR_ASSEMBLY_READY_MIN_CTA",
+    "MODULE_PRODUCT_EVIDENCE_REQUIRED",
+    "MODULE_PRODUCT_EVIDENCE_CONTEXT_SECONDS",
+    "MODULE_CLASSIFICATION_MIN_CONFIDENCE",
+    "MODULE_CLASSIFIER_WORKERS",
+    "MODULE_CANDIDATE_CACHE_ENABLED",
+    "MODULE_MAX_CANDIDATES_PER_ROLE",
+    "MODULE_INDEX_LOCK_TIMEOUT",
+    "MODULE_FILE_LOCK_TIMEOUT",
+    "MODULE_INDEX_VALIDATE_MEDIA",
+    "MODULE_INDEX_REPROBE_MEDIA",
+    "MODULE_REPORT_LOAD_SIDECARS",
 })
+REMOVED_MODULAR_SETTINGS = frozenset(
+    name for name in DEPRECATED_SETTINGS_OVERRIDES
+    if name.startswith(("MODULE_", "MODULAR_"))
+)
+
+
+def _warn_ignored_removed_settings(names: set[str]) -> None:
+    if names:
+        warnings.warn(
+            "Ignoring removed legacy modular setting(s): " + ", ".join(sorted(names)),
+            UserWarning,
+            stacklevel=3,
+        )
 
 LEGACY_SETTINGS_ALIASES = {
     "LM_STUDIO_MODEL": "LM_STUDIO_MOMENT_MODEL_ID",
@@ -80,16 +140,6 @@ def _definitions() -> tuple[SettingDefinition, ...]:
         "COMPLIANCE_ENABLED": "compliance",
         "COMPLIANCE_AUTO_FIX": "compliance",
         "COMPLIANCE_BLOCK_HIGH": "compliance",
-        "MODULE_EXTRACTION_ENABLED": "modules",
-        "MODULE_ASSEMBLY_ENABLED": "modules",
-        "MODULE_ASSEMBLY_REQUIRE_APPROVED": "modules",
-        "MODULE_ASSEMBLY_SAME_DATE_ONLY": "modules",
-        "MODULE_ASSEMBLY_REQUIRE_ZOOM_READY": "modules",
-        "MODULE_REBUILD_INDEX_BEFORE_ASSEMBLY": "modules",
-        "MODULE_VALIDATE_ON_EXTRACT": "modules",
-        "MODULE_WORD_FALLBACK_REVIEW_REQUIRED": "modules",
-        "MODULE_PRODUCT_EVIDENCE_REQUIRED": "modules",
-        "MODULE_PRODUCT_ZOOM_ENABLED": "modules",
     }
     int_keys = {
         "QUEUE_START_RUN_NUMBER": ("queue", 1, None),
@@ -115,11 +165,6 @@ def _definitions() -> tuple[SettingDefinition, ...]:
         "SCORER_BATCH_FLUSH_EVERY": ("scoring", 1, None),
         "SCORER_FRAME_SAMPLE_RATE": ("scoring", 1, None),
         "SCORER_TOP_VARIANTS_PER_CLIP": ("scoring", 0, None),
-        "MODULE_ASSEMBLY_RENDER_LIMIT": ("modules", 0, None),
-        "MODULE_ASSEMBLY_MAX_PER_PRODUCT": ("modules", 1, None),
-        "MODULE_ASSEMBLY_CANDIDATE_POOL": ("modules", 1, None),
-        "MODULE_ASSEMBLY_MIN_SOURCE_VIDEOS": ("modules", 1, None),
-        "MODULE_CLASSIFIER_WORKERS": ("modules", 1, None),
         "PRODUCT_INFORMATION_LLM_MAX_INPUT_CHARS": ("models", 2000, None),
         "PRODUCT_INFORMATION_LLM_MAX_TOKENS": ("models", 512, None),
     }
@@ -156,14 +201,6 @@ def _definitions() -> tuple[SettingDefinition, ...]:
         "SCORER_REVIEW_THRESHOLD": ("scoring", 0, 10),
         "COMPLIANCE_LM_TIMEOUT": ("compliance", 1, None),
         "SCORER_VISION_TIMEOUT": ("scoring", 1, None),
-        "MODULE_CLASSIFICATION_MIN_CONFIDENCE": ("modules", 0, 1),
-        "MODULE_HOOK_MIN_DURATION": ("modules", 0, None),
-        "MODULE_HOOK_MAX_DURATION": ("modules", 0, None),
-        "MODULE_MAIN_MIN_DURATION": ("modules", 0, None),
-        "MODULE_MAIN_MAX_DURATION": ("modules", 0, None),
-        "MODULE_CTA_MIN_DURATION": ("modules", 0, None),
-        "MODULE_CTA_MAX_DURATION": ("modules", 0, None),
-        "MODULE_VISUAL_VALIDATION_MIN_CONFIDENCE": ("modules", 0, 1),
     }
     string_keys = {
         "OUTPUT_DIR": "paths",
@@ -173,7 +210,6 @@ def _definitions() -> tuple[SettingDefinition, ...]:
         "QUEUE_STATE_FILE": "paths",
         "QUEUE_FOREVER_STATE_FILE": "paths",
         "QUEUE_CONTROL_FILE": "paths",
-        "MODULE_LIBRARY_DIR": "paths",
         "LM_STUDIO_BASE_URL": "models",
         "LM_STUDIO_MOMENT_MODEL_ID": "models",
         "SCORER_VISION_BASE_URL": "models",
@@ -222,7 +258,6 @@ PRIVILEGED_SETTINGS = frozenset({
     "QUEUE_STATE_FILE",
     "QUEUE_FOREVER_STATE_FILE",
     "QUEUE_CONTROL_FILE",
-    "MODULE_LIBRARY_DIR",
     "LM_STUDIO_BASE_URL",
     "SCORER_VISION_BASE_URL",
     "WHATSAPP_DIRECT_PC_DELIVERY_ENABLED",
@@ -257,10 +292,6 @@ def validate_setting_relationships(values: Mapping[str, Any]) -> None:
             "WhatsApp cutover: direct PC delivery requires explicit confirmation "
             "that the legacy Drive assignment/delivery workflow is disabled"
         )
-    ordered("MODULE_HOOK_MIN_DURATION", "MODULE_HOOK_MAX_DURATION", "Hook module duration")
-    ordered("MODULE_MAIN_MIN_DURATION", "MODULE_MAIN_MAX_DURATION", "Main module duration")
-    ordered("MODULE_CTA_MIN_DURATION", "MODULE_CTA_MAX_DURATION", "CTA module duration")
-
     if (
         "CHUNK_OVERLAP" in values
         and "CHUNK_DURATION" in values
@@ -320,7 +351,14 @@ class LegacyConfigProvider:
         persisted = self._load_persisted_overrides() if self.include_persisted_overrides else {}
         command_overrides = normalize_setting_aliases(overrides or {})
         stale_persisted = set(persisted) & DEPRECATED_SETTINGS_OVERRIDES
+        _warn_ignored_removed_settings(stale_persisted & REMOVED_MODULAR_SETTINGS)
         active_persisted = {key: value for key, value in persisted.items() if key not in stale_persisted}
+        stale_command = set(command_overrides) & REMOVED_MODULAR_SETTINGS
+        _warn_ignored_removed_settings(stale_command)
+        command_overrides = {
+            key: value for key, value in command_overrides.items()
+            if key not in stale_command
+        }
         accepted_command_names = set(SETTINGS_REGISTRY) | set(RUNTIME_SETTINGS_REGISTRY)
         unknown = sorted(
             (set(active_persisted) - set(SETTINGS_REGISTRY))
@@ -433,6 +471,9 @@ class LegacyConfigProvider:
             raise ValueError("Settings snapshot file must contain a values object")
         values = payload["values"]
         sources = payload.get("sources", {}) if isinstance(payload.get("sources"), dict) else {}
+        stale_values = set(values) & REMOVED_MODULAR_SETTINGS
+        _warn_ignored_removed_settings(stale_values)
+        values = {name: value for name, value in values.items() if name not in stale_values}
         unknown = sorted(set(values) - set(SETTINGS_REGISTRY))
         if unknown:
             raise ValueError(f"Unsupported settings snapshot value(s): {', '.join(unknown)}")
@@ -449,7 +490,7 @@ class LegacyConfigProvider:
         calculated = hashlib.sha256(
             json.dumps(normalized, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
-        if revision and revision != calculated:
+        if revision and revision != calculated and not stale_values:
             raise ValueError("Settings snapshot revision does not match its values")
         return SettingsSnapshot(entries=entries, revision=calculated)
 

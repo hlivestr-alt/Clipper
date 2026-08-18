@@ -47,10 +47,8 @@ class CatalogDatabaseTests(unittest.TestCase):
 
     def test_backfill_materializes_query_rows(self) -> None:
         output = self.root / "output"
-        modules = self.root / "modules"
         working = self.root / "working"
         output.mkdir()
-        modules.mkdir()
         working.mkdir(exist_ok=True)
         run = output / "vod_run_001"
         run.mkdir()
@@ -62,15 +60,10 @@ class CatalogDatabaseTests(unittest.TestCase):
             json.dumps({"schema_version": 2, "updated_at": "2026-01-01T00:00:00+00:00", "groups": []}),
             encoding="utf-8",
         )
-        (modules / "index.json").write_text(
-            json.dumps({"schema_version": 2, "modules": [{"module_id": "m1", "product": "serum", "role": "hook"}]}),
-            encoding="utf-8",
-        )
         state = working / "state.json"
         state.write_text(json.dumps({"schema_version": 2, "videos": {}}), encoding="utf-8")
         cfg = SimpleNamespace(
             OUTPUT_DIR=str(output),
-            MODULE_LIBRARY_DIR=str(modules),
             WORKING_DIR=str(working),
             QUEUE_STATE_FILE=str(state),
             QUEUE_CONTROL_FILE=str(working / "control.json"),
@@ -81,15 +74,10 @@ class CatalogDatabaseTests(unittest.TestCase):
 
         self.assertEqual(result["errors"], 0)
         self.assertEqual(self.database.scalar("SELECT COUNT(*) FROM clips"), 1)
-        self.assertEqual(self.database.scalar("SELECT COUNT(*) FROM modules"), 1)
         self.assertTrue(CatalogIndexer(self.database, cfg).verify()["ok"])
 
         with mock.patch.dict(os.environ, {"CLIPPER_CATALOG_MODE": "catalog", "CLIPPER_CATALOG_PATH": str(self.database.path)}):
             reads = ReadDashboardService(LegacyConfigProvider(cfg))
-            with mock.patch.object(reads, "_module_corpus", side_effect=AssertionError("request-time crawl")):
-                page = reads.module_library(limit=20)
-            self.assertEqual(page.data.total, 1)
-            self.assertEqual(page.data.rows[0].module_id, "m1")
             self.assertEqual(reads.scores(limit=20).data.total, 0)
 
 

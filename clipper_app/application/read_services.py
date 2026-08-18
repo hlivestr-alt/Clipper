@@ -24,11 +24,6 @@ from clipper_app.contracts.read_models import (
     DashboardSummary,
     LogLine,
     LogTail,
-    ModuleLibraryPage,
-    ModuleLibraryRow,
-    ModuleDetail,
-    ModuleReadiness,
-    ModuleReadinessRow,
     OverviewCompliance,
     OverviewExport,
     OverviewScoreTrendPoint,
@@ -56,16 +51,6 @@ STAGES: tuple[tuple[str, str], ...] = (
     ("ffmpeg", "Clip Rendering"),
 )
 STAGE_LABELS = {key: label for key, label in STAGES}
-MODULE_PRODUCTS: tuple[tuple[str, str], ...] = (
-    ("cleanser", "Cleanser"),
-    ("toner", "Toner"),
-    ("serum", "Serum"),
-    ("eye_cream", "Eye Cream"),
-    ("mask", "Mask"),
-    ("skin_cream", "Skin Cream"),
-)
-MODULE_ROLES = ("hook", "main", "cta")
-MODULE_PRODUCT_LABELS = dict(MODULE_PRODUCTS)
 MIN_SORT_TIMESTAMP = datetime(1970, 1, 1, tzinfo=datetime.now().astimezone().tzinfo)
 
 
@@ -200,20 +185,6 @@ def source_date_from_source_video(value: Any) -> str:
     return match.group("date") if match else ""
 
 
-def source_video_filename(source_video: Any) -> str:
-    if isinstance(source_video, dict):
-        source_video = source_video.get("name") or source_video.get("path") or ""
-    return Path(str(source_video or "")).name
-
-
-def module_source_date_value(module: dict[str, Any]) -> str:
-    for key in ("source_date", "date"):
-        explicit = str(module.get(key) or "").strip()
-        if explicit:
-            return explicit
-    return source_date_from_source_video(module.get("source_video"))
-
-
 class ReadDashboardService:
     def __init__(
         self,
@@ -237,10 +208,9 @@ class ReadDashboardService:
         """Invalidate cached read corpora after a successful mutation."""
         aliases = {
             "queue": ("queue", "dashboard", "output_dirs", "scores", "compliance", "overview"),
-            "settings": ("settings", "dashboard", "queue", "modules", "overview"),
+            "settings": ("settings", "dashboard", "queue", "overview"),
             "scores": ("scores", "overview"),
             "compliance": ("compliance", "overview"),
-            "modules": ("modules",),
             "outputs": ("output_dirs", "scores", "compliance", "overview"),
             "system": ("system",),
             "overview": ("overview",),
@@ -768,170 +738,6 @@ class ReadDashboardService:
 
         return self._cache.get_or_load("compliance:overview", revision, load)
 
-    def module_readiness(self) -> ReadServiceResult:
-        if self._catalog is not None and self._catalog.ready("modules"):
-            return ReadServiceResult(
-                self._catalog.module_readiness(),
-                revision=self._catalog.revision("modules"),
-            )
-        index_payload, signature, warnings = self._module_index_payload()
-        modules = index_payload.get("modules", []) if isinstance(index_payload, dict) else []
-        modules = [module for module in modules if isinstance(module, dict)]
-        min_hook = int(getattr(self.cfg, "MODULAR_ASSEMBLY_READY_MIN_HOOK", 5) or 5)
-        min_main = int(getattr(self.cfg, "MODULAR_ASSEMBLY_READY_MIN_MAIN", 3) or 3)
-        min_cta = int(getattr(self.cfg, "MODULAR_ASSEMBLY_READY_MIN_CTA", 3) or 3)
-        min_events = max(1, int(getattr(self.cfg, "MODULE_ASSEMBLY_ZOOM_READY_MIN_EVENTS", 1) or 1))
-        revision = (self._signature_key(signature), min_hook, min_main, min_cta, min_events)
-        cached = self._cache.get("modules:readiness", revision)
-        if cached is not None:
-            return cached
-        role_counts = {product: {role: 0 for role in MODULE_ROLES} for product, _label in MODULE_PRODUCTS}
-        visual_counts = {
-            product: {
-                "total": 0,
-                "passed": 0,
-                "failed": 0,
-                "not_run": 0,
-                "zoom_ready_candidates": 0,
-            }
-            for product, _label in MODULE_PRODUCTS
-        }
-        for module in modules:
-            product_key = str(module.get("product") or "")
-            role = str(module.get("role") or "")
-            if product_key in role_counts and role in role_counts[product_key]:
-                role_counts[product_key][role] += 1
-            if product_key in visual_counts:
-                visual = visual_counts[product_key]
-                visual["total"] += 1
-                status = self._module_visual_status(module.get("visual_validation_status"))
-                visual[status] += 1
-                hits = as_nonnegative_int(module.get("visual_product_hits"))
-                approved = str(module.get("quality_status") or "") in {"approved", "no_visual_events"}
-                if approved and status == "passed" and hits >= min_events:
-                    visual["zoom_ready_candidates"] += 1
-
-        rows: list[ModuleReadinessRow] = []
-        for product_key, label in MODULE_PRODUCTS:
-            counts = role_counts[product_key]
-            total = sum(counts.values())
-            if counts["hook"] >= min_hook and counts["main"] >= min_main and counts["cta"] >= min_cta:
-                readiness = "ready"
-            elif total > 0:
-                readiness = "partial"
-            else:
-                readiness = "empty"
-            visual = visual_counts[product_key]
-            rows.append(
-                ModuleReadinessRow(
-                    product=label,
-                    product_key=product_key,
-                    hook=counts["hook"],
-                    main=counts["main"],
-                    cta=counts["cta"],
-                    total=total,
-                    readiness=readiness,
-                    visual_total=visual["total"],
-                    visual_passed=visual["passed"],
-                    visual_failed=visual["failed"],
-                    visual_not_run=visual["not_run"],
-                    zoom_ready_candidates=visual["zoom_ready_candidates"],
-                )
-            )
-        data = ModuleReadiness(
-            library_dir=str(self._module_library_dir()),
-            index_path=signature.path,
-            index_exists=signature.exists,
-            index_updated_at=str(index_payload.get("updated_at") or "") if isinstance(index_payload, dict) else "",
-            index_module_count=self._module_index_count(index_payload, modules),
-            thresholds={"hook": min_hook, "main": min_main, "cta": min_cta, "zoom_ready_events": min_events},
-            rows=tuple(rows),
-        )
-        return self._cache.set(
-            "modules:readiness",
-            revision,
-            ReadServiceResult(data, (signature,), tuple(warnings)),
-        )
-
-    def module_library(
-        self,
-        *,
-        limit: int = 50,
-        offset: int = 0,
-        search: str | None = None,
-        status: str | None = None,
-        quality_status: str | None = None,
-        review_status: str | None = None,
-        visual_status: str | None = None,
-        product: str | None = None,
-        sort: str = "product",
-        direction: Literal["asc", "desc"] = "asc",
-    ) -> ReadServiceResult:
-        limit, offset = self._bounded_page(limit, offset)
-        if self._catalog is not None and self._catalog.ready("modules"):
-            data = self._catalog.modules(
-                limit=limit,
-                offset=offset,
-                search=search,
-                status=status,
-                quality_status=quality_status,
-                review_status=review_status,
-                visual_status=visual_status,
-                product=product,
-                sort=sort,
-                direction=direction,
-            )
-            return ReadServiceResult(data, revision=self._catalog.revision("modules"))
-        rows, modules_by_id, signature, warnings = self._module_corpus()
-        filter_options = {
-            "product": tuple(sorted({row.product for row in rows if row.product})),
-            "source_date": tuple(sorted({row.source_date for row in rows if row.source_date})),
-            "quality_status": tuple(sorted({row.quality_status for row in rows if row.quality_status})),
-            "visual_validation_status": tuple(sorted({row.visual_validation_status for row in rows if row.visual_validation_status})),
-            "review_status": tuple(sorted({row.review_status for row in rows if row.review_status})),
-        }
-        rows = self._filter_module_rows(
-            rows,
-            search=search,
-            status=status,
-            quality_status=quality_status,
-            review_status=review_status,
-            visual_status=visual_status,
-            product=product,
-        )
-        rows = self._sort_module_rows(rows, sort=sort, direction=direction)
-        total = len(rows)
-        page = [
-            self._module_row(modules_by_id[row.module_id], include_artifact=True)
-            if row.module_id in modules_by_id else row
-            for row in rows[offset : offset + limit]
-        ]
-        data = ModuleLibraryPage(
-            library_dir=str(self._module_library_dir()),
-            rows=tuple(page),
-            total=total,
-            limit=limit,
-            offset=offset,
-            filter_options=filter_options,
-        )
-        return ReadServiceResult(data, (signature,), tuple(warnings))
-
-    def module_detail(self, module_id: str) -> ReadServiceResult:
-        if self._catalog is not None and self._catalog.ready("modules"):
-            return ReadServiceResult(
-                self._catalog.module_detail(module_id),
-                revision=self._catalog.revision("modules"),
-            )
-        _rows, modules_by_id, signature, warnings = self._module_corpus()
-        module = modules_by_id.get(str(module_id))
-        if module is None:
-            return ReadServiceResult(ModuleDetail(), (signature,), tuple(warnings))
-        data = ModuleDetail(
-            selected=self._module_row(module, include_artifact=True),
-            transcript_text=str(module.get("transcript_text") or ""),
-        )
-        return ReadServiceResult(data, (signature,), tuple(warnings))
-
     def settings_snapshot(self) -> ReadServiceResult:
         snapshot = self.settings_provider.snapshot()
         entries_by_name = {entry.name: entry for entry in snapshot.entries}
@@ -1175,7 +981,7 @@ class ReadDashboardService:
         try:
             import queue_control
 
-            return queue_control.normalize_launch_config(value)
+            return queue_control.normalize_launch_config(value, allow_legacy=True)
         except Exception:
             return {}
 
@@ -1982,140 +1788,6 @@ class ReadDashboardService:
             except OSError:
                 continue
 
-    def _module_index_payload(self) -> tuple[dict[str, Any], SourceSignature, list[str]]:
-        path = self._module_library_dir() / "index.json"
-        signature = self._source_signature(path)
-
-        def load() -> tuple[dict[str, Any], tuple[str, ...]]:
-            warnings: list[str] = []
-            payload = self._load_json_dict(path, warnings, optional=True)
-            if not signature.exists:
-                warnings.append(f"No module index found at {path}")
-            modules = payload.get("modules", []) if isinstance(payload, dict) else []
-            if modules is not None and not isinstance(modules, list):
-                warnings.append("Module index 'modules' field was not a list.")
-                payload["modules"] = []
-            return payload, tuple(warnings)
-
-        payload, warnings = self._cache.get_or_load(
-            "modules:index",
-            self._signature_key(signature),
-            load,
-        )
-        return payload, signature, list(warnings)
-
-    def _module_corpus(
-        self,
-    ) -> tuple[list[ModuleLibraryRow], dict[str, dict[str, Any]], SourceSignature, list[str]]:
-        payload, signature, warnings = self._module_index_payload()
-
-        def load() -> tuple[tuple[ModuleLibraryRow, ...], dict[str, dict[str, Any]]]:
-            rows: list[ModuleLibraryRow] = []
-            modules_by_id: dict[str, dict[str, Any]] = {}
-            for module in payload.get("modules", []) if isinstance(payload, dict) else []:
-                if not isinstance(module, dict):
-                    continue
-                row = self._module_row(module, include_artifact=False)
-                rows.append(row)
-                modules_by_id[row.module_id] = module
-            return tuple(rows), modules_by_id
-
-        rows, modules_by_id = self._cache.get_or_load(
-            "modules:corpus",
-            self._signature_key(signature),
-            load,
-        )
-        return list(rows), modules_by_id, signature, warnings
-
-    def _module_row(self, module: dict[str, Any], *, include_artifact: bool = False) -> ModuleLibraryRow:
-        product_key = str(module.get("product") or "")
-        file_path = str(module.get("file_path") or "")
-        return ModuleLibraryRow(
-            module_id=str(module.get("module_id") or Path(file_path).stem),
-            product=MODULE_PRODUCT_LABELS.get(product_key, product_key),
-            product_key=product_key,
-            role=str(module.get("role") or ""),
-            source_date=module_source_date_value(module),
-            source_video=source_video_filename(module.get("source_video")),
-            duration=round(score_float(module.get("duration")) or 0.0, 2),
-            confidence=round(score_float(module.get("confidence")) or 0.0, 3),
-            quality_status=str(module.get("quality_status") or ""),
-            review_status=str(module.get("review_status") or ""),
-            boundary_mode=str(module.get("boundary_mode") or ""),
-            visual_validation_status=self._module_visual_status(module.get("visual_validation_status")),
-            visual_product_hits=as_nonnegative_int(module.get("visual_product_hits")),
-            visual_product_confidence_max=round(score_float(module.get("visual_product_confidence_max")) or 0.0, 3),
-            visual_validation_reason=str(module.get("visual_validation_reason") or ""),
-            file_artifact=self._artifact_for_output(self._module_library_dir(), file_path) if include_artifact else None,
-        )
-
-    def _filter_module_rows(
-        self,
-        rows: list[ModuleLibraryRow],
-        *,
-        search: str | None,
-        status: str | None,
-        quality_status: str | None,
-        review_status: str | None,
-        visual_status: str | None,
-        product: str | None,
-    ) -> list[ModuleLibraryRow]:
-        search_key = str(search or "").casefold().strip()
-        status_key = str(status or "").casefold().strip()
-        quality_key = str(quality_status or "").casefold().strip()
-        review_key = str(review_status or "").casefold().strip()
-        visual_key = str(visual_status or "").casefold().strip()
-        product_key = str(product or "").casefold().strip()
-        filtered = rows
-        if search_key:
-            filtered = [
-                row
-                for row in filtered
-                if search_key
-                in " ".join([row.module_id, row.source_video, row.transcript_text, row.product, row.role]).casefold()
-            ]
-        if status_key:
-            filtered = [
-                row
-                for row in filtered
-                if row.quality_status.casefold() == status_key
-                or row.review_status.casefold() == status_key
-                or row.visual_validation_status.casefold() == status_key
-            ]
-        if quality_key:
-            filtered = [row for row in filtered if row.quality_status.casefold() == quality_key]
-        if review_key:
-            filtered = [row for row in filtered if row.review_status.casefold() == review_key]
-        if visual_key:
-            filtered = [row for row in filtered if row.visual_validation_status.casefold() == visual_key]
-        if product_key:
-            filtered = [row for row in filtered if row.product_key.casefold() == product_key or row.product.casefold() == product_key]
-        return filtered
-
-    def _sort_module_rows(self, rows: list[ModuleLibraryRow], *, sort: str, direction: str) -> list[ModuleLibraryRow]:
-        reverse = direction == "desc"
-        sorters = {
-            "product": lambda row: (row.product.casefold(), row.source_date, row.role, row.module_id),
-            "source_date": lambda row: row.source_date,
-            "duration": lambda row: row.duration,
-            "confidence": lambda row: row.confidence,
-            "role": lambda row: row.role.casefold(),
-            "status": lambda row: (row.quality_status.casefold(), row.review_status.casefold()),
-        }
-        if sort not in sorters:
-            raise ValueError(f"Unsupported module sort: {sort}")
-        return sorted(rows, key=sorters[sort], reverse=reverse)
-
-    def _module_visual_status(self, value: Any) -> str:
-        status = str(value or "not_run").strip().lower()
-        return status if status in {"passed", "failed", "not_run"} else "not_run"
-
-    def _module_index_count(self, payload: dict[str, Any], modules: list[Any]) -> int:
-        try:
-            return int(payload.get("module_count") or len(modules) or 0) if isinstance(payload, dict) else len(modules)
-        except (TypeError, ValueError):
-            return len(modules)
-
     def _collect_output_dirs(self) -> tuple[str, ...]:
         max_dirs = max(1, int(getattr(self.cfg, "READ_APP_MAX_OUTPUT_DIRS", 200) or 200))
         output_dirs: dict[str, Path] = {}
@@ -2255,15 +1927,11 @@ class ReadDashboardService:
         batch_dir_name = str(getattr(self.cfg, "EXPORT_BATCH_DIR_NAME", "export_batches") or "export_batches")
         return self._output_root() / batch_dir_name / "_status.json"
 
-    def _module_library_dir(self) -> Path:
-        return Path(getattr(self.cfg, "MODULE_LIBRARY_DIR", r"D:\proya_modules")).resolve()
-
     def _allowed_artifact_roots(self) -> tuple[Path, ...]:
         working_dir = Path(getattr(self.cfg, "WORKING_DIR", "working"))
         product_broll = Path(getattr(self.cfg, "PRODUCT_BROLL_DIR", "assets/product_broll"))
         roots = [
             Path(getattr(self.cfg, "OUTPUT_DIR", r"D:\output_clips")),
-            Path(getattr(self.cfg, "MODULE_LIBRARY_DIR", r"D:\proya_modules")),
             product_broll,
             working_dir / "variation_previews",
             Path.cwd() / "assets" / "variation_preview",

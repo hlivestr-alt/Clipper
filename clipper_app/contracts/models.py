@@ -39,12 +39,6 @@ class PipelineRunCommand(StrictModel):
     max_clips: int | None = Field(default=None, ge=1)
     min_score: float | None = Field(default=None, ge=0, le=10)
     force_rescore: bool = False
-    extract_modules_only: bool = False
-    force_modules: bool = False
-    render_modules: bool = False
-    modular_only: bool = False
-    module_assembly_limit: int | None = Field(default=None, ge=0)
-    module_product_zoom: bool = False
     output_tag: str | None = None
     working_tag: str | None = None
     control_path: str | None = None
@@ -63,8 +57,6 @@ class PipelineResult(StrictModel):
     scores_summary_path: str | None = None
     clips_scored: int = Field(default=0, ge=0)
     export_batches: dict[str, Any] = Field(default_factory=dict)
-    module_extraction: dict[str, Any] = Field(default_factory=dict)
-    modular_assembly: dict[str, Any] = Field(default_factory=dict)
 
 
 class QueueRunMode(StrEnum):
@@ -76,6 +68,7 @@ class QueueRunMode(StrEnum):
 class QueuePipelineMode(StrEnum):
     FULL = "full"
     CLIPS_ONLY = "clips_only"
+    # Deserialization-only compatibility for historical persisted queue records.
     MODULES_ONLY = "modules_only"
     RAW_CUTS_ONLY = "raw_cuts_only"
 
@@ -139,7 +132,6 @@ class QueueRunCommand(StrictModel):
     max_clips: int | None = Field(default=None, ge=1)
     min_score: float | None = Field(default=None, ge=0, le=10)
     force_rescore: bool = False
-    force_modules: bool = False
     output_tag: str | None = None
     working_tag: str | None = None
     poll_interval: float = Field(default=2.0, ge=0.5)
@@ -180,7 +172,6 @@ class QueueSupervisorCommand(StrictModel):
     min_score: float | None = Field(default=None, ge=0, le=10)
     python_exe: str
     force_rescore: bool = False
-    force_modules: bool = False
     retry_failed: bool = False
     dry_run: bool = False
     run_mode: QueueRunMode = QueueRunMode.FOLDER_REPEAT
@@ -242,41 +233,6 @@ class ComplianceScanResult(StrictModel):
     blocked: int = Field(ge=0)
     auto_fixed: int = Field(default=0, ge=0)
     violation_count: int = Field(default=0, ge=0)
-
-
-class ModuleAssemblyCommand(StrictModel):
-    assembly_date: str | None = None
-    product: str | None = None
-    module_assembly_limit: int | None = Field(default=None, ge=0)
-    module_product_zoom: bool = False
-
-
-class ModuleValidationCommand(StrictModel):
-    product: str | None = None
-    limit: int | None = Field(default=None, ge=1)
-    force: bool = False
-    visual_status: str = "not_run"
-    role: str | None = None
-    approved_only: bool = False
-    priority: str = "assembly_ready"
-
-
-class ModuleReviewCommand(StrictModel):
-    identifier: str
-    status: str
-    note: str = ""
-    reviewer: str = "operator"
-
-
-class ModuleReportCommand(StrictModel):
-    include_library_report: bool = True
-    include_review_queue: bool = False
-    review_filter: str = "needs_review"
-    review_limit: int | None = Field(default=None, ge=1)
-
-
-class ModuleOperationResult(StrictModel):
-    payload: dict[str, Any] = Field(default_factory=dict)
 
 
 class ExportPackagingCommand(StrictModel):

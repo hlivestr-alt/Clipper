@@ -16,11 +16,10 @@ param(
     [int]$BetweenRunsDelaySeconds = 0,
     [string]$PythonExe = "python",
     [switch]$ForceRescore,
-    [switch]$ForceModules,
     [switch]$RetryFailed,
     [ValidateSet("single_video", "folder_once", "folder_repeat")]
     [string]$RunMode = "",
-    [ValidateSet("full", "clips_only", "modules_only", "raw_cuts_only")]
+    [ValidateSet("full", "clips_only", "raw_cuts_only")]
     [string]$PipelineMode = "",
     [ValidateSet("all", "original", "custom")]
     [string]$VariantMode = "",
@@ -93,9 +92,6 @@ if ($BetweenRunsDelaySeconds -gt 0) {
 }
 if ($ForceRescore) {
     $PythonArgs += "--force-rescore"
-}
-if ($ForceModules) {
-    $PythonArgs += "--force-modules"
 }
 if ($RetryFailed) {
     $PythonArgs += "--retry-failed"

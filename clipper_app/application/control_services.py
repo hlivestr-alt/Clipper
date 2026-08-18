@@ -60,13 +60,15 @@ INTERACTIVE_OPERATIONS = {
     ControlOperation.SETTINGS_UPDATE,
     ControlOperation.SETTINGS_DELETE,
     ControlOperation.SETTINGS_RESET,
-    ControlOperation.MODULE_REVIEW,
 }
 COMPUTE_HEAVY_OPERATIONS = {
     ControlOperation.RESCORE,
     ControlOperation.COMPLIANCE_SCAN,
-    ControlOperation.MODULE_ASSEMBLY,
     ControlOperation.TREND_ANALYSIS,
+}
+LEGACY_UNSUPPORTED_OPERATIONS = {
+    ControlOperation.MODULE_ASSEMBLY,
+    ControlOperation.MODULE_REVIEW,
 }
 
 
@@ -441,6 +443,10 @@ class ControlJobService:
         actor: str = "operator",
         conflict_key: str | None = None,
     ) -> ControlJob:
+        if operation in LEGACY_UNSUPPORTED_OPERATIONS:
+            raise ValueError(
+                f"{operation.value} is a legacy unsupported operation and has no active executor"
+            )
         request_payload = _jsonable(request)
         if not isinstance(request_payload, dict):
             request_payload = {"value": request_payload}

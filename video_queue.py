@@ -6,7 +6,7 @@ Pipeline per video:
   1. Transcription (GPU shared lane)
   2. LLM moment detection (GPU shared lane)
   3. YOLO scan (isolated parallel lane)
-  4. Module extraction + normal FFmpeg clip render (parallel CPU lane/backlog)
+  4. Normal FFmpeg clip render (parallel CPU lane/backlog)
 
 State is persisted to JSON so interrupted runs can resume.
 """
@@ -71,7 +71,6 @@ STOPPABLE_STAGE_STATUSES = {"pending", "queued", "running", "paused"}
 PIPELINE_MODE_STAGES = {
     "full": STAGES,
     "clips_only": (EDIT_STAGE,),
-    "modules_only": ("transcribe", "llm", EDIT_STAGE),
     "raw_cuts_only": ("transcribe", "llm", EDIT_STAGE),
 }
 CLIP_PROGRESS_DEFAULTS = {
@@ -85,9 +84,6 @@ CLIP_PROGRESS_DEFAULTS = {
     "clips_skipped": 0,
     "clips_blocked": 0,
     "clips_scored": 0,
-    "modules_accepted": 0,
-    "modules_existing": 0,
-    "modules_rejected": 0,
     "last_clip_id": None,
     "last_clip_status": None,
     "last_event": None,
@@ -179,7 +175,6 @@ class VideoQueueRunner:
         max_clips: int | None = None,
         min_score: float | None = None,
         force_rescore: bool = False,
-        force_modules: bool = False,
         output_tag: str | None = None,
         working_tag: str | None = None,
         poll_interval: float = 2.0,
@@ -233,7 +228,6 @@ class VideoQueueRunner:
         self.max_clips = max(1, int(max_clips)) if max_clips else None
         self.min_score = float(min_score) if min_score is not None else None
         self.force_rescore = bool(force_rescore)
-        self.force_modules = bool(force_modules)
         self.poll_interval = max(0.5, float(poll_interval))
         if scan_interval is None:
             scan_interval = getattr(cfg, "QUEUE_RESCAN_INTERVAL_SECONDS", 300.0)
@@ -942,8 +936,6 @@ class VideoQueueRunner:
                     max_clips=self.max_clips,
                     min_score=self.min_score,
                     force_rescore=self.force_rescore,
-                    extract_modules_only=self.pipeline_mode == "modules_only",
-                    force_modules=self.force_modules,
                     output_tag=self.output_tag,
                     working_tag=self.working_tag,
                     control_path=self.control_path,
@@ -987,9 +979,6 @@ class VideoQueueRunner:
                 "clips_skipped",
                 "clips_blocked",
                 "clips_scored",
-                "modules_accepted",
-                "modules_existing",
-                "modules_rejected",
                 "active_clip_renders",
             ):
                 if field in payload:
@@ -1202,8 +1191,6 @@ class VideoQueueRunner:
             cmd.extend(["--min-score", str(self.min_score)])
         if self.force_rescore:
             cmd.append("--force-rescore")
-        if self.force_modules:
-            cmd.append("--force-modules")
         cmd.extend([
             "--run-mode",
             self.run_mode,
@@ -1482,9 +1469,7 @@ class VideoQueueRunner:
                     )
                 )
             if stage == "ffmpeg":
-                if self.pipeline_mode == "modules_only":
-                    return False
-                if self.force_rescore or self.force_modules:
+                if self.force_rescore:
                     return False
                 with open(path, "r", encoding="utf-8") as f:
                     manifest = json.load(f)
@@ -1513,12 +1498,6 @@ class VideoQueueRunner:
             overrides["MIN_SCORE"] = self.min_score
         if stage == EDIT_STAGE:
             overrides.update(self._pipeline_settings_overrides())
-            overrides.update(
-                {
-                    "MODULE_ASSEMBLY_RENDER_LIMIT": 0,
-                    "MODULE_PRODUCT_ZOOM_ENABLED": False,
-                }
-            )
             if self.ffmpeg_max_parallel_clips is not None:
                 overrides["MAX_PARALLEL_CLIPS"] = self.ffmpeg_max_parallel_clips
             if self.force_rescore:
@@ -1546,19 +1525,6 @@ class VideoQueueRunner:
         if self.pipeline_mode == "clips_only":
             overrides.update(
                 {
-                    "MODULE_EXTRACTION_ENABLED": False,
-                    "MODULE_ASSEMBLY_ENABLED": False,
-                    "SCORER_ENABLED": False,
-                    "COMPLIANCE_ENABLED": False,
-                    "EXPORT_BATCHES_ENABLED": False,
-                }
-            )
-            return overrides
-        if self.pipeline_mode == "modules_only":
-            overrides.update(
-                {
-                    "MODULE_EXTRACTION_ENABLED": True,
-                    "MODULE_ASSEMBLY_ENABLED": False,
                     "SCORER_ENABLED": False,
                     "COMPLIANCE_ENABLED": False,
                     "EXPORT_BATCHES_ENABLED": False,
@@ -1569,8 +1535,6 @@ class VideoQueueRunner:
             overrides.update(
                 {
                     "VARIANTS_PER_CLIP": 1,
-                    "MODULE_EXTRACTION_ENABLED": False,
-                    "MODULE_ASSEMBLY_ENABLED": False,
                     "SCORER_ENABLED": False,
                     "COMPLIANCE_ENABLED": False,
                     "EXPORT_BATCHES_ENABLED": False,
@@ -2032,11 +1996,6 @@ def main() -> int:
     parser.add_argument("--max-clips", type=int, default=None, help="Maximum rendered clip jobs per video")
     parser.add_argument("--min-score", type=float, default=None, help="Minimum LLM moment score for fresh detection")
     parser.add_argument("--force-rescore", action="store_true", help="Bypass post-render score cache")
-    parser.add_argument(
-        "--force-modules",
-        action="store_true",
-        help="Recut reusable module outputs even when existing module files are valid",
-    )
     parser.add_argument("--output-tag", default=None, help="Write rendered clips to a new tagged output folder")
     parser.add_argument("--working-tag", default=None, help="Write caches to a new tagged working folder")
     parser.add_argument("--redo-tag", default=None, help="Apply the same tag to both working and output folders")
@@ -2049,7 +2008,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--pipeline-mode",
-        choices=["full", "clips_only", "modules_only", "raw_cuts_only"],
+        choices=["full", "clips_only", "raw_cuts_only"],
         default="full",
     )
     parser.add_argument(
@@ -2079,7 +2038,6 @@ def main() -> int:
             max_clips=args.max_clips,
             min_score=args.min_score,
             force_rescore=args.force_rescore,
-            force_modules=args.force_modules,
             run_mode=args.run_mode,
             pipeline_mode=args.pipeline_mode,
             variant_mode=args.variant_mode,
@@ -2101,7 +2059,6 @@ def main() -> int:
         max_clips=args.max_clips,
         min_score=args.min_score,
         force_rescore=args.force_rescore,
-        force_modules=args.force_modules,
         output_tag=output_tag,
         working_tag=working_tag,
         poll_interval=args.poll_interval,
@@ -2134,7 +2091,6 @@ def _runner_from_command(command):
         max_clips=command.max_clips,
         min_score=command.min_score,
         force_rescore=command.force_rescore,
-        force_modules=command.force_modules,
         output_tag=command.output_tag,
         working_tag=command.working_tag,
         poll_interval=command.poll_interval,
@@ -2161,7 +2117,6 @@ def _run_stage_once(
     max_clips: int | None = None,
     min_score: float | None = None,
     force_rescore: bool = False,
-    force_modules: bool = False,
     run_mode: str = "folder_repeat",
     pipeline_mode: str = "full",
     variant_mode: str = "all",
@@ -2241,8 +2196,6 @@ def _run_stage_once(
             overrides.update(
                 {
                     "VARIANTS_PER_CLIP": 1,
-                    "MODULE_EXTRACTION_ENABLED": False,
-                    "MODULE_ASSEMBLY_ENABLED": False,
                     "SCORER_ENABLED": False,
                     "COMPLIANCE_ENABLED": False,
                     "EXPORT_BATCHES_ENABLED": False,
@@ -2253,21 +2206,9 @@ def _run_stage_once(
                     "BEFORE_AFTER_ENABLED": False,
                 }
             )
-        elif pipeline_mode == "modules_only":
-            overrides.update(
-                {
-                    "MODULE_EXTRACTION_ENABLED": True,
-                    "MODULE_ASSEMBLY_ENABLED": False,
-                    "SCORER_ENABLED": False,
-                    "COMPLIANCE_ENABLED": False,
-                    "EXPORT_BATCHES_ENABLED": False,
-                }
-            )
         elif pipeline_mode == "clips_only":
             overrides.update(
                 {
-                    "MODULE_EXTRACTION_ENABLED": False,
-                    "MODULE_ASSEMBLY_ENABLED": False,
                     "SCORER_ENABLED": False,
                     "COMPLIANCE_ENABLED": False,
                     "EXPORT_BATCHES_ENABLED": False,
@@ -2291,8 +2232,6 @@ def _run_stage_once(
             max_clips=max(1, int(max_clips)) if max_clips else None,
             min_score=float(min_score) if min_score is not None else None,
             force_rescore=force_rescore,
-            extract_modules_only=pipeline_mode == "modules_only",
-            force_modules=force_modules,
             output_tag=output_tag,
             working_tag=working_tag,
             settings_overrides=overrides,

@@ -86,9 +86,6 @@ export function invalidationPrefixesForMutation(path: string): string[] {
   if (normalized.startsWith("/api/operations/compliance")) {
     prefixes.add("/api/compliance");
   }
-  if (normalized.startsWith("/api/modules") || normalized.startsWith("/api/operations/module-assembly")) {
-    prefixes.add("/api/modules");
-  }
   if (normalized.startsWith("/api/settings")) {
     prefixes.add("/api/settings");
     prefixes.add("/api/system");

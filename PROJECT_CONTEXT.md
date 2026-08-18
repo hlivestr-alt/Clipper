@@ -1,6 +1,6 @@
 # Project Context
 
-**Last reviewed:** 2026-08-10  
+**Last reviewed:** 2026-08-18
 **Workspace:** `C:\Data\Clipper Ai Trends`  
 **Git branch/HEAD:** `main` at `d1035f1` (`Medium Efforts Changes`, 2026-07-13)  
 **Review basis:** current working tree, including uncommitted files; source, configuration, launchers, tests, API/UI, and local catalog status.
@@ -14,7 +14,6 @@ Clipper is a Windows-first, local PROYA video-production system. Its core turns 
 The same repository also contains:
 
 - a resumable multi-VOD queue, continuous supervisor, and graceful control CLI;
-- reusable product-specific hook/main/CTA extraction, review, validation, and modular assembly;
 - revisioned variation profiles, presets, product-information extraction, dynamic text, B-roll, and preview rendering;
 - a typed FastAPI application layer, React operator UI, and portable Electron shell;
 - a staged SQLite catalog and optional SQLite queue authority while legacy files remain the defaults;
@@ -24,12 +23,14 @@ The same repository also contains:
 
 There is no implemented social-platform publishing step. TikTok integration is research/authorization, not posting. Export/WhatsApp handoff is the final automated delivery boundary. No separate Instagram carousel, Seedance prompt, price-list, or general social-content system exists in this repository.
 
-## Verified State on 2026-08-10
+The legacy modular extraction/library/review/validation/assembly system was removed on 2026-08-18. Modular functionality is temporarily unavailable and its replacement will be designed separately. The normal production pipeline has no modular dependency. Historical `modules_only` state remains readable but cannot start or resume, and historical `D:\proya_modules` media is intentionally preserved in place.
 
-- `python -m pytest -q`: **500 passed**, **27 subtests passed**, one Starlette/TestClient deprecation warning.
+## Verified State on 2026-08-18
+
+- `python -m pytest -q`: **411 passed**, **27 subtests passed**, one Starlette/TestClient deprecation warning.
 - `pnpm.cmd test`: **18 files / 82 tests passed**.
 - `pnpm.cmd build`: production TypeScript/Vite build passed.
-- `pnpm.cmd desktop:test`: **11 passed**.
+- Electron files were unchanged during the legacy modular removal, so desktop tests were not rerun for that change.
 - Runtime used for this verification: Python 3.11.9, Node 26.5.0, pnpm 11.13.1, and a 2026-04-16 FFmpeg/FFprobe build. These are observed workstation versions, not declared minimums.
 - `python -m clipper_app.catalog_cli status`: catalog schema **12**, SQLite integrity `ok`, no recorded repair rows, default catalog mode `legacy`, and default queue mode `json`.
 - The current catalog contains successful trend fingerprints and patterns. Older documentation saying trend analysis had never completed is obsolete.
@@ -42,7 +43,6 @@ flowchart TD
     B --> C["Faster-Whisper + WhisperX"]
     C --> D["LM Studio moment selection"]
     D --> E["Optional YOLO scan"]
-    D --> F["Optional reusable module extraction"]
     E --> G["Base moments"]
     H["Variation profile + approved assets/facts"] --> I["Variant expansion"]
     G --> I
@@ -50,9 +50,6 @@ flowchart TD
     J --> K["Compliance + scoring + manifests"]
     K --> L["Diversity-first export batches"]
     L --> M["WhatsApp media/assignment state"]
-    F --> N["Reviewed module library"]
-    N --> O["Modular assembly"]
-    O --> J
     P["TikTok Business discovery"] --> Q["SQLite snapshots and media records"]
     Q --> R["Editing fingerprints and patterns"]
     R -. "read-only suggestion" .-> H
@@ -68,7 +65,7 @@ flowchart TD
 Important boundaries:
 
 - Top-level Python modules still own pipeline algorithms. `clipper_app` wraps them with typed settings, commands, results, reads, jobs, events, storage, and security.
-- JSON/manifests/sidecars/module indexes/logs remain authoritative in default modes. The catalog is rebuildable; SQLite queue authority is opt-in.
+- JSON/manifests/sidecars/logs remain authoritative in default modes. The catalog is rebuildable; SQLite queue authority is opt-in.
 - React and Electron never process video themselves. They read FastAPI data or submit controlled backend work.
 - Variation changes affect future renders only. Trend recommendations are not auto-applied.
 - WhatsApp media preparation can run while direct affiliate claims remain disabled.
@@ -77,9 +74,9 @@ Important boundaries:
 
 | Area | Current implementation | Primary entry points |
 | --- | --- | --- |
-| Single-VOD pipeline | Operational transcription, moment selection, vision, variants, render, compliance, score, modules, and export hooks | `main.py`, `python main.py --video ...` |
+| Single-VOD pipeline | Operational transcription, moment selection, vision, variants, render, compliance, score, and export hooks | `main.py`, `python main.py --video ...` |
 | Queue and supervisor | Resumable four-stage scheduling, retries, stable-file discovery, run/pipeline/variant modes, graceful control | `video_queue.py`, `queue_supervisor.py`, `queue_control.py`, `run_queue*.ps1` |
-| Reusable modules | Extraction, sidecars/index, readiness, manual review, visual validation, same-date assembly | `module_*.py`, `run_module_assembly.ps1` |
+| Modular workspace | Legacy feature removed; `/modules` is a temporary neutral placeholder | `new_app/src/App.tsx` |
 | Variants and facts | Schema-12 profiles, 1-6 variants, presets, previews, source-supported dynamic text, product B-roll | `variation_profile.py`, `variation_engine.py`, `dynamic_text.py`, `product_information.py`, `product_broll.py` |
 | Scoring/compliance/export | Multi-dimension score groups, optional Qwen-VL host focus, fail-closed compliance, diversity-first batches | `clip_scorer.py`, `compliance_checker.py`, `export_packager.py` |
 | Application API | Typed reads/mutations, auth, jobs/results/audit, SSE, safe artifacts, static SPA | `clipper_app/web_api.py`, `clipper_app/application/` |
@@ -98,12 +95,11 @@ Important boundaries:
 2. Transcribe with Faster-Whisper and align words with WhisperX; retain raw checkpoints and configured fallback behavior.
 3. Detect candidate moments through LM Studio in chunks; validate duration, speech density, focus, score, and overlap.
 4. Optionally run YOLO over moment ranges for product/host events.
-5. Optionally extract reusable hook/main/CTA modules before render-list truncation.
-6. Load `working/variation_profile.json` or generate the default profile and expand each base moment into up to six deterministic variants.
-7. Build evidence-backed dynamic text from approved PDF/DOCX facts, content topics, compliance results, and role/intensity settings.
-8. Render missing jobs incrementally with FFmpeg, preserving stage fingerprints, render state, manifests, audio timing, and resume semantics.
-9. Run compliance, safe auto-fixes/blocking, score dimensions/flags, optional Qwen-VL vision scoring, and auto-sort.
-10. Optionally package export-ready clips into append-only diversity-first batches and register them with WhatsApp state.
+5. Load `working/variation_profile.json` or generate the default profile and expand each base moment into up to six deterministic variants.
+6. Build evidence-backed dynamic text from approved PDF/DOCX facts, content topics, compliance results, and role/intensity settings.
+7. Render missing jobs incrementally with FFmpeg, preserving stage fingerprints, render state, manifests, audio timing, and resume semantics.
+8. Run compliance, safe auto-fixes/blocking, score dimensions/flags, optional Qwen-VL vision scoring, and auto-sort.
+9. Optionally package export-ready clips into append-only diversity-first batches and register them with WhatsApp state.
 
 ### Creative Features
 
@@ -115,11 +111,10 @@ Product-information sources live under `assets/information/`. `product_informati
 
 Current `config.py` defaults include:
 
-- `OUTPUT_DIR=D:\output_clips`, `WORKING_DIR=working`, `QUEUE_INPUT_DIR=D:\VOD`, `MODULE_LIBRARY_DIR=D:\proya_modules`.
+- `OUTPUT_DIR=D:\output_clips`, `WORKING_DIR=working`, `QUEUE_INPUT_DIR=D:\VOD`.
 - 25-60 second selected moments, `MIN_SCORE=7.0`, 30 FPS H.264 NVENC output.
 - `VARIANTS_PER_CLIP=6`, variation-profile schema 12, product-information LLM enabled, dynamic-text mode `balanced`.
 - `SCORER_ENABLED=True`, `SCORER_VISION_ENABLED=True`, compliance enabled/auto-fix/high-risk blocking enabled.
-- Module extraction and normal module assembly disabled by default; explicit CLI/workflow paths enable them.
 - Export batches enabled with 15 clips, diversity-first rolling strategy, target five distinct VODs, and no more than three per VOD until the configured wait relaxes diversity.
 - `WHATSAPP_DELIVERY_ENABLED=True`, but both direct-delivery cutover flags are `False`.
 - `TREND_QWEN_ENABLED=False`; deterministic visual/transcript analysis still works.
@@ -133,7 +128,7 @@ Do not assume defaults are portable or production-approved. Review the active se
 Supported launch dimensions:
 
 - Run mode: `single_video`, `folder_once`, `folder_repeat`.
-- Pipeline mode: `full`, `clips_only`, `modules_only`, `raw_cuts_only`.
+- Pipeline mode: `full`, `clips_only`, `raw_cuts_only`. Historical `modules_only` state is read-only and explicitly unsupported.
 - Variant mode: `all`, `original`, `custom` plus count.
 
 Default state is `working/video_queue_state.json`. `QueueStateRepository` adds `dual` and `sqlite` modes, active schema 3, immutable SQLite history, and monthly checksummed JSONL journals. Schema 2 remains the rollback/export contract.
@@ -142,7 +137,7 @@ Never infer a live process solely from a saved `running` row. Use queue control/
 
 ## FastAPI, Jobs, and Security
 
-`clipper_app.web_api` exposes health/catalog/events, overview/dashboard/queue, scores, compliance, modules, logs, settings, product information, variations, trends/TikTok OAuth, control jobs/results, system/artifacts, WhatsApp delivery, and production mutation routes.
+`clipper_app.web_api` exposes health/catalog/events, overview/dashboard/queue, scores, compliance, logs, settings, product information, variations, trends/TikTok OAuth, control jobs/results, system/artifacts, WhatsApp delivery, and production mutation routes.
 
 All JSON reads use a common envelope. Every mutation and sensitive read requires `Authorization: Bearer <CLIPPER_CONTROL_TOKEN>`. The two TikTok callback paths are the narrow unauthenticated exception. Trusted hosts/origins and filesystem containment remain enforced.
 
@@ -161,7 +156,7 @@ The current UI routes are:
 - Review Clips and Compliance.
 - Trends.
 - Variants.
-- Modules.
+- Modules (temporary rebuild placeholder only).
 - Deliveries.
 - Activity Jobs and Logs.
 - Settings Configuration and Diagnostics.
@@ -197,7 +192,6 @@ Direct claims/send transitions require both `WHATSAPP_DIRECT_PC_DELIVERY_ENABLED
 | `product_information.py`, `product_broll.py`, `content_topics.py` | Evidence/assets/topic matching |
 | `ffmpeg_editor.py`, `stage_cache.py` | Composition, FFmpeg execution, resume compatibility |
 | `clip_scorer.py`, `compliance_checker.py` | Score and policy gates |
-| `module_*.py` | Reusable module extraction/review/readiness/assembly |
 | `export_packager.py` | Diversity-first export publication |
 | `video_queue.py`, `queue_supervisor.py`, `queue_control.py` | Bulk scheduling and control |
 | `clipper_app/` | Typed application/API/security/catalog/job boundary |
@@ -209,7 +203,7 @@ Direct claims/send transitions require both `WHATSAPP_DIRECT_PC_DELIVERY_ENABLED
 | `dataset/`, `models/proya_best.pt` | YOLO data and trained weights |
 | `working/` | Generated caches/state/catalog/jobs/secrets; not source code |
 | `D:\output_clips` | Configured finished media/export/delivery root |
-| `D:\proya_modules` | Configured reusable module library |
+| `D:\proya_modules` | Preserved historical media; current Clipper code does not read, index, modify, or delete it |
 
 ## Common Commands
 
@@ -226,9 +220,7 @@ python main.py --video "D:\VOD\livestream.mp4"
 .\run_queue_forever.ps1 -RunMode folder_repeat -PipelineMode full -VariantMode all -DryRun
 .\run_queue_control.ps1 status -Json
 
-# Modules/export/storage
-python main.py --video "D:\VOD\livestream.mp4" --extract-modules-only
-.\run_module_assembly.ps1 -DryRun
+# Export/storage
 python main.py --package-export-batches --dry-run
 python -m clipper_app.catalog_cli status
 python -m clipper_app.catalog_cli verify

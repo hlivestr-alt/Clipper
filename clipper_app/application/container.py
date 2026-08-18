@@ -8,7 +8,6 @@ from clipper_app.application.whatsapp_delivery import WhatsAppDeliveryService
 from clipper_app.application.services import (
     ComplianceService,
     ExportPackagingService,
-    ModuleService,
     QueueControlService,
     ScoringService,
 )
@@ -22,7 +21,6 @@ class ApplicationServiceContainer:
     queue_controls: QueueControlService
     scoring: ScoringService
     compliance: ComplianceService
-    modules: ModuleService
     exports: ExportPackagingService
     whatsapp_delivery: WhatsAppDeliveryService
 
@@ -36,7 +34,6 @@ class ApplicationServiceContainer:
         queue_controls: QueueControlService | None = None,
         scoring: ScoringService | None = None,
         compliance: ComplianceService | None = None,
-        modules: ModuleService | None = None,
         exports: ExportPackagingService | None = None,
         whatsapp_delivery: WhatsAppDeliveryService | None = None,
         migrate_legacy_jobs: bool = False,
@@ -53,7 +50,6 @@ class ApplicationServiceContainer:
             queue_controls=queue_controls or QueueControlService(provider),
             scoring=scoring or ScoringService(provider),
             compliance=compliance or ComplianceService(provider),
-            modules=modules or ModuleService(provider),
             exports=exports or ExportPackagingService(provider),
             whatsapp_delivery=whatsapp_delivery or WhatsAppDeliveryService.from_config(
                 read_service.cfg

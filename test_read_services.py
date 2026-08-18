@@ -16,10 +16,8 @@ class ReadServiceTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.output_root = self.root / "output"
         self.working = self.root / "working"
-        self.module_library = self.root / "modules"
         self.output_root.mkdir()
         self.working.mkdir()
-        self.module_library.mkdir()
         self.run_dir = self.output_root / "2026-06-01-10-00-00__run_001"
         self.run_dir.mkdir()
         (self.run_dir / "clip_001.mp4").write_bytes(b"fake media")
@@ -128,46 +126,15 @@ class ReadServiceTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        (self.module_library / "module_001.mp4").write_bytes(b"fake module")
-        (self.module_library / "index.json").write_text(
-            json.dumps(
-                {
-                    "updated_at": "2026-06-01T12:00:00+08:00",
-                    "module_count": 1,
-                    "modules": [
-                        {
-                            "module_id": "module_001",
-                            "product": "serum",
-                            "role": "hook",
-                            "source_video": "2026-06-01-10-00-00.mp4",
-                            "duration": 5.2,
-                            "confidence": 0.9,
-                            "quality_status": "approved",
-                            "review_status": "needs_review",
-                            "visual_validation_status": "passed",
-                            "visual_product_hits": 1,
-                            "file_path": str(self.module_library / "module_001.mp4"),
-                            "transcript_text": "serum intro",
-                        }
-                    ],
-                }
-            ),
-            encoding="utf-8",
-        )
         self.config = SimpleNamespace(
             OUTPUT_DIR=str(self.output_root),
             WORKING_DIR=str(self.working),
             QUEUE_STATE_FILE=str(self.state_path),
             QUEUE_CONTROL_FILE=str(self.working / "queue_control.json"),
             QUEUE_FOREVER_STATE_FILE=str(self.working / "queue_forever_state.json"),
-            MODULE_LIBRARY_DIR=str(self.module_library),
             QUEUE_DASHBOARD_RUNNING_STALL_SECONDS=7200.0,
             QUEUE_DASHBOARD_QUEUED_STALL_SECONDS=86400.0,
             QUEUE_STAGE_ADMISSION_LIMIT=3,
-            MODULAR_ASSEMBLY_READY_MIN_HOOK=1,
-            MODULAR_ASSEMBLY_READY_MIN_MAIN=1,
-            MODULAR_ASSEMBLY_READY_MIN_CTA=1,
-            MODULE_ASSEMBLY_ZOOM_READY_MIN_EVENTS=1,
             MIN_SCORE=7.0,
             MAX_PARALLEL_CLIPS=2,
             READ_APP_MAX_OUTPUT_DIRS=200,
@@ -360,25 +327,6 @@ class ReadServiceTests(unittest.TestCase):
         detail = self.service.compliance_detail(str(self.run_dir))
         self.assertEqual(len(detail.data.violations), 1)
         self.assertEqual(detail.data.violations[0].violation_type, "claim")
-
-    def test_modules_readiness_and_library_use_index(self):
-        readiness = self.service.module_readiness()
-        serum = [row for row in readiness.data.rows if row.product_key == "serum"][0]
-        self.assertEqual(serum.readiness, "partial")
-        self.assertEqual(serum.zoom_ready_candidates, 1)
-
-        library = self.service.module_library(limit=10, product="serum")
-        self.assertEqual(library.data.total, 1)
-        self.assertEqual(library.data.rows[0].module_id, "module_001")
-        self.assertNotIn("transcript_text", library.data.rows[0].model_dump())
-        self.assertIn("approved", library.data.filter_options["quality_status"])
-
-        detail = self.service.module_detail("module_001")
-        self.assertEqual(detail.data.selected.module_id, "module_001")
-        self.assertEqual(detail.data.transcript_text, "serum intro")
-
-        filtered = self.service.module_library(limit=10, quality_status="approved", visual_status="passed")
-        self.assertEqual(filtered.data.total, 1)
 
     def test_overview_is_compact_and_uses_cached_corpora(self):
         status_path = self.output_root / "export_batches" / "_status.json"

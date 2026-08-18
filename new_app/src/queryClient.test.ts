@@ -24,7 +24,7 @@ describe("API query keys", () => {
       "/api/dashboard",
       "/api/queue"
     ]));
-    expect(invalidationPrefixesForMutation("/api/modules/m-1/review")).toContain("/api/modules");
+    expect(invalidationPrefixesForMutation("/api/modules/m-1/review")).not.toContain("/api/modules");
     expect(invalidationPrefixesForMutation("/api/operations/compliance-scan")).toContain("/api/compliance");
   });
 

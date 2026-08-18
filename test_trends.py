@@ -1091,7 +1091,7 @@ class TrendApiTests(unittest.TestCase):
 
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
-        for name in ("working", "output", "vods", "modules", "media", "bgm"):
+        for name in ("working", "output", "vods", "media", "bgm"):
             (root / name).mkdir()
         state = root / "working" / "state.json"
         state.write_text(json.dumps({"schema_version": 2, "queue_status": "idle", "videos": {}}), encoding="utf-8")
@@ -1099,7 +1099,7 @@ class TrendApiTests(unittest.TestCase):
             OUTPUT_DIR=str(root / "output"), WORKING_DIR=str(root / "working"), QUEUE_INPUT_DIR=str(root / "vods"),
             QUEUE_STATE_FILE=str(state), QUEUE_CONTROL_FILE=str(root / "working" / "control.json"),
             QUEUE_FOREVER_STATE_FILE=str(root / "working" / "forever.json"), QUEUE_STAGE_ADMISSION_LIMIT=3,
-            MODULE_LIBRARY_DIR=str(root / "modules"), QUEUE_DASHBOARD_RUNNING_STALL_SECONDS=7200.0,
+            QUEUE_DASHBOARD_RUNNING_STALL_SECONDS=7200.0,
             QUEUE_DASHBOARD_QUEUED_STALL_SECONDS=86400.0, VARIANTS_PER_CLIP=1,
             FONT_SUBTITLE="assets/fonts/Montserrat-ExtraBold.ttf", FONT_HOOK="assets/fonts/Montserrat-ExtraBold.ttf",
             FONT_HOOK_FALLBACKS=[], SUBTITLE_FONT_DIR="assets/fonts", BGM_DIR=str(root / "bgm"),

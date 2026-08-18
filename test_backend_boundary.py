@@ -200,8 +200,6 @@ class BackendBoundaryTests(unittest.TestCase):
                 "scores_summary_path": None,
                 "clips_scored": 0,
                 "export_batches": {},
-                "module_extraction": {},
-                "modular_assembly": {},
             }
 
         service = PipelineService(executor=executor, settings_provider=provider)

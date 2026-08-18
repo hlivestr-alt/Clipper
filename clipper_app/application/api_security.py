@@ -69,11 +69,6 @@ def is_sensitive_read(path: str) -> bool:
         return True
     if normalized.startswith("/api/integrations/tiktok/oauth") and normalized != "/api/integrations/tiktok/oauth/callback":
         return True
-    if normalized.startswith("/api/modules/") and normalized not in {
-        "/api/modules/library",
-        "/api/modules/readiness",
-    }:
-        return True
     return False
 
 

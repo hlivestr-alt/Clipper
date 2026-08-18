@@ -11,7 +11,6 @@ param(
     [double]$PollInterval = 0.0,
     [string]$PythonExe = "python",
     [switch]$ForceRescore,
-    [switch]$ForceModules,
     [switch]$DryRun
 )
 
@@ -47,8 +46,6 @@ payload = {
     "max_inflight_videos": getattr(cfg, "QUEUE_MAX_INFLIGHT_VIDEOS", 1),
     "ffmpeg_max_parallel_clips": getattr(cfg, "QUEUE_FFMPEG_MAX_PARALLEL_CLIPS", 2),
     "poll_interval": getattr(cfg, "QUEUE_POLL_INTERVAL", 2.0),
-    "module_extraction_enabled": bool(getattr(cfg, "MODULE_EXTRACTION_ENABLED", True)),
-    "module_library_dir": getattr(cfg, "MODULE_LIBRARY_DIR", r"D:\proya_modules"),
     "compliance_enabled": bool(getattr(cfg, "COMPLIANCE_ENABLED", True)),
     "scorer_enabled": bool(getattr(cfg, "SCORER_ENABLED", True)),
     "scorer_vision_enabled": bool(getattr(cfg, "SCORER_VISION_ENABLED", False)),
@@ -122,20 +119,15 @@ if ($null -ne $MinScore) {
 if ($ForceRescore) {
     $PythonArgs += "--force-rescore"
 }
-if ($ForceModules) {
-    $PythonArgs += "--force-modules"
-}
 
 Write-Host "Starting PROYA queue pass: $RedoTag"
 Write-Host "Input: $InputDirPath"
 Write-Host "State: $StateFilePath"
-Write-Host ("Features: modules={0}, compliance={1}, scoring={2}, vision-scoring={3}, model-management={4}" -f `
-    $QueueConfig.module_extraction_enabled, `
+Write-Host ("Features: compliance={0}, scoring={1}, vision-scoring={2}, model-management={3}" -f `
     $QueueConfig.compliance_enabled, `
     $QueueConfig.scorer_enabled, `
     $QueueConfig.scorer_vision_enabled, `
     $QueueConfig.model_management_enabled)
-Write-Host "Module library: $($QueueConfig.module_library_dir)"
 if ($null -ne $MaxClips -and $MaxClips -gt 0) {
     Write-Host "Clip limit per video: $MaxClips"
 }
@@ -144,9 +136,6 @@ if ($null -ne $MinScore) {
 }
 if ($ForceRescore) {
     Write-Host "Force rescore: enabled"
-}
-if ($ForceModules) {
-    Write-Host "Force module recut: enabled"
 }
 
 if ($DryRun) {

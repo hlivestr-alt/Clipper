@@ -40,7 +40,6 @@ from clipper_app.application.whatsapp_delivery import (
 from clipper_app.application.services import (
     ComplianceService,
     ExportPackagingService,
-    ModuleService,
     QueueControlService,
     ScoringService,
 )
@@ -50,8 +49,6 @@ from clipper_app.contracts.control_models import (
     ControlJob,
     ControlOperation,
     ExportBatchesRequest,
-    ModuleAssemblyRequest,
-    ModuleReviewRequest,
     QueueControlRequest,
     RescoreRequest,
     SettingsOverrideDeleteRequest,
@@ -68,8 +65,6 @@ from clipper_app.contracts.control_models import (
 from clipper_app.contracts.models import (
     ComplianceScanCommand,
     ExportPackagingCommand,
-    ModuleAssemblyCommand,
-    ModuleReviewCommand,
     QueueAction,
     QueueControlCommand,
     QueueLaunchConfig,
@@ -200,13 +195,6 @@ def _settings_read_snapshot(settings_service: SettingsService) -> SettingsReadSn
     )
 
 
-def _safe_module_identifier(module_id: str) -> str:
-    value = str(module_id or "").strip()
-    if not value or "\x00" in value or ":" in value or "/" in value or "\\" in value:
-        raise HTTPException(status_code=400, detail="module_id must be an indexed module identifier, not a path")
-    return value
-
-
 def _validated_queue_launch_config(
     service: ReadDashboardService,
     request: QueueControlRequest,
@@ -216,6 +204,11 @@ def _validated_queue_launch_config(
         return None
     if request.action != QueueAction.START:
         raise HTTPException(status_code=400, detail="launch_config is only valid with action=start")
+    if launch.pipeline_mode.value == "modules_only":
+        raise HTTPException(
+            status_code=400,
+            detail="Modules Only is a legacy unsupported pipeline mode and cannot be started.",
+        )
     if launch.run_mode.value != "single_video":
         return launch
 
@@ -258,7 +251,7 @@ def _execute_with_invalidation(
         result = execute()
         catalog_indexer = getattr(read_service, "catalog_indexer", None)
         if catalog_indexer is not None and read_service.catalog_mode in {"shadow", "catalog"}:
-            if set(domains) & {"outputs", "scores", "compliance", "modules"}:
+            if set(domains) & {"outputs", "scores", "compliance"}:
                 try:
                     catalog_indexer.backfill()
                 except Exception as exc:
@@ -317,7 +310,6 @@ def create_app(
     queue_control_service: QueueControlService | None = None,
     scoring_service: ScoringService | None = None,
     compliance_service: ComplianceService | None = None,
-    module_service: ModuleService | None = None,
     export_service: ExportPackagingService | None = None,
     security_settings: ApiSecuritySettings | None = None,
     tiktok_oauth_service: TikTokOAuthService | None = None,
@@ -335,7 +327,6 @@ def create_app(
         queue_controls=queue_control_service,
         scoring=scoring_service,
         compliance=compliance_service,
-        modules=module_service,
         exports=export_service,
         whatsapp_delivery=whatsapp_delivery_service,
         migrate_legacy_jobs=migrate_legacy_jobs,
@@ -347,7 +338,6 @@ def create_app(
     queue_controls = container.queue_controls
     scorer = container.scoring
     compliance_runner = container.compliance
-    modules = container.modules
     exporter = container.exports
     whatsapp_delivery = container.whatsapp_delivery
     catalog = CatalogDatabase.from_config(read_service.cfg)
@@ -371,7 +361,7 @@ def create_app(
     api = FastAPI(
         title="Clipper",
         version="0.3.0",
-        description="Control API for queue, score, compliance, module, log, settings, and artifact visibility.",
+        description="Control API for queue, score, compliance, log, settings, and artifact visibility.",
     )
     api.add_middleware(
         CORSMiddleware,
@@ -796,48 +786,6 @@ def create_app(
     def compliance_detail(output_dir: str) -> dict[str, Any]:
         return _envelope(read_service.compliance_detail(_output_dir_or_404(read_service, output_dir)))
 
-    @api.get("/api/modules/readiness")
-    def module_readiness(request: Request) -> Response:
-        return _read_response(read_service.module_readiness(), request)
-
-    @api.get("/api/modules/library")
-    def module_library(
-        request: Request,
-        limit: int = Query(default=50, ge=1, le=500),
-        offset: int = Query(default=0, ge=0),
-        search: str | None = None,
-        status: str | None = None,
-        quality_status: str | None = None,
-        review_status: str | None = None,
-        visual_status: str | None = None,
-        product: str | None = None,
-        sort: str = "product",
-        direction: str = "asc",
-    ) -> Response:
-        try:
-            result = read_service.module_library(
-                limit=limit,
-                offset=offset,
-                search=search,
-                status=status,
-                quality_status=quality_status,
-                review_status=review_status,
-                visual_status=visual_status,
-                product=product,
-                sort=sort,
-                direction=_direction(direction),  # type: ignore[arg-type]
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return _read_response(result, request)
-
-    @api.get("/api/modules/{module_id}")
-    def module_detail(module_id: str, request: Request) -> Response:
-        result = read_service.module_detail(_safe_module_identifier(module_id))
-        if result.data.selected is None:
-            raise HTTPException(status_code=404, detail="module_id was not found")
-        return _read_response(result, request)
-
     @api.get("/api/overview")
     def overview(request: Request) -> Response:
         return _read_response(read_service.overview(), request)
@@ -1235,30 +1183,6 @@ def create_app(
             raise _capacity_response(exc) from exc
         return _job_envelope(job, response)
 
-    @api.post("/api/operations/module-assembly")
-    def module_assembly(request: ModuleAssemblyRequest, response: Response, http_request: Request) -> dict[str, Any]:
-        command = ModuleAssemblyCommand(
-            assembly_date=request.assembly_date,
-            product=request.product,
-            module_assembly_limit=request.module_assembly_limit,
-            module_product_zoom=request.module_product_zoom,
-        )
-        try:
-            job = jobs.submit(
-                operation=ControlOperation.MODULE_ASSEMBLY,
-                request=request,
-                executor=lambda: _execute_with_invalidation(
-                    read_service, ("modules",), lambda: modules.assemble(command)
-                ),
-                actor=http_request.state.actor,
-                conflict_key="module_assembly",
-            )
-        except JobConflictError as exc:
-            raise _conflict_response(exc) from exc
-        except JobCapacityError as exc:
-            raise _capacity_response(exc) from exc
-        return _job_envelope(job, response)
-
     @api.post("/api/operations/export-batches")
     def export_batches(request: ExportBatchesRequest, response: Response, http_request: Request) -> dict[str, Any]:
         output_root = _output_root_or_404(read_service, request.output_root)
@@ -1276,30 +1200,6 @@ def create_app(
                 ),
                 actor=http_request.state.actor,
                 conflict_key="export_batches",
-            )
-        except JobConflictError as exc:
-            raise _conflict_response(exc) from exc
-        except JobCapacityError as exc:
-            raise _capacity_response(exc) from exc
-        return _job_envelope(job, response)
-
-    @api.post("/api/modules/{module_id}/review")
-    def module_review(module_id: str, request: ModuleReviewRequest, response: Response, http_request: Request) -> dict[str, Any]:
-        safe_module_id = _safe_module_identifier(module_id)
-        command = ModuleReviewCommand(
-            identifier=safe_module_id,
-            status=request.status,
-            note=request.note,
-            reviewer=http_request.state.actor,
-        )
-        try:
-            job = jobs.submit(
-                operation=ControlOperation.MODULE_REVIEW,
-                request={"module_id": safe_module_id, **request.model_dump(mode="json")},
-                executor=lambda: _execute_with_invalidation(
-                    read_service, ("modules",), lambda: modules.review(command)
-                ),
-                actor=http_request.state.actor,
             )
         except JobConflictError as exc:
             raise _conflict_response(exc) from exc

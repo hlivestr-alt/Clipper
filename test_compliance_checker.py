@@ -1,7 +1,9 @@
 import json
 import os
+import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,9 +18,28 @@ from compliance_checker import (
     write_compliance_result,
 )
 from clipper_app.path_safety import UnsafePathError
+import main
 
 
 class ComplianceCheckerTest(unittest.TestCase):
+    def test_pipeline_compliance_import_failure_fails_closed(self):
+        job = {
+            "clip_id": "clip_0001",
+            "product": "serum",
+            "output_path": r"D:\output\clip_0001.mp4",
+            "moment": {"hook": "Hook aman", "hook_overlay": {"headline": "Hook aman"}},
+        }
+
+        class Cfg:
+            COMPLIANCE_ENABLED = True
+
+        with mock.patch.dict(sys.modules, {"compliance_checker": None}):
+            result = main._prepare_job_compliance(job, [], Cfg)
+
+        self.assertTrue(result["blocked"])
+        self.assertEqual(result["source"], "system_fail_closed")
+        self.assertEqual(job["compliance_result"]["source"], "system_fail_closed")
+
     def test_compliance_path_uses_dedicated_output_folder(self):
         path = compliance_path_for_clip(Path(r"C:\clips\run\v1\clip_0001.mp4"), "clip_0001")
 

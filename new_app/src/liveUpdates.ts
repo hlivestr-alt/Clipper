@@ -22,7 +22,6 @@ const topicPrefixes: Record<string, string[]> = {
   jobs: ["/api/control/jobs", "/api/overview"],
   scores: ["/api/scores", "/api/overview"],
   compliance: ["/api/compliance", "/api/overview"],
-  modules: ["/api/modules"],
   outputs: ["/api/scores", "/api/compliance", "/api/overview"],
   settings: ["/api/settings", "/api/system", "/api/dashboard", "/api/queue"],
   variations: ["/api/variations"],

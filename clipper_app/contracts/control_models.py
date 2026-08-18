@@ -24,6 +24,7 @@ class ControlOperation(StrEnum):
     SETTINGS_RESET = "settings_reset"
     RESCORE = "rescore"
     COMPLIANCE_SCAN = "compliance_scan"
+    # Historical control-job values remain deserializable but have no executor/API.
     MODULE_ASSEMBLY = "module_assembly"
     EXPORT_BATCHES = "export_batches"
     MODULE_REVIEW = "module_review"
@@ -135,22 +136,10 @@ class ComplianceScanRequest(StrictModel):
     force: bool = True
 
 
-class ModuleAssemblyRequest(StrictModel):
-    assembly_date: str | None = None
-    product: str | None = None
-    module_assembly_limit: int | None = Field(default=None, ge=0)
-    module_product_zoom: bool = False
-
-
 class ExportBatchesRequest(StrictModel):
     output_root: str | None = None
     batch_size: int | None = Field(default=None, ge=1)
     dry_run: bool = False
-
-
-class ModuleReviewRequest(StrictModel):
-    status: str
-    note: str = ""
 
 
 class VariationProfileWriteRequest(StrictModel):

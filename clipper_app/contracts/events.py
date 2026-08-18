@@ -14,10 +14,6 @@ class OperationKind(StrEnum):
     QUEUE = "queue"
     SCORING = "scoring"
     COMPLIANCE = "compliance"
-    MODULE_ASSEMBLY = "module_assembly"
-    MODULE_VALIDATION = "module_validation"
-    MODULE_REVIEW = "module_review"
-    MODULE_REPORT = "module_report"
     HEALTH = "health"
 
 
@@ -28,8 +24,6 @@ class Stage(StrEnum):
     LLM = "llm"
     VISION = "vision"
     YOLO = "yolo"
-    MODULES = "modules"
-    MODULAR = "modular"
     EDITING = "editing"
     FFMPEG = "ffmpeg"
     SCORING = "scoring"
@@ -44,9 +38,6 @@ class EventKind(StrEnum):
     CLIP_COMPLETE = "clip_complete"
     CLIP_SCORING_PROGRESS = "clip_scoring_progress"
     RENDER_PAUSED = "render_paused"
-    MODULE_EXTRACTION_COMPLETE = "module_extraction_complete"
-    MODULAR_CLIP_COMPLETE = "modular_clip_complete"
-    MODULE_ASSEMBLY_COMPLETE = "module_assembly_complete"
     PIPELINE_COMPLETE = "pipeline_complete"
 
 
@@ -81,9 +72,6 @@ class ProgressMetrics(StrictModel):
     clips_blocked: int | None = Field(default=None, ge=0)
     clips_scored: int | None = Field(default=None, ge=0)
     active_clip_renders: int | None = Field(default=None, ge=0)
-    modules_accepted: int | None = Field(default=None, ge=0)
-    modules_existing: int | None = Field(default=None, ge=0)
-    modules_rejected: int | None = Field(default=None, ge=0)
     export_batches_packaged: int | None = Field(default=None, ge=0)
 
 

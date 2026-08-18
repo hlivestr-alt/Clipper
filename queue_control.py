@@ -24,9 +24,14 @@ RUN_MODE_LABELS = {
 PIPELINE_MODE_LABELS = {
     "full": "Full Pipeline",
     "clips_only": "Clips Only",
-    "modules_only": "Modules Only",
+    "modules_only": "Modules Only (legacy unsupported)",
     "raw_cuts_only": "Raw Cuts Only",
 }
+ACTIVE_PIPELINE_MODES = frozenset({"full", "clips_only", "raw_cuts_only"})
+LEGACY_MODULES_ONLY_ERROR = (
+    "Modules Only is a legacy unsupported pipeline mode. "
+    "Historical state remains readable but cannot be started or continued."
+)
 VARIANT_MODE_LABELS = {
     "all": "All Variants",
     "original": "Original Only",
@@ -109,7 +114,11 @@ def read_control_state(control_path: str | Path | None = None) -> dict[str, Any]
     return state
 
 
-def normalize_launch_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
+def normalize_launch_config(
+    config: dict[str, Any] | None = None,
+    *,
+    allow_legacy: bool = False,
+) -> dict[str, Any]:
     raw = dict(config or {})
     run_mode = str(raw.get("run_mode") or "folder_repeat").strip().lower()
     pipeline_mode = str(raw.get("pipeline_mode") or "full").strip().lower()
@@ -118,6 +127,8 @@ def normalize_launch_config(config: dict[str, Any] | None = None) -> dict[str, A
         raise ValueError(f"Unsupported run_mode: {run_mode}")
     if pipeline_mode not in PIPELINE_MODE_LABELS:
         raise ValueError(f"Unsupported pipeline_mode: {pipeline_mode}")
+    if pipeline_mode not in ACTIVE_PIPELINE_MODES and not allow_legacy:
+        raise ValueError(LEGACY_MODULES_ONLY_ERROR)
     if variant_mode not in VARIANT_MODE_LABELS:
         raise ValueError(f"Unsupported variant_mode: {variant_mode}")
 
@@ -164,7 +175,7 @@ def normalize_launch_config(config: dict[str, Any] | None = None) -> dict[str, A
 
 
 def launch_summary(config: dict[str, Any] | None = None) -> str:
-    launch = normalize_launch_config(config)
+    launch = normalize_launch_config(config, allow_legacy=True)
     parts = [
         RUN_MODE_LABELS.get(str(launch.get("run_mode")), str(launch.get("run_mode") or "")),
         PIPELINE_MODE_LABELS.get(str(launch.get("pipeline_mode")), str(launch.get("pipeline_mode") or "")),
@@ -218,10 +229,23 @@ def request_pause(control_path: str | Path | None = None) -> dict[str, Any]:
 
 def request_continue(control_path: str | Path | None = None) -> dict[str, Any]:
     state = read_control_state(control_path)
+    if contains_legacy_modules_only(state):
+        raise ValueError(LEGACY_MODULES_ONLY_ERROR)
     state["requested_action"] = RUN_ACTION
     state["status"] = "continue_requested"
     state["continued_at"] = now_iso()
     return write_control_state(control_path, state)
+
+
+def contains_legacy_modules_only(value: Any) -> bool:
+    """Recognize persisted legacy mode without normalizing or mutating it."""
+    if isinstance(value, dict):
+        if str(value.get("pipeline_mode") or "").strip().casefold() == "modules_only":
+            return True
+        return any(contains_legacy_modules_only(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(contains_legacy_modules_only(item) for item in value)
+    return False
 
 
 def request_start(
@@ -344,6 +368,13 @@ def main() -> int:
         print(f"Graceful pause requested at {state.get('requested_at')}")
         return 0
     if args.action == "continue":
+        snapshot = read_status_snapshot(
+            control_path=args.control_file,
+            forever_state_path=args.forever_state_file,
+            queue_state_path=args.queue_state_file,
+        )
+        if contains_legacy_modules_only(snapshot):
+            raise ValueError(LEGACY_MODULES_ONLY_ERROR)
         state = request_continue(args.control_file)
         print(f"Continue requested at {state.get('continued_at')}")
         return 0
