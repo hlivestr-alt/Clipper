@@ -197,10 +197,8 @@ describe("Phase 2 variant navigator", () => {
 
     expect(view.container.querySelectorAll(".variant-navigator-card")).toHaveLength(6);
     expect(screen.getByText("Draft name 1")).toBeTruthy();
-    expect(screen.getByRole("img", { name: "Visual: Host" })).toBeTruthy();
-    expect(screen.getByRole("img", { name: "Subtitles: On" })).toBeTruthy();
-    expect(screen.getByRole("img", { name: "Dynamic text: Balanced" })).toBeTruthy();
-    expect(screen.getByRole("img", { name: "Audio: Music + SFX" })).toBeTruthy();
+    expect(screen.getByText("Host · Normal zoom")).toBeTruthy();
+    expect(screen.getByText("Subtitles on · Music + SFX")).toBeTruthy();
 
     const second = view.container.querySelectorAll(".variant-navigator-card")[1] as HTMLButtonElement;
     fireEvent.click(second);

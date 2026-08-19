@@ -1,4 +1,4 @@
-import { Captions, Minus, Music2, Plus, Sparkles, Type, Video } from "lucide-react";
+import { Minus, Plus } from "lucide-react";
 import type { VariationVariant } from "../api";
 import { deriveVariantSummary } from "./variantModel";
 
@@ -96,21 +96,10 @@ export function VariantNavigator({
                 <strong title={variant.name || `Variant ${index + 1}`}>{variant.name || `Variant ${index + 1}`}</strong>
               </span>
               <span className="variant-navigator-summary">
-                <span role="img" aria-label={`Hook: ${conciseLabel(summary.hookType)}`} title={`Hook: ${conciseLabel(summary.hookType)}`}>
-                  <Type size={14} aria-hidden="true" />
-                </span>
-                <span role="img" aria-label={`Visual: ${conciseLabel(summary.visualMode)}`} title={`Visual: ${conciseLabel(summary.visualMode)}`}>
-                  <Video size={14} aria-hidden="true" />
-                </span>
-                <span role="img" aria-label={`Subtitles: ${summary.subtitlesEnabled ? "On" : "Off"}`} title={`Subtitles: ${summary.subtitlesEnabled ? "On" : "Off"}`}>
-                  <Captions size={14} aria-hidden="true" />
-                </span>
-                <span role="img" aria-label={`Dynamic text: ${conciseLabel(summary.dynamicTextMode)}`} title={`Dynamic text: ${conciseLabel(summary.dynamicTextMode)}`}>
-                  <Sparkles size={14} aria-hidden="true" />
-                </span>
-                <span role="img" aria-label={`Audio: ${audioLabel(variant)}`} title={`Audio: ${audioLabel(variant)}`}>
-                  <Music2 size={14} aria-hidden="true" />
-                </span>
+                <span>{conciseLabel(summary.visualMode)} · {variant.product_zoom_enabled ? `${conciseLabel(variant.zoom_intensity)} zoom` : "No zoom"}</span>
+                <small title={`Hook: ${conciseLabel(summary.hookType)}. Dynamic text: ${conciseLabel(summary.dynamicTextMode)}.`}>
+                  {summary.subtitlesEnabled ? "Subtitles on" : "Subtitles off"} · {audioLabel(variant)}
+                </small>
               </span>
             </button>
           );

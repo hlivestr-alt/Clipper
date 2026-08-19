@@ -236,7 +236,7 @@ describe("Phase 3 variant editor tabs", () => {
       "Audio",
       "Dynamic Text",
       "Advanced",
-      "Assets & Diagnostics"
+      "Diagnostics"
     ]);
     for (const tab of tabs) {
       const panelId = tab.getAttribute("aria-controls") ?? "";

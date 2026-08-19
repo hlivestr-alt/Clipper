@@ -347,10 +347,6 @@ export function VariantPreviewPanel({
 
       <div className="variant-preview-helper">
         <p>Preview updates as settings change.</p>
-        <p>
-          Render validates supported typography, color grade, mirroring, letterbox, and dynamic-text effects on a silent fixed source.
-          It does not validate audio, product zoom, B-roll insertion, real Before/After imagery, or transitional-hook output.
-        </p>
       </div>
 
       {mediaError && (
@@ -362,22 +358,29 @@ export function VariantPreviewPanel({
         </div>
       )}
 
-      <section className="variant-preview-readiness" aria-labelledby="variant-preview-readiness-heading">
-        <h3 id="variant-preview-readiness-heading">Readiness</h3>
-        <ReadinessRow label="Product information" {...information} />
-        <ReadinessRow
-          label="Fixed preview source"
-          tone={data.preview_source.exists ? "ready" : "missing"}
-          status={data.preview_source.exists ? "Ready" : "Missing"}
-          detail={data.preview_source.exists ? "Local host preview available" : "Host approximation unavailable"}
-        />
-        <ReadinessRow
-          label="B-roll inventory"
-          tone={brollTone}
-          status={brollStatus}
-          detail={brollDetail}
-        />
-      </section>
+      <details className="variant-preview-details">
+        <summary>Preview details</summary>
+        <p>
+          Rendering validates supported typography, color grade, mirroring, letterbox, and dynamic text on a silent fixed source.
+          Audio, product zoom, B-roll insertion, real Before/After imagery, and transitional hooks require a full render.
+        </p>
+        <section className="variant-preview-readiness" aria-label="Readiness">
+          <h3>Readiness</h3>
+          <ReadinessRow label="Product information" {...information} />
+          <ReadinessRow
+            label="Fixed preview source"
+            tone={data.preview_source.exists ? "ready" : "missing"}
+            status={data.preview_source.exists ? "Ready" : "Missing"}
+            detail={data.preview_source.exists ? "Local host preview available" : "Host approximation unavailable"}
+          />
+          <ReadinessRow
+            label="B-roll inventory"
+            tone={brollTone}
+            status={brollStatus}
+            detail={brollDetail}
+          />
+        </section>
+      </details>
     </aside>
   );
 }

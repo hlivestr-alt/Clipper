@@ -237,19 +237,22 @@ function navItemIsActive(item: NavItem, pathname: string): boolean {
 
 function statusClass(value?: string | null): BadgeKind {
   const normalized = String(value ?? "").toLowerCase();
-  if (["completed", "strong", "ready", "passed", "ok", "healthy", "approved"].some((item) => normalized.includes(item))) {
+  if (["completed", "complete", "strong", "ready", "passed", "sent", "success", "healthy", "approved", "downloaded"].some((item) => normalized.includes(item))) {
     return "good";
   }
-  if (["failed", "blocked", "critical", "stalled", "rejected", "interrupted", "outside"].some((item) => normalized.includes(item))) {
+  if (["failed", "blocked", "critical", "stalled", "rejected", "interrupted", "error", "outside"].some((item) => normalized.includes(item))) {
     return "bad";
   }
-  if (["review", "attention", "waiting", "partial", "paused", "queued", "running", "processing", "stopped"].some((item) => normalized.includes(item))) {
+  if (["running", "processing", "active", "rendering", "scanning", "downloading", "in_progress", "in progress"].some((item) => normalized.includes(item))) {
+    return "info";
+  }
+  if (["review", "attention", "waiting", "partial", "paused", "queued", "pending"].some((item) => normalized.includes(item))) {
     return "warn";
   }
-  if (!normalized || normalized === "none" || normalized === "-") {
+  if (!normalized || normalized === "none" || normalized === "-" || ["idle", "stopped", "unknown", "disabled", "not started"].some((item) => normalized.includes(item))) {
     return "neutral";
   }
-  return "info";
+  return "neutral";
 }
 
 function healthText(summary?: DashboardSummary): string {
@@ -456,10 +459,6 @@ function averageProgress(rows: QueueRunRow[]): number {
 }
 
 function runStatusKind(value?: string | null): BadgeKind {
-  const normalized = String(value ?? "").toLowerCase();
-  if (["running", "processing", "active", "in_progress", "in progress"].some((item) => normalized.includes(item))) {
-    return "good";
-  }
   return statusClass(value);
 }
 
@@ -679,7 +678,7 @@ function AppShell({ children }: { children: ReactNode }) {
             </NavLink>
           ))}
         </nav>
-        <details className="sidebar-tools">
+        <details className="sidebar-tools" open={toolNav.some((item) => navItemIsActive(item, location.pathname)) || undefined}>
           <summary>More</summary>
           <nav className="nav-list" aria-label="Additional tools">
             {toolNav.map((item) => (
@@ -1288,7 +1287,11 @@ function RunLauncher({
   const queueRows = data?.rows ?? [];
   const currentRun = pickCurrentRun(queueRows, active ? "running" : data?.queue_status);
   const activeStage = stageKeyForRun(currentRun);
-  const activeStageMeta = operationStages.find((stage) => stage.key === activeStage) ?? operationStages[2];
+  const activeStageMeta = operationStages.find((stage) => stage.key === activeStage) ?? {
+    key: undefined,
+    label: "Processing",
+    icon: Activity
+  };
   const ActiveStageIcon = activeStageMeta.icon;
   const currentProgress = clampProgress(currentRun?.progress);
 
@@ -1363,7 +1366,10 @@ function RunLauncher({
                 <h3>{currentRun.video_name}</h3>
                 <div className="current-stage">
                   <ActiveStageIcon size={20} aria-hidden="true" />
-                  <strong>{activeStageMeta.label}</strong>
+                  <span>
+                    <strong>{activeStageMeta.label}</strong>
+                    {!activeStage && currentRun.current_step && <small>{currentRun.current_step}</small>}
+                  </span>
                 </div>
                 <div className="run-progress-line" aria-label={`Current run progress ${currentProgress}%`}>
                   <div className="run-progress-track">
@@ -1729,7 +1735,6 @@ function QueuePage() {
   return (
     <section className="page-stack">
       <PageTitle title="Queue history" detail="Inspect active, waiting, completed, and failed production runs." onRefresh={queue.refresh} />
-      <RunLauncher onQueueRefresh={queue.refresh} />
       {queue.loading && <SkeletonLines count={4} />}
       {queue.error && <StateBlock kind="bad" title="Queue read failed" detail={queue.error} />}
       <StateBlock kind="warn" warnings={queue.envelope?.warnings} />
@@ -1774,9 +1779,10 @@ function DashboardPage() {
   const exportOverview = buildExportOverview(overviewData?.export);
   const rows = summary?.rows ?? [];
   const recentRuns = [...rows].sort((left, right) => runTime(right) - runTime(left)).slice(0, 6);
-  const readyForReview = (overviewData?.top_clips ?? []).filter((clip) => statusClass(clip.status) === "good").length;
+  const readyForReview = overviewData?.scored_count ?? 0;
   const stoppedRuns = rows.filter((row) => ["stopped", "failed", "interrupted"].some((value) => row.status.toLowerCase().includes(value))).length;
-  const totalDuration = recentRuns.map((row) => row.duration).find(Boolean) || "—";
+  const waitingDeliveries = exportOverview.available ? exportOverview.pending : 0;
+  const hasAttention = readyForReview > 0 || waitingDeliveries > 0 || stoppedRuns > 0;
   const hour = new Date().getHours();
   const greeting = hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
 
@@ -1794,11 +1800,11 @@ function DashboardPage() {
 
       <section className="home-section">
         <h2>Needs attention</h2>
-        <div className="attention-list">
-          <Link to="/review/clips"><Video size={18} aria-hidden="true" /><span><strong>{numberText(readyForReview)} clips</strong> are ready for review</span><ChevronRight size={17} /></Link>
-          <Link to="/deliveries"><PackageCheck size={18} aria-hidden="true" /><span><strong>{numberText(exportOverview.pending)} deliveries</strong> are waiting</span><ChevronRight size={17} /></Link>
-          <Link to="/activity/jobs?status=failed"><Activity size={18} aria-hidden="true" /><span><strong>{numberText(stoppedRuns)} runs</strong> are stopped or failed</span><ChevronRight size={17} /></Link>
-        </div>
+        {hasAttention ? <div className="attention-list">
+          {readyForReview > 0 && <Link to="/review/clips"><Video size={18} aria-hidden="true" /><span><strong>{numberText(readyForReview)} clips</strong> are ready for review</span><ChevronRight size={17} /></Link>}
+          {waitingDeliveries > 0 && <Link to="/deliveries"><PackageCheck size={18} aria-hidden="true" /><span><strong>{numberText(waitingDeliveries)} deliveries</strong> are waiting</span><ChevronRight size={17} /></Link>}
+          {stoppedRuns > 0 && <Link to="/activity/jobs?status=failed"><Activity size={18} aria-hidden="true" /><span><strong>{numberText(stoppedRuns)} runs</strong> are stopped or failed</span><ChevronRight size={17} /></Link>}
+        </div> : <p className="attention-clear">You’re all caught up.</p>}
       </section>
 
       <section className="home-section recent-runs-section">
@@ -1808,11 +1814,6 @@ function DashboardPage() {
             {recentRuns.map((row) => <tr key={`${row.video_name}-${row.started_at}`}><td className="strong">{row.video_name}</td><td>{numberText(row.clips_generated)}</td><td><Badge value={row.status} /></td><td>{displayTime(row.started_at)}</td><td>{row.duration || "—"}</td></tr>)}
           </tbody></table></div>
         ) : <EmptyState icon={Video} title="No recent runs" detail="Your completed and active production runs will appear here." />}
-        <div className="home-summary" aria-label="Production summary">
-          <div><strong>{numberText(rows.length)}</strong><span>Runs in total</span></div>
-          <div><strong>{numberText(summary?.total_clips)}</strong><span>Clips processed</span></div>
-          <div><strong>{totalDuration}</strong><span>Recent runtime</span></div>
-        </div>
       </section>
     </section>
   );
@@ -1909,10 +1910,14 @@ function ClipReviewPage({ active }: { active: boolean }) {
 
       <details className="review-rescore-panel">
         <summary>
-          <span><RotateCcw size={16} aria-hidden="true" /> Rescore an output directory</span>
-          <small>Select a score row to prefill the path.</small>
+          <span><SlidersHorizontal size={16} aria-hidden="true" /> Advanced actions</span>
+          <small>Rescore output folders and access operator tools.</small>
         </summary>
         <div className="review-rescore-content">
+          <div className="advanced-action-intro">
+            <strong>Rescore an output directory</strong>
+            <p>Selecting a clip prefills its output folder.</p>
+          </div>
           <div className="action-row">
             <FilterField label="Output directory">
               <input value={outputDir} onChange={(event) => setOutputDir(event.target.value)} placeholder="D:\output_clips\vod__run_001" />
@@ -2021,21 +2026,21 @@ function ScoreTable({
     <article className="panel review-score-panel">
       <div className="panel-head review-panel-head">
         <div>
-          <h2>Score index</h2>
-          <p>{numberText(total)} rows available, showing {numberText(groups.length)} main clips from {reviewRangeText(total, limit, offset, rows.length)}.</p>
+          <h2>Clips</h2>
+          <p>{numberText(total)} scored {total === 1 ? "item" : "items"}</p>
         </div>
       </div>
       <div className="index-toolbar review-index-toolbar">
-        <SearchInput className="review-index-search" ariaLabel="Search score index" value={search} onChange={setSearch} placeholder="Search clips, products, sources..." />
-        <IndexSelect label="Filter score status" icon={ShieldCheck} value={status} onChange={setStatus}>
+        <SearchInput className="review-index-search" ariaLabel="Search clips" value={search} onChange={setSearch} placeholder="Search clips..." />
+        <IndexSelect label="Status" icon={ShieldCheck} value={status} onChange={setStatus}>
           <option value="">All statuses</option>
           {["Strong", "Okay", "Review", "Blocked"].map((item) => <option value={item} key={item}>{item}</option>)}
         </IndexSelect>
-        <IndexSelect label="Filter score product" icon={PackageCheck} value={product} onChange={setProduct}>
+        <IndexSelect label="Product" icon={PackageCheck} value={product} onChange={setProduct}>
           <option value="">All products</option>
           {productOptions.map((item) => <option value={item} key={item}>{item}</option>)}
         </IndexSelect>
-        <IndexSelect label="Sort score index" icon={SlidersHorizontal} value={sort} onChange={setSort}>
+        <IndexSelect label="Sort" icon={SlidersHorizontal} value={sort} onChange={setSort}>
           <option value="scored_at">Scored time</option>
           <option value="total_score">Total score</option>
           <option value="quality_score">Quality score</option>
@@ -2044,12 +2049,12 @@ function ScoreTable({
           <option value="status">Status</option>
         </IndexSelect>
         <SortDirectionButton direction={direction} onToggle={() => setDirection(direction === "desc" ? "asc" : "desc")} />
-        <button className="icon-button toolbar-icon-button" type="button" onClick={onRefresh} aria-label="Refresh score index" title="Refresh score index">
+        <button className="icon-button toolbar-icon-button" type="button" onClick={onRefresh} aria-label="Refresh clips" title="Refresh clips">
           <RefreshCw size={16} aria-hidden="true" />
         </button>
       </div>
       {rows.length === 0 ? (
-        <EmptyState icon={Video} title="No scored clips" detail="Score summaries will appear after clips are rendered and scored." />
+        <EmptyState icon={Video} title="No clips available yet" detail="Clips will appear after they are rendered and scored." />
       ) : (
         <div className="table-wrap review-score-table-wrap">
           <table className="review-score-table">
@@ -2058,7 +2063,7 @@ function ScoreTable({
                 <th>Clip</th>
                 <th>Status</th>
                 <th>Product</th>
-                <th>Total</th>
+                <th>Score</th>
                 <th>Quality</th>
                 <th>Flags</th>
                 <th>Scored</th>
@@ -2105,7 +2110,7 @@ function ScoreTable({
                       <td className="review-number-cell">{scoreText(row.total_score)}</td>
                       <td className="review-number-cell">{scoreText(row.quality_score)}</td>
                       <td className="review-number-cell">{row.flag_count}</td>
-                      <td className="muted">{row.scored_at || "-"}</td>
+                      <td className="muted">{row.scored_at ? displayTime(row.scored_at) : "-"}</td>
                     </tr>
                     {isOpen && group.variants.map((variant) => (
                       <tr
@@ -2127,7 +2132,7 @@ function ScoreTable({
                         <td className="review-number-cell">{scoreText(variant.total_score)}</td>
                         <td className="review-number-cell">{scoreText(variant.quality_score)}</td>
                         <td className="review-number-cell">{variant.flag_count}</td>
-                        <td className="muted">{variant.scored_at || "-"}</td>
+                        <td className="muted">{variant.scored_at ? displayTime(variant.scored_at) : "-"}</td>
                       </tr>
                     ))}
                   </Fragment>
@@ -2197,10 +2202,9 @@ function ReviewPagination({
   const visiblePages = Array.from({ length: Math.min(5, pages) }, (_, index) => firstPage + index).filter((page) => page <= pages);
 
   return (
-    <div className="review-pagination" aria-label="Score index pagination">
+    <div className="review-pagination" aria-label="Clips pagination">
       <div className="review-page-size">
-        <span>Rows per page</span>
-        <strong>{numberText(limit)}</strong>
+        <span>{numberText(limit)} per page</span>
       </div>
       <div className="review-page-controls">
         <button className="icon-button small" disabled={offset <= 0} onClick={() => setOffset(Math.max(0, offset - limit))} aria-label="Previous score page">
@@ -2298,7 +2302,7 @@ function ScoreDetailPanel({
               <div>
                 <h3>{selected.clip_id || selected.source_video}</h3>
                 <p>{selected.row_type} clip</p>
-                <span>{selected.scored_at ? `Scored ${selected.scored_at}` : "Not scored yet"}</span>
+                <span>{selected.scored_at ? `Scored ${displayTime(selected.scored_at)}` : "Not scored yet"}</span>
               </div>
               <ReviewStatusBadge value={selected.status} />
             </div>
@@ -2687,12 +2691,12 @@ function ExportsPage() {
         />
       )}
       <section className="delivery-summary" aria-label="Delivery status summary">
-        <div><Clock size={19} aria-hidden="true" /><span>Pending<strong>{numberText((whatsappDelivery.envelope?.data.counts.ready_batches ?? 0) + (whatsappDelivery.envelope?.data.counts.assigned ?? 0) + (whatsappDelivery.envelope?.data.counts.sending ?? 0))}</strong><small>Awaiting delivery</small></span></div>
+        <div><Clock size={19} aria-hidden="true" /><span>Ready<strong>{numberText(whatsappDelivery.envelope?.data.counts.ready_batches ?? 0)}</strong><small>Ready for assignment</small></span></div>
         <div><CheckCircle2 size={19} aria-hidden="true" /><span>Sent<strong>{numberText(whatsappDelivery.envelope?.data.counts.sent ?? 0)}</strong><small>Delivered successfully</small></span></div>
         <div><X size={19} aria-hidden="true" /><span>Failed<strong>{numberText(whatsappDelivery.envelope?.data.counts.delivery_failed ?? 0)}</strong><small>Delivery failed</small></span></div>
       </section>
 
-      <section className="delivery-workspace">
+      <section className={`delivery-workspace ${assignments.length ? "has-detail" : ""}`}>
         <article className="panel delivery-list-panel">
           <div className="panel-head"><div><h2>Deliveries</h2><p>{numberText(assignments.length)} canonical WhatsApp batches</p></div></div>
           {assignments.length ? <div className="table-wrap"><table><thead><tr><th>Folder</th><th>Recipient</th><th>Channel</th><th>Status</th><th>Sent at</th></tr></thead><tbody>
@@ -2701,7 +2705,7 @@ function ExportsPage() {
             </tr>)}
           </tbody></table></div> : <EmptyState icon={PackageCheck} title="No deliveries yet" detail="Assigned delivery batches will appear here." />}
         </article>
-        <aside className="panel delivery-detail-panel">
+        {assignments.length > 0 && <aside className="panel delivery-detail-panel">
           <div className="panel-head"><div><h2>Delivery details</h2><p>{selectedAssignment ? `Batch ${selectedAssignment.batch_number}` : "Select a delivery"}</p></div></div>
           {selectedAssignment ? <div className="detail-list">
             <DetailItem label="Folder" value={selectedAssignment.canonical_folder_path} />
@@ -2713,7 +2717,7 @@ function ExportsPage() {
             <DetailItem label="Sent" value={selectedAssignment.sent_at ? displayTime(selectedAssignment.sent_at) : "—"} />
             {selectedAssignment.delivery_error && <StateBlock kind="bad" title="Delivery error" detail={selectedAssignment.delivery_error} />}
           </div> : <p className="muted-copy">Select a delivery to inspect its current state.</p>}
-        </aside>
+        </aside>}
       </section>
       <article className="panel delivery-status-panel">
         <div className="panel-head">
@@ -2726,16 +2730,16 @@ function ExportsPage() {
             kind={!exportOverview.available ? "neutral" : exportOverview.errorCount > 0 ? "bad" : exportOverview.pending > 0 ? "warn" : "good"}
           />
         </div>
-        <div className="overview-export-stats delivery-status-stats">
-          <OverviewStatLine label="Actionable at last pass" value={exportOverview.available ? numberText(exportOverview.actionable) : "—"} />
-          <OverviewStatLine label="Moved last pass" value={exportOverview.available ? numberText(exportOverview.packagedLastRun) : "—"} />
-          <OverviewStatLine label="Remaining now" value={exportOverview.available ? numberText(exportOverview.pending) : "—"} />
-          <OverviewStatLine label="Cumulative assignments" value={exportOverview.available ? numberText(exportOverview.packagedTotal) : "—"} />
-          <OverviewStatLine label="Last update" value={exportOverview.updatedAt ? new Date(exportOverview.updatedAt).toLocaleString() : "—"} />
-        </div>
-        {!exportOverview.available && (
-          <p className="muted-copy">The next automatic packaging pass or a recovery preflight will create the first operational snapshot.</p>
-        )}
+        {exportOverview.available ? <div className="overview-export-stats delivery-status-stats">
+          <OverviewStatLine label="Actionable at last pass" value={numberText(exportOverview.actionable)} />
+          <OverviewStatLine label="Moved last pass" value={numberText(exportOverview.packagedLastRun)} />
+          <OverviewStatLine label="Remaining now" value={numberText(exportOverview.pending)} />
+          <OverviewStatLine label="Cumulative assignments" value={numberText(exportOverview.packagedTotal)} />
+          <OverviewStatLine label="Last update" value={exportOverview.updatedAt ? new Date(exportOverview.updatedAt).toLocaleString() : "Unknown"} />
+        </div> : <div className="delivery-empty-history">
+          <strong>No export batching history yet.</strong>
+          <p>The next automatic packaging pass will create the first operational snapshot.</p>
+        </div>}
       </article>
       <details className="panel delivery-recovery-panel">
         <summary>Recovery &amp; Reconciliation</summary>
@@ -3064,11 +3068,11 @@ function TrendsPage({ active }: { active: boolean }) {
                 {visibleHashtags.length === 0 ? (
                   <EmptyState icon={TrendingUp} title="No relevant trending hashtags" detail="TikTok returned no qualifying topical or recognized beauty and personal-care brand hashtags for this selection. Unrelated trends are never used as filler." />
                 ) : <div className="trend-scroll-list">
-                  {visibleHashtags.map((hashtag) => (
+                  {visibleHashtags.map((hashtag, index) => (
                     <button
                       type="button"
                       className={`trend-hashtag-row ${selectedHashtag === hashtag.hashtag_id ? "active" : ""}`}
-                      key={hashtag.hashtag_id}
+                      key={`${hashtag.hashtag_id}-${index}`}
                       aria-pressed={selectedHashtag === hashtag.hashtag_id}
                       onClick={() => selectHashtag(hashtag.hashtag_id)}
                     >
@@ -3101,18 +3105,12 @@ function TrendsPage({ active }: { active: boolean }) {
                   <EmptyState icon={Video} title="No playable videos available for this hashtag" detail="TikTok returned no valid playable video posts in this ranked pool. Image, carousel, unknown, private, deleted, and unplayable posts were excluded." />
                 ) : (
                   <div className="trend-video-grid">
-                    {visibleVideos.map((video) => {
+                    {visibleVideos.map((video, index) => {
                       const selectable = trendVideoIsSelectable(video);
                       const displayStatus = video.media_status || video.download_status || "discovered";
-                      const displayKind: BadgeKind = displayStatus === "failed" || displayStatus === "interrupted"
-                        ? "bad"
-                        : displayStatus === "queued" || displayStatus === "downloading"
-                          ? "warn"
-                          : video.media_status
-                            ? "good"
-                            : displayStatus === "downloaded" ? "info" : "neutral";
+                      const displayKind = statusClass(displayStatus);
                       return (
-                        <button type="button" className={`trend-video-row ${activeVideo?.video_id === video.video_id ? "active" : ""}`} key={video.video_id} onClick={() => { setSelectedVideo(video.video_id); setSelectedMedia(""); }}>
+                        <button type="button" className={`trend-video-row ${activeVideo?.video_id === video.video_id ? "active" : ""}`} key={`${video.video_id}-${index}`} onClick={() => { setSelectedVideo(video.video_id); setSelectedMedia(""); }}>
                           <input type="checkbox" checked={analysisSelection.includes(video.video_id)} disabled={!selectable} onClick={(event) => event.stopPropagation()} onChange={() => toggleAnalysis(video)} aria-label={`Select ${video.video_id} for analysis`} />
                           <span>
                             <strong>#{video.final_rank} · #{video.hashtag_name}</strong>
@@ -4220,7 +4218,11 @@ const settingCopy: Record<string, { label: string; description: string; unit?: s
   SCORER_EXPORT_READY_THRESHOLD: { label: "Export-ready score", description: "Score required for a clip to be considered delivery-ready.", unit: "/10" },
   SCORER_REVIEW_THRESHOLD: { label: "Review score threshold", description: "Clips below this score are highlighted for review.", unit: "/10" },
   QUEUE_MAX_INFLIGHT_VIDEOS: { label: "Concurrent videos", description: "Maximum videos processed at the same time." },
-  QUEUE_FFMPEG_MAX_PARALLEL_CLIPS: { label: "Parallel clip renders", description: "Maximum FFmpeg clip renders running together." }
+  QUEUE_FFMPEG_MAX_PARALLEL_CLIPS: { label: "Parallel clip renders", description: "Maximum FFmpeg clip renders running together." },
+  QUEUE_BETWEEN_RUNS_DELAY_SECONDS: { label: "Between-run delay", description: "Time to wait before starting the next queued video.", unit: "seconds" },
+  QUEUE_DASHBOARD_QUEUED_STALL_SECONDS: { label: "Queued alert threshold", description: "Time a queued video may wait before it is flagged for attention.", unit: "seconds" },
+  QUEUE_DASHBOARD_RUNNING_STALL_SECONDS: { label: "Running alert threshold", description: "Time without progress before a running video is flagged for attention.", unit: "seconds" },
+  QUEUE_MAX_RETRIES: { label: "Retry limit", description: "Maximum automatic retry attempts for a failed queue step." }
 };
 
 function settingLabel(name: string): string {
@@ -4228,6 +4230,21 @@ function settingLabel(name: string): string {
     return settingCopy[name].label;
   }
   return name.toLowerCase().replace(/_/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function settingCategoryLabel(category: string): string {
+  const labels: Record<string, string> = {
+    selection: "Processing",
+    paths: "Paths",
+    queue: "Queue",
+    render: "Render",
+    models: "Models",
+    scoring: "Scoring",
+    compliance: "Compliance",
+    delivery: "Delivery",
+    advanced: "Advanced"
+  };
+  return labels[category] ?? settingLabel(category);
 }
 
 function settingDescription(entry: SettingsReadEntry): string {
@@ -4254,6 +4271,13 @@ function SettingsPage({ active }: { active: boolean }) {
   const groups = settings.envelope?.data.groups ?? {};
   const revision = settings.envelope?.data.revision ?? "";
   const entries = Object.values(groups).flat();
+  const categoryOrder = ["selection", "queue", "render", "models", "scoring", "compliance", "delivery", "paths", "advanced"];
+  const categories = Object.keys(groups).sort((left, right) => {
+    const leftIndex = categoryOrder.indexOf(left);
+    const rightIndex = categoryOrder.indexOf(right);
+    return (leftIndex < 0 ? categoryOrder.length : leftIndex) - (rightIndex < 0 ? categoryOrder.length : rightIndex)
+      || left.localeCompare(right);
+  });
   const [draft, setDraft] = useState<Record<string, string>>({});
   const [message, setMessage] = useState<ActionMessage>();
   const [search, setSearch] = useState("");
@@ -4383,16 +4407,16 @@ function SettingsPage({ active }: { active: boolean }) {
       <div className="settings-layout">
         <aside className="settings-subnav" aria-label="Settings categories">
           <button className={!categoryFilter ? "active" : ""} onClick={() => setCategoryFilter("")}>All settings</button>
-          {Object.keys(groups).map((category) => <button className={categoryFilter === category ? "active" : ""} onClick={() => setCategoryFilter(category)} key={category}>{settingLabel(category)}</button>)}
-          <small>Revision {revision ? revision.slice(0, 12) : "loading"}</small>
+          {categories.map((category) => <button className={categoryFilter === category ? "active" : ""} onClick={() => setCategoryFilter(category)} key={category}>{settingCategoryLabel(category)}</button>)}
+          <details className="settings-revision"><summary>Configuration details</summary><small>Revision {revision ? revision.slice(0, 12) : "loading"}</small></details>
         </aside>
       <div className="settings-grid">
         {Object.entries(visibleGroups).map(([category, groupEntries]) => (
           <article className="panel" key={category}>
             <div className="panel-head">
               <div>
-                <h2>{category}</h2>
-                <p>{groupEntries.length} registered values</p>
+                <h2>{settingCategoryLabel(category)}</h2>
+                <p>{groupEntries.length} {groupEntries.length === 1 ? "setting" : "settings"}</p>
               </div>
             </div>
             <div className="settings-list">
@@ -4401,18 +4425,26 @@ function SettingsPage({ active }: { active: boolean }) {
                   <div>
                     <strong>{settingLabel(entry.name)}</strong>
                     <span>{settingDescription(entry)}</span>
-                    <code>{entry.name}</code>
-                    <span>{entry.value_type} - {entry.source}</span>
                     {entry.editable === false && <span>{entry.read_only_reason || "Managed by operator configuration; restart required after external changes."}</span>}
-                    {(entry.minimum !== null || entry.maximum !== null) && (
-                      <span>Bounds {entry.minimum ?? "-"} to {entry.maximum ?? "-"}</span>
-                    )}
+                    <details className="setting-technical-details">
+                      <summary>Details</summary>
+                      <code>{entry.name}</code>
+                      <span>Type: {entry.value_type}</span>
+                      <span>Source: {entry.source}</span>
+                      {(entry.minimum !== null || entry.maximum !== null) && <span>Bounds: {entry.minimum ?? "none"} to {entry.maximum ?? "none"}</span>}
+                    </details>
                   </div>
                   {entry.value_type === "bool" ? (
-                    <select disabled={entry.editable === false} value={draft[entry.name] ?? "false"} onChange={(event) => setDraft((current) => ({ ...current, [entry.name]: event.target.value }))}>
-                      <option value="true">true</option>
-                      <option value="false">false</option>
-                    </select>
+                    <label className="setting-toggle">
+                      <input
+                        type="checkbox"
+                        disabled={entry.editable === false}
+                        checked={(draft[entry.name] ?? "false") === "true"}
+                        onChange={(event) => setDraft((current) => ({ ...current, [entry.name]: String(event.target.checked) }))}
+                        aria-label={settingLabel(entry.name)}
+                      />
+                      <span aria-hidden="true" />
+                    </label>
                   ) : (
                     <input
                       type={entry.value_type === "int" || entry.value_type === "float" ? "number" : "text"}
@@ -4424,9 +4456,9 @@ function SettingsPage({ active }: { active: boolean }) {
                       onChange={(event) => setDraft((current) => ({ ...current, [entry.name]: event.target.value }))}
                     />
                   )}
-                  <button className="tiny-button" disabled={entry.editable === false || entry.source !== "settings_override"} onClick={() => setDeleteTarget(entry.name)}>
-                    Reset override
-                  </button>
+                  {entry.editable !== false && entry.source === "settings_override"
+                    ? <button className="tiny-button" onClick={() => setDeleteTarget(entry.name)}>Reset override</button>
+                    : <span className="setting-reset-slot" aria-hidden="true" />}
                 </div>
               ))}
             </div>

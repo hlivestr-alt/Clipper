@@ -36,7 +36,7 @@
 .variant-presets-feedback { margin-top: 10px; color: var(--muted); font-size: 12px; }
 
 .variant-workspace {
-  display: grid; min-height: 690px; grid-template-columns: minmax(220px, 250px) minmax(500px, 1fr) minmax(300px, 340px);
+  display: grid; min-height: 690px; grid-template-columns: minmax(170px, 250px) minmax(440px, 1fr) minmax(250px, 340px);
   gap: 0; border: 1px solid var(--line); border-radius: 5px;
 }
 .variant-workspace-navigator, .variant-workspace-editor { border-right: 1px solid var(--line); }
@@ -56,7 +56,7 @@
 .variant-count-stepper input::-webkit-inner-spin-button { display: none; }
 .variant-navigator-list { display: grid; gap: 3px; }
 .variant-navigator-card {
-  display: grid; width: 100%; min-height: 54px; gap: 7px; padding: 9px 10px;
+  display: grid; width: 100%; min-height: 66px; gap: 6px; padding: 9px 10px;
   border: 0; border-radius: 4px; background: transparent; color: var(--muted); text-align: left; cursor: pointer;
 }
 .variant-navigator-card:hover { background: #131313; color: var(--text); }
@@ -64,12 +64,13 @@
 .variant-navigator-card-title { min-width: 0; gap: 8px; }
 .variant-navigator-card-title strong { min-width: 0; overflow: hidden; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
 .variant-navigator-number { color: var(--subtle); font-size: 11px; }
-.variant-navigator-summary { gap: 9px; padding-left: 25px; color: #696969; }
+.variant-navigator-summary { display: grid; gap: 2px; padding-left: 25px; color: #898989; font-size: 11px; line-height: 1.35; }
+.variant-navigator-summary small { overflow: hidden; color: #696969; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .variant-navigator-card.selected .variant-navigator-summary { color: #aaa; }
 
 .variant-tabbed-editor { min-width: 0; }
 .variant-editor-tablist {
-  position: sticky; top: 0; z-index: 10; display: flex; gap: 20px; overflow-x: auto;
+  position: sticky; top: 0; z-index: 10; display: flex; gap: 16px; overflow-x: auto;
   padding: 0 20px; border-bottom: 1px solid var(--line); background: var(--bg);
 }
 .variant-editor-tablist button {
@@ -115,11 +116,17 @@
 .variant-toggle-control span::after { content: ""; display: block; width: 13px; height: 13px; margin: 2px; border-radius: 50%; background: #8b8b8b; transition: transform 120ms ease, background 120ms ease; }
 .variant-toggle-control input:checked + span { border-color: #e5e5e5; background: #e5e5e5; }
 .variant-toggle-control input:checked + span::after { transform: translateX(15px); background: #0a0a0a; }
-.variant-summary-grid, .variant-dynamic-role-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0; border-top: 1px solid var(--line); border-left: 1px solid var(--line); }
-.variant-summary-card, .variant-dynamic-role-card { padding: 14px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); background: transparent; }
+.variant-summary-grid { display: grid; }
+.variant-summary-card { display: grid; grid-template-columns: minmax(120px, .7fr) minmax(0, 1.3fr) auto; align-items: center; gap: 14px; min-height: 56px; padding: 9px 0; border-top: 1px solid var(--line); background: transparent; }
+.variant-summary-card:first-child { border-top: 0; }
+.variant-summary-card p { min-width: 0; }
+.variant-dynamic-role-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0; border-top: 1px solid var(--line); border-left: 1px solid var(--line); }
+.variant-dynamic-role-card { padding: 14px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); background: transparent; }
 .variant-summary-card h3, .variant-dynamic-role-card h3 { margin-bottom: 4px; }
 .variant-summary-card p, .variant-dynamic-role-card p { margin: 0; color: var(--muted); font-size: 12px; }
-.variant-summary-action { margin-top: 11px; }
+.variant-summary-action { padding: 7px 0; border: 0; background: transparent; color: var(--muted); cursor: pointer; white-space: nowrap; }
+.variant-summary-action:hover { color: var(--text); }
+.variant-summary-action::after { content: " →"; }
 .variant-dynamic-role-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .variant-dynamic-role-fields { display: grid; gap: 8px; margin-top: 12px; }
 .variant-enabled-roles { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -148,6 +155,9 @@
 .variant-preview-feedback.error { border-left-color: var(--bad); }
 .variant-preview-readiness { display: grid; }
 .variant-preview-readiness-row { display: flex; justify-content: space-between; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+.variant-preview-details { border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+.variant-preview-details > summary { padding: 11px 0; cursor: pointer; }
+.variant-preview-details > p { margin: 0 0 12px; font-size: 12px; }
 
 .variant-diagnostics-tab, .diagnostic-section-body, .diagnostic-warning-groups { display: grid; gap: 14px; }
 .diagnostic-section { border-top: 1px solid var(--line); padding-top: 16px; }
@@ -167,17 +177,16 @@
 .diagnostic-long-list { max-height: 240px; overflow: auto; }
 .diagnostic-empty-note { color: var(--muted); }
 
-@media (min-width: 960px) and (max-width: 1359px) {
+@media (min-width: 1100px) and (max-width: 1399px) {
   .variant-command-bar { grid-template-columns: 1fr auto; }
   .variant-command-meta { display: none; }
-  .variant-workspace { grid-template-columns: minmax(480px, 1fr) minmax(280px, 320px); }
-  .variant-workspace-navigator { grid-column: 1 / -1; border-right: 0; border-bottom: 1px solid var(--line); }
-  .variant-navigator { padding-bottom: 10px; }
-  .variant-navigator-list { display: flex; overflow-x: auto; gap: 4px; }
-  .variant-navigator-card { min-width: 160px; }
+  .variant-workspace { grid-template-columns: minmax(165px, 190px) minmax(420px, 1fr) minmax(245px, 280px); }
+  .variant-command-actions .secondary-button { padding-inline: 11px; }
+  .variant-preview-panel { padding: 15px; }
+  .variant-preview-canvas-shell { min-height: 340px; padding: 10px; }
 }
 
-@media (max-width: 959px) {
+@media (max-width: 1099px) {
   .variant-workspace { grid-template-columns: 1fr; }
   .variant-workspace-navigator, .variant-workspace-editor { border-right: 0; border-bottom: 1px solid var(--line); }
   .variant-workspace-preview { grid-column: 1 / -1; border-top: 1px solid var(--line); }

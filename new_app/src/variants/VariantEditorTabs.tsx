@@ -9,14 +9,14 @@ import { TextSubtitlesTab } from "./tabs/TextSubtitlesTab";
 import { VisualTab } from "./tabs/VisualTab";
 import type { VariantEditorContext, VariantEditorTabId } from "./variantTypes";
 
-const tabs: Array<{ id: VariantEditorTabId; label: string }> = [
+const tabs: Array<{ id: VariantEditorTabId; label: string; displayLabel?: string }> = [
   { id: "basics", label: "Basics" },
   { id: "text-subtitles", label: "Text & Subtitles" },
   { id: "visual", label: "Visual" },
   { id: "audio", label: "Audio" },
   { id: "dynamic-text", label: "Dynamic Text" },
   { id: "advanced", label: "Advanced" },
-  { id: "assets-diagnostics", label: "Assets & Diagnostics" }
+  { id: "assets-diagnostics", label: "Assets & Diagnostics", displayLabel: "Diagnostics" }
 ];
 
 export function VariantEditorTabs(props: VariantEditorContext) {
@@ -73,6 +73,7 @@ export function VariantEditorTabs(props: VariantEditorContext) {
             role="tab"
             id={`variant-tab-${tab.id}`}
             aria-controls={`variant-panel-${tab.id}`}
+            aria-label={tab.label}
             aria-selected={activeTab === tab.id}
             tabIndex={activeTab === tab.id ? 0 : -1}
             key={tab.id}
@@ -80,7 +81,7 @@ export function VariantEditorTabs(props: VariantEditorContext) {
             onClick={() => selectTab(tab.id)}
             onKeyDown={onTabKeyDown}
           >
-            {tab.label}
+            {tab.displayLabel ?? tab.label}
           </button>
         ))}
       </div>

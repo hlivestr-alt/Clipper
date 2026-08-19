@@ -70,10 +70,13 @@ export function VariantCommandBar({
         <p>Configure how clips are transformed and rendered.</p>
         {conflict && <small className="variant-command-conflict">{conflict}</small>}
       </div>
-      <div className="variant-command-meta" aria-label="Active variation profile">
+      <div
+        className="variant-command-meta"
+        aria-label="Active variation profile"
+        title={`Profile revision: ${revision || "new"}`}
+      >
         <span>Default profile</span>
         <span>{variantCount} {variantCount === 1 ? "variant" : "variants"}</span>
-        <span>Rev {revision ? revision.slice(0, 12) : "new"}</span>
       </div>
       <div className="variant-command-actions">
         <button
