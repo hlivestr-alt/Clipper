@@ -716,10 +716,14 @@ def create_app(
         return _read_response(read_service.dashboard(), request)
 
     @api.get("/api/queue")
-    def queue(request: Request) -> Response:
+    def queue(
+        request: Request,
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+    ) -> Response:
         if "state_path" in request.query_params:
             raise HTTPException(status_code=400, detail="state_path overrides are not supported")
-        return _read_response(read_service.queue_detail(), request)
+        return _read_response(read_service.queue_detail(limit=limit, offset=offset), request)
 
     @api.get("/api/queue/vods")
     def queue_vods() -> dict[str, Any]:

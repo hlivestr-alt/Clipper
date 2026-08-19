@@ -182,3 +182,10 @@ test("portable restart targets the outer executable and preserves launch argumen
   assert.equal(portableRestartCommand({ portableExecutableFile: path.join(root, "missing.exe") }), null);
   assert.equal(portableRestartCommand({}), null);
 });
+
+test("renderer keeps desktop drag regions separate from fixed window controls", () => {
+  const css = fs.readFileSync(path.join(__dirname, "..", "src", "styles.css"), "utf8");
+  assert.match(css, /\.desktop-drag-strip\s*\{[^}]*position:\s*fixed;[^}]*-webkit-app-region:\s*drag;/s);
+  assert.match(css, /\.window-controls\s*\{[^}]*position:\s*fixed;[^}]*-webkit-app-region:\s*no-drag;/s);
+  assert.match(css, /\.app-shell a,[^{]+\{\s*-webkit-app-region:\s*no-drag;/s);
+});

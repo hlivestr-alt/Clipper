@@ -154,6 +154,75 @@ class ReadServiceTests(unittest.TestCase):
         self.assertGreaterEqual(result.data.clips_today, 0)
         self.assertEqual(Path(result.source_signatures[0].path).resolve(), self.state_path.resolve())
 
+    def test_queue_history_returns_individual_attempts_with_attempt_metrics(self):
+        state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        video = state["videos"]["vod"]
+        video["run_history"] = [
+            {
+                "status": "completed",
+                "created_at": "2026-05-30T10:00:00+08:00",
+                "completed_at": "2026-05-30T10:11:35+08:00",
+                "output_dir": str(self.output_root / "old_run"),
+                "stages": {"ffmpeg": {"status": "done", "clips_created": 24}},
+            },
+            {
+                "status": "failed",
+                "created_at": "2026-05-31T10:00:00+08:00",
+                "failed_at": "2026-05-31T10:04:12+08:00",
+                "stages": {"llm": {"status": "failed", "error": "Model request timed out"}},
+            },
+        ]
+        self.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        rows = self.service.queue_detail().data.rows
+
+        self.assertEqual(len(rows), 3)
+        first, failed, completed = rows
+        self.assertEqual(first.attempt_number, 3)
+        self.assertEqual(first.clips_generated, 1)
+        self.assertEqual(failed.attempt_number, 2)
+        self.assertEqual(failed.duration, "4m 12s")
+        self.assertEqual(failed.attention, "Sales Moment Detection: Model request timed out")
+        self.assertEqual(completed.attempt_number, 1)
+        self.assertEqual(completed.clips_generated, 24)
+        self.assertEqual(completed.duration, "11m 35s")
+        dashboard = self.service.dashboard().data
+        self.assertEqual(dashboard.total_videos, 1)
+        self.assertEqual(dashboard.status_counts, {"Completed": 1})
+
+    def test_overview_counts_only_review_and_blocked_score_rows_as_needing_review(self):
+        (self.run_dir / "scores_summary.json").write_text(
+            json.dumps(
+                {
+                    "groups": [
+                        {
+                            "clip_id": "clip_review",
+                            "base_clip_id": "clip_review",
+                            "product": "serum",
+                            "total_score": 4.2,
+                            "representative_output_file": "clip_001.mp4",
+                            "scored_at": "2026-06-01T11:04:00+08:00",
+                            "variants": [{"clip_id": "clip_review_v1", "output_file": "clip_001.mp4"}],
+                        },
+                        {
+                            "clip_id": "clip_strong",
+                            "base_clip_id": "clip_strong",
+                            "product": "serum",
+                            "total_score": 8.5,
+                            "representative_output_file": "clip_001.mp4",
+                            "scored_at": "2026-06-01T11:05:00+08:00",
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        overview = self.service.overview().data
+
+        self.assertEqual(overview.scored_count, 3)
+        self.assertEqual(overview.review_needed_count, 2)
+
     def test_queue_detail_uses_completed_one_shot_supervisor_over_stale_control(self):
         Path(self.config.QUEUE_CONTROL_FILE).write_text(
             json.dumps(

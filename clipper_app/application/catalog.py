@@ -894,7 +894,8 @@ class CatalogQueryService:
         with self.database.read_connection() as connection:
             score_stats = connection.execute(
                 "SELECT COUNT(*) AS scored_count, AVG(total_score) AS average_score, "
-                "COALESCE(SUM(CASE WHEN json_extract(payload_json, '$.compliance_blocked') THEN 1 ELSE 0 END),0) AS blocked "
+                "COALESCE(SUM(CASE WHEN json_extract(payload_json, '$.compliance_blocked') THEN 1 ELSE 0 END),0) AS blocked, "
+                "COALESCE(SUM(CASE WHEN lower(json_extract(payload_json, '$.status')) IN ('review','needs review','blocked','attention') THEN 1 ELSE 0 END),0) AS review_needed_count "
                 "FROM score_records"
             ).fetchone()
             trend_rows = connection.execute(
@@ -965,6 +966,7 @@ class CatalogQueryService:
             revision=revision,
             queue_active=bool(queue_active),
             scored_count=scored_count,
+            review_needed_count=int(score_stats["review_needed_count"]),
             average_score=(
                 round(float(score_stats["average_score"]), 3)
                 if score_stats["average_score"] is not None else None

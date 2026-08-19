@@ -23,6 +23,7 @@ export type ArtifactRef = {
 
 export type QueueRunRow = {
   run_id?: string;
+  attempt_number: number;
   video_name: string;
   video_path?: string | null;
   status: string;
@@ -108,6 +109,9 @@ export type QueueDetail = {
   stage_waiting: Record<string, number>;
   waiting_videos: number;
   stage_admission_limit: number;
+  total: number;
+  limit: number;
+  offset: number;
   rows: QueueRunRow[];
 };
 
@@ -801,6 +805,7 @@ export type OverviewData = {
   revision: string;
   queue_active: boolean;
   scored_count: number;
+  review_needed_count: number;
   average_score?: number | null;
   export_ready_count: number;
   score_trend: OverviewScoreTrendPoint[];

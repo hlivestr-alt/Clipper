@@ -153,7 +153,7 @@ type CatalogStatus = {
   backfill?: { status?: string; duration_seconds?: number; error?: string };
   shadow_comparison?: { mismatch_count?: number; checked?: boolean };
 };
-type WindowControlAction = "minimize" | "toggle-maximize" | "close";
+type WindowControlAction = "get-state" | "minimize" | "toggle-maximize" | "close";
 type ScoreGroup = {
   key: string;
   main: ScoreRow;
@@ -421,7 +421,7 @@ function isTerminalRun(row?: QueueRunRow | null): boolean {
 }
 
 function runTime(row: QueueRunRow): number {
-  const value = row.completed_at || row.started_at;
+  const value = row.started_at || row.completed_at;
   const parsed = value ? Date.parse(value) : Number.NaN;
   return Number.isNaN(parsed) ? 0 : parsed;
 }
@@ -655,6 +655,8 @@ function AppShell({ children }: { children: ReactNode }) {
   const variantsOwnsPageIdentity = location.pathname === "/variants";
   return (
     <div className="app-shell">
+      <div className="desktop-drag-strip" aria-hidden="true" />
+      <WindowControls />
       <aside className="side-rail">
         <Link className="brand-block" to="/overview" aria-label="Clipper overview home">
           <div className="brand-mark" aria-hidden="true">C</div>
@@ -718,7 +720,6 @@ function AppShell({ children }: { children: ReactNode }) {
           )}
           <div className="topbar-actions">
             <QueueHealthPill summary={summary} />
-            <WindowControls />
           </div>
         </header>
         <ContextTabs />
@@ -741,7 +742,26 @@ function QueueHealthPill({ summary }: { summary?: DashboardSummary }) {
 
 function WindowControls() {
   const [maximized, setMaximized] = useState(false);
-  const canControlWindow = typeof window !== "undefined" && Boolean(window.clipperDesktop?.windowControl);
+  const hasDesktopBridge = typeof window !== "undefined" && Boolean(window.clipperDesktop?.windowControl);
+  const desktopLaunch = typeof window !== "undefined" && (
+    new URLSearchParams(window.location.search).get("desktop") === "1"
+    || window.sessionStorage.getItem("clipper:desktop-shell") === "1"
+  );
+  const canControlWindow = hasDesktopBridge || desktopLaunch || (typeof navigator !== "undefined" && navigator.userAgent.includes("Electron"));
+
+  useEffect(() => {
+    if (desktopLaunch) window.sessionStorage.setItem("clipper:desktop-shell", "1");
+  }, [desktopLaunch]);
+
+  useEffect(() => {
+    if (!hasDesktopBridge) return;
+    const sync = () => {
+      void window.clipperDesktop?.windowControl?.("get-state").then((result) => setMaximized(Boolean(result?.maximized)));
+    };
+    sync();
+    window.addEventListener("resize", sync);
+    return () => window.removeEventListener("resize", sync);
+  }, [hasDesktopBridge]);
 
   if (!canControlWindow) {
     return null;
@@ -1187,26 +1207,32 @@ function QueueTable({
         <tbody>
           {rows.map((row) => (
             <tr
-              className={selected?.video_name === row.video_name && selected?.started_at === row.started_at ? "selected-row" : ""}
-              key={`${row.video_name}-${row.started_at}`}
+              className={selected?.run_id === row.run_id ? "selected-row" : ""}
+              key={row.run_id || `${row.video_name}-${row.started_at}-${row.attempt_number}`}
               onClick={() => setSelected?.(row)}
             >
               <td>
                 <div className="strong">{row.video_name}</div>
-                <div className="muted">{row.runs} run(s), {row.redos} redo(s)</div>
+                <div className="muted">Run {row.attempt_number}</div>
               </td>
               <td><Badge value={row.status} /></td>
               <td>{row.current_step}</td>
               <td><Progress value={row.progress} /></td>
               <td>{numberText(row.clips_generated)}</td>
               {!compact && <td>{row.duration}</td>}
-              {!compact && <td className="muted attention-cell">{row.attention || "Clear"}</td>}
+              {!compact && <td className="muted attention-cell">{queueAttentionText(row)}</td>}
             </tr>
           ))}
         </tbody>
       </table>
     </div>
   );
+}
+
+function queueAttentionText(row: QueueRunRow): string {
+  const failed = ["failed", "error", "blocked", "rejected"].some((value) => row.status.toLowerCase().includes(value));
+  if (failed && (!row.attention || row.attention.toLowerCase() === "clear")) return "—";
+  return row.attention || "Clear";
 }
 
 function SegmentedControl<T extends string>({
@@ -1250,7 +1276,7 @@ function RunLauncher({
   onQueueRefresh?: () => void;
   surface?: "standard" | "operations";
 }) {
-  const queue = useApiQuery<QueueDetail>("/api/queue", (data) => isQueueActive(data) ? 2_000 : 15_000, true);
+  const queue = useApiQuery<QueueDetail>("/api/queue?view=attempts", (data) => isQueueActive(data) ? 2_000 : 15_000, true);
   const vods = useApiQuery<QueueVodList>("/api/queue/vods", 8_000, true);
   const [runMode, setRunMode] = useState<QueueRunMode>("folder_repeat");
   const [pipelineMode, setPipelineMode] = useState<QueuePipelineMode>("full");
@@ -1427,6 +1453,7 @@ function RunLauncher({
           <div className="next-run-head">
             <h2>Configure a new run</h2>
           </div>
+          <div className="run-config-surface">
           <div className="run-form-rows">
             <label className="run-form-row">
               <span>Source</span>
@@ -1481,6 +1508,7 @@ function RunLauncher({
           <div className="next-run-action-row">
             <button className="secondary-button" type="button" onClick={() => { setRunMode("folder_repeat"); setPipelineMode("full"); setVariantMode("all"); setVariantCount(2); setMaxClips("0"); setVideoPath(""); }}>Reset</button>
             <button className="primary-button" disabled={!canStart} onClick={startQueue}><Play size={16} aria-hidden="true" />Start run</button>
+          </div>
           </div>
           {needsVod && vods.error && <StateBlock kind="bad" detail={vods.error} />}
           {needsVod && !vods.loading && files.length === 0 && <StateBlock kind="warn" detail="No supported video files found." />}
@@ -1718,7 +1746,7 @@ function OperationsPage() {
           <h2>Recent runs</h2>
           {rows.length ? <div className="table-wrap"><table><thead><tr><th>Run</th><th>Status</th><th>Started</th><th>Duration</th></tr></thead><tbody>
             {[...rows].sort((left, right) => runTime(right) - runTime(left)).slice(0, 5).map((row) => (
-              <tr key={`${row.video_name}-${row.started_at}`}><td className="strong">{row.video_name}</td><td><Badge value={row.status} /></td><td>{displayTime(row.started_at)}</td><td>{row.duration || "—"}</td></tr>
+              <tr key={row.run_id || `${row.video_name}-${row.started_at}-${row.attempt_number}`}><td><div className="strong">{row.video_name}</div><div className="muted">Run {row.attempt_number}</div></td><td><Badge value={row.status} /></td><td>{displayTime(row.started_at)}</td><td>{row.duration || "—"}</td></tr>
             ))}
           </tbody></table></div> : <EmptyState icon={ListChecks} title="No runs yet" detail="Completed production runs will appear here." />}
         </section>
@@ -1728,7 +1756,8 @@ function OperationsPage() {
 }
 
 function QueuePage() {
-  const queue = useApiQuery<QueueDetail>("/api/queue", (data) => isQueueActive(data) ? 2_000 : 15_000, true);
+  const [offset, setOffset] = useState(0);
+  const queue = useApiQuery<QueueDetail>(`/api/queue${query({ view: "attempts", limit: 100, offset })}`, (data) => isQueueActive(data) ? 2_000 : 15_000, true);
   const [selected, setSelected] = useState<QueueRunRow | null>(null);
   const data = queue.envelope?.data;
 
@@ -1739,6 +1768,15 @@ function QueuePage() {
       {queue.error && <StateBlock kind="bad" title="Queue read failed" detail={queue.error} />}
       <StateBlock kind="warn" warnings={queue.envelope?.warnings} />
       <QueueTable rows={data?.rows ?? []} selected={selected} setSelected={setSelected} />
+      {(data?.total ?? 0) > 0 && (
+        <div className="queue-pagination" aria-label="Queue history pagination">
+          <span>{numberText((data?.offset ?? 0) + 1)}–{numberText(Math.min((data?.offset ?? 0) + (data?.rows.length ?? 0), data?.total ?? 0))} of {numberText(data?.total ?? 0)} run attempts</span>
+          <div>
+            <button className="secondary-button" disabled={offset <= 0} onClick={() => setOffset(Math.max(0, offset - 100))}>Previous</button>
+            <button className="secondary-button" disabled={offset + 100 >= (data?.total ?? 0)} onClick={() => setOffset(offset + 100)}>Next</button>
+          </div>
+        </div>
+      )}
       <Drawer
         open={Boolean(selected)}
         title={selected?.video_name ?? "Queue run"}
@@ -1748,13 +1786,14 @@ function QueuePage() {
         {selected && (
           <div className="detail-list">
             <DetailItem label="Status" value={<Badge value={selected.status} />} />
+            <DetailItem label="Attempt" value={`Run ${selected.attempt_number}`} />
             <DetailItem label="Progress" value={<Progress value={selected.progress} />} />
             <DetailItem label="Video path" value={selected.video_path || "-"} />
             <DetailItem label="Output dir" value={selected.output_dir || "-"} />
             <DetailItem label="Working dir" value={selected.working_dir || "-"} />
             <DetailItem label="Started" value={selected.started_at || "-"} />
             <DetailItem label="Completed" value={selected.completed_at || "-"} />
-            <DetailItem label="Attention" value={selected.attention || "Clear"} />
+            <DetailItem label="Attention" value={queueAttentionText(selected)} />
           </div>
         )}
       </Drawer>
@@ -1779,10 +1818,13 @@ function DashboardPage() {
   const exportOverview = buildExportOverview(overviewData?.export);
   const rows = summary?.rows ?? [];
   const recentRuns = [...rows].sort((left, right) => runTime(right) - runTime(left)).slice(0, 6);
-  const readyForReview = overviewData?.scored_count ?? 0;
-  const stoppedRuns = rows.filter((row) => ["stopped", "failed", "interrupted"].some((value) => row.status.toLowerCase().includes(value))).length;
+  const reviewNeeded = overviewData?.review_needed_count ?? 0;
+  const stoppedRuns = Object.entries(summary?.status_counts ?? {}).reduce(
+    (count, [status, total]) => ["stopped", "failed", "interrupted"].some((value) => status.toLowerCase().includes(value)) ? count + total : count,
+    0,
+  );
   const waitingDeliveries = exportOverview.available ? exportOverview.pending : 0;
-  const hasAttention = readyForReview > 0 || waitingDeliveries > 0 || stoppedRuns > 0;
+  const hasAttention = reviewNeeded > 0 || waitingDeliveries > 0 || stoppedRuns > 0;
   const hour = new Date().getHours();
   const greeting = hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
 
@@ -1801,7 +1843,7 @@ function DashboardPage() {
       <section className="home-section">
         <h2>Needs attention</h2>
         {hasAttention ? <div className="attention-list">
-          {readyForReview > 0 && <Link to="/review/clips"><Video size={18} aria-hidden="true" /><span><strong>{numberText(readyForReview)} clips</strong> are ready for review</span><ChevronRight size={17} /></Link>}
+          {reviewNeeded > 0 && <Link to="/review/clips"><Video size={18} aria-hidden="true" /><span><strong>{numberText(reviewNeeded)} clips</strong> need review</span><ChevronRight size={17} /></Link>}
           {waitingDeliveries > 0 && <Link to="/deliveries"><PackageCheck size={18} aria-hidden="true" /><span><strong>{numberText(waitingDeliveries)} deliveries</strong> are waiting</span><ChevronRight size={17} /></Link>}
           {stoppedRuns > 0 && <Link to="/activity/jobs?status=failed"><Activity size={18} aria-hidden="true" /><span><strong>{numberText(stoppedRuns)} runs</strong> are stopped or failed</span><ChevronRight size={17} /></Link>}
         </div> : <p className="attention-clear">You’re all caught up.</p>}
@@ -1811,7 +1853,7 @@ function DashboardPage() {
         <h2>Recent runs</h2>
         {recentRuns.length ? (
           <div className="table-wrap"><table><thead><tr><th>Run</th><th>Clips</th><th>Status</th><th>Started</th><th>Duration</th></tr></thead><tbody>
-            {recentRuns.map((row) => <tr key={`${row.video_name}-${row.started_at}`}><td className="strong">{row.video_name}</td><td>{numberText(row.clips_generated)}</td><td><Badge value={row.status} /></td><td>{displayTime(row.started_at)}</td><td>{row.duration || "—"}</td></tr>)}
+            {recentRuns.map((row) => <tr key={row.run_id || `${row.video_name}-${row.started_at}-${row.attempt_number}`}><td><div className="strong">{row.video_name}</div><div className="muted">Run {row.attempt_number}</div></td><td>{numberText(row.clips_generated)}</td><td><Badge value={row.status} /></td><td>{displayTime(row.started_at)}</td><td>{row.duration || "—"}</td></tr>)}
           </tbody></table></div>
         ) : <EmptyState icon={Video} title="No recent runs" detail="Your completed and active production runs will appear here." />}
       </section>

@@ -91,6 +91,7 @@ class _OverviewScoreCandidate:
 @dataclass(frozen=True)
 class _OverviewScoreCorpus:
     scored_count: int
+    review_needed_count: int
     score_total: float
     score_value_count: int
     compliance_blocked_count: int
@@ -230,7 +231,8 @@ class ReadDashboardService:
         )
         return ReadServiceResult(summary, (signature,), tuple(warnings))
 
-    def queue_detail(self, state_path: str | None = None) -> ReadServiceResult:
+    def queue_detail(self, state_path: str | None = None, *, limit: int = 100, offset: int = 0) -> ReadServiceResult:
+        limit, offset = self._bounded_page(limit, offset)
         state, signature, warnings = self._read_queue_state(state_path)
         control, control_signature, control_warnings = self._read_queue_control()
         supervisor, supervisor_signature, supervisor_warnings = self._read_queue_forever()
@@ -257,10 +259,13 @@ class ReadDashboardService:
                 stage_waiting=self._stage_waiting_counts(state, videos),
                 waiting_videos=self._waiting_video_count(state, videos),
                 stage_admission_limit=self._stage_admission_limit(state),
-                rows=tuple(rows),
+                total=len(rows),
+                limit=limit,
+                offset=offset,
+                rows=tuple(rows[offset : offset + limit]),
             )
 
-        data = self._cache.get_or_load("queue:detail", revision, build)
+        data = self._cache.get_or_load(f"queue:detail:{limit}:{offset}", revision, build)
         return ReadServiceResult(data, (signature, control_signature, supervisor_signature), tuple(warnings))
 
     def queue_vods(self) -> ReadServiceResult:
@@ -519,6 +524,7 @@ class ReadDashboardService:
             revision=revision,
             queue_active=queue_active,
             scored_count=score_corpus.scored_count,
+            review_needed_count=score_corpus.review_needed_count,
             average_score=(
                 round(score_corpus.score_total / score_corpus.score_value_count, 3)
                 if score_corpus.score_value_count
@@ -570,6 +576,7 @@ class ReadDashboardService:
         def load() -> _OverviewScoreCorpus:
             warnings: list[str] = []
             scored_count = 0
+            review_needed_count = 0
             score_total = 0.0
             score_value_count = 0
             compliance_blocked_count = 0
@@ -586,12 +593,15 @@ class ReadDashboardService:
                 scored_at: str,
                 source_date: str,
                 blocked: bool,
+                needs_review: bool,
                 output_dir: Path,
                 artifact_value: Any,
             ) -> None:
-                nonlocal scored_count, score_total, score_value_count
+                nonlocal scored_count, review_needed_count, score_total, score_value_count
                 nonlocal compliance_blocked_count
                 scored_count += 1
+                if needs_review:
+                    review_needed_count += 1
                 if blocked:
                     compliance_blocked_count += 1
                 if total_score is None:
@@ -629,6 +639,8 @@ class ReadDashboardService:
                     total_score = score_float(group.get("total_score"))
                     scored_at = str(group.get("scored_at") or "")
                     blocked = bool(group.get("compliance_blocked", False))
+                    flags = self._score_flags_list(group.get("flags", []))
+                    status = self._score_status_label(total_score, self._score_flag_severity(flags), blocked)
                     base_clip_id = group.get("base_clip_id") or group.get("clip_id")
                     artifact_value = group.get("representative_clip_path") or group.get(
                         "representative_output_file"
@@ -641,6 +653,7 @@ class ReadDashboardService:
                         scored_at=scored_at,
                         source_date=source_date,
                         blocked=blocked,
+                        needs_review=status in {"Review", "Blocked"},
                         output_dir=folder,
                         artifact_value=artifact_value,
                     )
@@ -649,6 +662,13 @@ class ReadDashboardService:
                         continue
                     for variant in (item for item in variants if isinstance(item, dict)):
                         variant_artifact = variant.get("clip_path") or variant.get("output_file")
+                        variant_blocked = bool(variant.get("compliance_blocked", blocked))
+                        variant_flags = self._score_flags_list(variant.get("flags") or variant.get("similarity_flags", []))
+                        variant_status = self._score_status_label(
+                            total_score,
+                            self._score_flag_severity(variant_flags),
+                            variant_blocked,
+                        )
                         add_candidate(
                             identity=variant,
                             clip_id=variant.get("clip_id"),
@@ -656,7 +676,8 @@ class ReadDashboardService:
                             total_score=total_score,
                             scored_at=str(variant.get("scored_at") or scored_at),
                             source_date=source_date,
-                            blocked=bool(variant.get("compliance_blocked", blocked)),
+                            blocked=variant_blocked,
+                            needs_review=variant_status in {"Review", "Blocked"},
                             output_dir=folder,
                             artifact_value=variant_artifact,
                         )
@@ -697,6 +718,7 @@ class ReadDashboardService:
             )
             return _OverviewScoreCorpus(
                 scored_count=scored_count,
+                review_needed_count=review_needed_count,
                 score_total=score_total,
                 score_value_count=score_value_count,
                 compliance_blocked_count=compliance_blocked_count,
@@ -999,10 +1021,12 @@ class ReadDashboardService:
     def _build_dashboard_summary(self, state: dict[str, Any], state_path: str) -> DashboardSummary:
         rows = self._queue_rows(state)
         queue_health = self._queue_health(state)
-        statuses = Counter(row.status for row in rows)
+        attention_by_video = queue_health.get("attention_by_video", {}) if isinstance(queue_health, dict) else {}
         stage_running: Counter[str] = Counter()
         stage_queued: Counter[str] = Counter()
-        videos = [self._aggregate_video_entry(video) for video in self._state_videos(state)]
+        current_videos = self._state_videos(state)
+        statuses = Counter(self._infer_video_status(video, attention_by_video) for video in current_videos)
+        videos = [self._aggregate_video_entry(video) for video in current_videos]
         stage_waiting = self._stage_waiting_counts(state, videos)
         for video in videos:
             if str(video.get("status") or "").strip().lower() in {"completed", "failed", "paused", "stopped"}:
@@ -1039,7 +1063,7 @@ class ReadDashboardService:
             stage_waiting=stage_waiting,
             waiting_videos=self._waiting_video_count(state, videos),
             stage_admission_limit=self._stage_admission_limit(state),
-            total_videos=len(rows),
+            total_videos=len(videos),
             total_clips=sum(row.clips_generated for row in rows),
             clips_today=int(clips_today),
             clips_last_24h=int(clips_last_24h),
@@ -1117,34 +1141,48 @@ class ReadDashboardService:
         attention_by_video = queue_health.get("attention_by_video", {}) if isinstance(queue_health, dict) else {}
         rows: list[QueueRunRow] = []
         now = datetime.now().astimezone()
-        for video in [self._aggregate_video_entry(item) for item in self._state_videos(state)]:
-            created_at = parse_timestamp(video.get("created_at"))
-            completed_at = self._infer_run_completed_at(video)
-            duration = "-"
-            if created_at:
-                duration = format_duration(((completed_at or now) - created_at).total_seconds())
-            rows.append(
-                QueueRunRow(
-                    run_id=str(video.get("operation_id") or video.get("run_id") or f"{video.get('path') or video.get('name') or '-'}|{format_datetime(created_at)}"),
-                    video_name=str(video.get("name") or "-"),
-                    video_path=str(video.get("path") or "") or None,
-                    status=self._infer_video_status(video, attention_by_video),
-                    current_step=self._infer_current_step(video, attention_by_video),
-                    progress=self._compute_progress(video, attention_by_video),
-                    attention=self._attention_text(video, attention_by_video),
-                    clips_generated=as_nonnegative_int(video.get("clips_generated_total")),
-                    runs=as_nonnegative_int(video.get("run_count"), 1),
-                    redos=as_nonnegative_int(video.get("redo_count")),
-                    duration=duration,
-                    started_at=format_datetime(created_at),
-                    completed_at=format_datetime(completed_at),
-                    output_dir=str(video.get("output_dir") or "") or None,
-                    working_dir=str(video.get("working_dir") or "") or None,
-                    current_stage=str(video.get("current_stage") or "") or None,
+        for video in self._state_videos(state):
+            history = [run for run in video.get("run_history", []) if isinstance(run, dict)]
+            attempts = [*history, {key: value for key, value in video.items() if key != "run_history"}]
+            for attempt_number, raw_attempt in enumerate(attempts, start=1):
+                is_current = attempt_number == len(attempts)
+                attempt = dict(raw_attempt)
+                for key in ("name", "path", "working_dir", "output_dir"):
+                    if not attempt.get(key):
+                        attempt[key] = video.get(key)
+                current_attention = attention_by_video if is_current else {}
+                created_at = parse_timestamp(attempt.get("created_at"))
+                ended_at = self._infer_run_ended_at(attempt)
+                status = self._infer_video_status(attempt, current_attention)
+                duration = "-"
+                if created_at and (ended_at or (is_current and status in {"Processing", "Waiting", "Needs Attention", "Paused"})):
+                    duration = format_duration(((ended_at or now) - created_at).total_seconds())
+                attention = self._attention_text(attempt, current_attention)
+                if status == "Failed":
+                    attention = self._run_failure_reason(attempt)
+                identity = str(attempt.get("path") or attempt.get("name") or "-")
+                rows.append(
+                    QueueRunRow(
+                        run_id=str(attempt.get("operation_id") or attempt.get("run_id") or f"{identity}|{attempt_number}|{format_datetime(created_at)}"),
+                        attempt_number=attempt_number,
+                        video_name=str(attempt.get("name") or "-"),
+                        video_path=str(attempt.get("path") or "") or None,
+                        status=status,
+                        current_step=self._infer_current_step(attempt, current_attention),
+                        progress=self._compute_progress(attempt, current_attention),
+                        attention=attention,
+                        clips_generated=self._run_clip_count(attempt, allow_manifest_fallback=is_current),
+                        runs=1,
+                        redos=0,
+                        duration=duration,
+                        started_at=format_datetime(created_at),
+                        completed_at=format_datetime(ended_at),
+                        output_dir=str(attempt.get("output_dir") or "") or None,
+                        working_dir=str(attempt.get("working_dir") or "") or None,
+                        current_stage=str(attempt.get("current_stage") or "") or None,
+                    )
                 )
-            )
-        status_rank = {"Needs Attention": 0, "Processing": 1, "Waiting": 2, "Failed": 3, "Stopped": 4, "Completed": 5, "Paused": 6}
-        rows.sort(key=lambda row: (status_rank.get(row.status, 9), row.started_at, row.video_name))
+        rows.sort(key=lambda row: parse_timestamp(row.started_at) or MIN_SORT_TIMESTAMP, reverse=True)
         return rows
 
     def _queue_health(self, state: dict[str, Any]) -> dict[str, Any]:
@@ -1188,13 +1226,13 @@ class ReadDashboardService:
         aggregate["clips_generated_total"] = sum(self._run_clip_count(run) for run in runs)
         return aggregate
 
-    def _run_clip_count(self, run: dict[str, Any]) -> int:
+    def _run_clip_count(self, run: dict[str, Any], *, allow_manifest_fallback: bool = True) -> int:
         stages = run.get("stages") if isinstance(run.get("stages"), dict) else {}
         ffmpeg = stages.get("ffmpeg") if isinstance(stages.get("ffmpeg"), dict) else {}
         live_count = as_nonnegative_int(ffmpeg.get("clips_created"))
         if live_count:
             return live_count
-        output_dir = run.get("output_dir")
+        output_dir = run.get("output_dir") if allow_manifest_fallback else None
         if not output_dir:
             return 0
         return self._manifest_clip_count(Path(str(output_dir)))
@@ -1206,6 +1244,41 @@ class ReadDashboardService:
         stages = run.get("stages") if isinstance(run.get("stages"), dict) else {}
         ffmpeg = stages.get("ffmpeg") if isinstance(stages.get("ffmpeg"), dict) else {}
         return parse_timestamp(ffmpeg.get("finished_at"))
+
+    def _infer_run_ended_at(self, run: dict[str, Any]) -> datetime | None:
+        for key in ("completed_at", "failed_at", "stopped_at", "interrupted_at"):
+            parsed = parse_timestamp(run.get(key))
+            if parsed:
+                return parsed
+        stages = run.get("stages") if isinstance(run.get("stages"), dict) else {}
+        stage_times = [
+            parsed
+            for stage in stages.values()
+            if isinstance(stage, dict)
+            for parsed in (parse_timestamp(stage.get("finished_at") or stage.get("failed_at") or stage.get("updated_at")),)
+            if parsed is not None
+        ]
+        if stage_times:
+            return max(stage_times)
+        return parse_timestamp(run.get("archived_at"))
+
+    def _run_failure_reason(self, run: dict[str, Any]) -> str:
+        for key in ("failure_reason", "last_error", "error", "message"):
+            value = str(run.get(key) or "").strip()
+            if value:
+                return value
+        stages = run.get("stages") if isinstance(run.get("stages"), dict) else {}
+        for stage_key, stage_label in STAGES:
+            stage = stages.get(stage_key) if isinstance(stages.get(stage_key), dict) else {}
+            if str(stage.get("status") or "").casefold() != "failed":
+                continue
+            value = str(stage.get("error") or "").strip()
+            if value:
+                return f"{stage_label}: {value}"
+            message = str(stage.get("message") or "").strip()
+            if message and any(token in message.casefold() for token in ("error", "failed", "exception", "timed out", "unable")):
+                return f"{stage_label}: {message}"
+        return ""
 
     def _clip_events(self, videos: list[dict[str, Any]]) -> list[tuple[datetime, int]]:
         events: list[tuple[datetime, int]] = []
@@ -1234,8 +1307,6 @@ class ReadDashboardService:
         return sum(counters.values()) / len(counters)
 
     def _infer_video_status(self, video: dict[str, Any], attention_by_video: dict[str, Any]) -> str:
-        if self._attention_items(video, attention_by_video):
-            return "Needs Attention"
         status = str(video.get("status") or "").lower()
         if status == "completed":
             return "Completed"
@@ -1245,6 +1316,8 @@ class ReadDashboardService:
             return "Stopped"
         if status == "paused":
             return "Paused"
+        if self._attention_items(video, attention_by_video):
+            return "Needs Attention"
         stages = video.get("stages") if isinstance(video.get("stages"), dict) else {}
         if video.get("current_stage") or any(isinstance(stage, dict) and stage.get("status") == "running" for stage in stages.values()):
             return "Processing"

@@ -59,6 +59,12 @@ p { color: var(--muted); line-height: 1.55; }
 ::selection { color: #0a0a0a; background: #e5e5e5; }
 
 .app-shell { min-height: 100vh; background: var(--bg); }
+.desktop-drag-strip {
+  position: fixed; inset: 0 108px auto 0; z-index: 55; height: 30px;
+  -webkit-app-region: drag;
+}
+.app-shell a, .app-shell button, .app-shell input, .app-shell select, .app-shell textarea,
+.app-shell summary, .app-shell [role="button"], .app-shell [role="tab"] { -webkit-app-region: no-drag; }
 .side-rail {
   position: fixed; inset: 0 auto 0 0; z-index: 30;
   display: flex; width: var(--rail-wide); flex-direction: column;
@@ -81,8 +87,8 @@ p { color: var(--muted); line-height: 1.55; }
 .nav-item:hover { color: var(--text); background: #131313; }
 .nav-item.active { color: #fff; background: #1a1a1a; }
 .nav-item svg { flex: 0 0 auto; stroke-width: 1.75; }
-.secondary-nav { margin-top: 28px; padding-top: 24px; border-top: 1px solid var(--line); }
-.sidebar-tools { margin-top: auto; color: var(--subtle); }
+.secondary-nav { margin-top: auto; padding-top: 24px; border-top: 1px solid var(--line); }
+.sidebar-tools { margin-top: 8px; color: var(--subtle); }
 .sidebar-tools > summary { padding: 11px 13px; cursor: pointer; list-style: none; font-size: 13px; }
 .sidebar-tools > summary::-webkit-details-marker { display: none; }
 .sidebar-tools[open] > summary { color: var(--muted); }
@@ -94,13 +100,18 @@ p { color: var(--muted); line-height: 1.55; }
 .topbar {
   display: flex; min-height: 120px; max-width: var(--content-max); margin: 0 auto;
   align-items: flex-end; justify-content: space-between; gap: 24px;
-  padding: 32px 0 20px; border-bottom: 1px solid var(--line);
+  padding: 32px 110px 20px 0; border-bottom: 1px solid var(--line);
+  -webkit-app-region: drag;
 }
 .topbar h1 { margin: 0 0 7px; }
 .topbar p { margin: 0; font-size: 14px; }
-.topbar-actions { display: flex; align-items: center; gap: 8px; }
+.topbar-actions { display: flex; align-items: center; gap: 8px; -webkit-app-region: no-drag; }
 .queue-health-pill { display: none; }
-.window-controls { display: flex; gap: 2px; }
+.window-controls {
+  position: fixed; top: 0; right: 0; z-index: 70;
+  display: flex; gap: 0; height: 38px; padding: 2px 3px;
+  background: var(--bg); -webkit-app-region: no-drag;
+}
 .window-control-button, .icon-button, .toolbar-icon-button {
   display: inline-grid; width: 34px; height: 34px; place-items: center;
   border: 0; border-radius: 4px; background: transparent; color: var(--muted); cursor: pointer;
@@ -252,16 +263,22 @@ tbody tr[onClick] { cursor: pointer; }
 .run-attention { display: flex; align-items: center; gap: 8px; color: var(--muted); }
 .run-attention.warn { color: #d6b675; }
 .next-run-panel { scroll-margin-top: 20px; }
+.run-config-surface { overflow: hidden; border: 1px solid var(--line); border-radius: 5px; }
 .next-run-head { padding: 0 0 11px; }
-.run-form-rows { border: 1px solid var(--line); border-radius: 5px 5px 0 0; padding: 0 18px; }
+.run-form-rows { padding: 0 18px; }
 .run-form-row { display: grid; min-height: 58px; grid-template-columns: minmax(150px, .7fr) minmax(250px, 1fr) minmax(280px, 1.35fr); align-items: center; gap: 22px; border-bottom: 1px solid var(--line); }
 .run-form-row:last-child { border-bottom: 0; }
 .run-form-row > span { font-weight: 550; }
 .run-form-row small { color: var(--muted); line-height: 1.4; }
-.advanced-options { border: 1px solid var(--line); border-top: 0; border-radius: 0 0 5px 5px; }
+.advanced-options { border-top: 1px solid var(--line); }
 .advanced-options summary, .delivery-recovery-panel > summary, .delivery-advanced-options > summary, .review-rescore-panel > summary { padding: 14px 18px; cursor: pointer; color: #c7c7cc; }
 .advanced-options-body { display: flex; justify-content: space-between; padding: 0 18px 15px; color: var(--muted); }
-.next-run-action-row { display: flex; justify-content: flex-end; gap: 12px; padding-top: 16px; }
+.next-run-action-row {
+  display: flex; min-height: 74px; align-items: center; justify-content: flex-end; gap: 12px;
+  padding: 17px 18px; border-top: 1px solid var(--line);
+}
+.queue-pagination { display: flex; align-items: center; justify-content: space-between; gap: 16px; color: var(--muted); font-size: 13px; }
+.queue-pagination > div { display: flex; gap: 8px; }
 .pipeline-progress-panel { padding: 18px 22px; }
 .operation-stage-grid { display: grid; gap: 0; margin-top: 10px; }
 .operation-stage-card { position: relative; padding: 13px 0 13px 40px; border-top: 1px solid var(--line); }

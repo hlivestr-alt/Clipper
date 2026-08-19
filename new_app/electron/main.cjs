@@ -364,7 +364,7 @@ async function createMainWindow(runtime) {
   mainWindow.on("closed", () => {
     mainWindow = null;
   });
-  await mainWindow.loadURL(`http://${BACKEND_HOST}:${runtime.backendPort}/`);
+  await mainWindow.loadURL(`http://${BACKEND_HOST}:${runtime.backendPort}/?desktop=1`);
 }
 
 function stopBackend() {

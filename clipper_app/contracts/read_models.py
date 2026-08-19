@@ -33,6 +33,7 @@ class ReadEnvelope(StrictReadModel):
 
 class QueueRunRow(StrictReadModel):
     run_id: str = ""
+    attempt_number: int = Field(default=1, ge=1)
     video_name: str
     video_path: str | None = None
     status: str
@@ -88,6 +89,9 @@ class QueueDetail(StrictReadModel):
     stage_waiting: dict[str, int] = Field(default_factory=dict)
     waiting_videos: int = Field(default=0, ge=0)
     stage_admission_limit: int = Field(default=3, ge=1)
+    total: int = Field(default=0, ge=0)
+    limit: int = Field(default=100, ge=1)
+    offset: int = Field(default=0, ge=0)
     rows: tuple[QueueRunRow, ...] = ()
 
 
@@ -248,6 +252,7 @@ class OverviewSummary(StrictReadModel):
     revision: str
     queue_active: bool = False
     scored_count: int = Field(default=0, ge=0)
+    review_needed_count: int = Field(default=0, ge=0)
     average_score: float | None = Field(default=None, ge=0, le=10)
     export_ready_count: int = Field(default=0, ge=0)
     score_trend: tuple[OverviewScoreTrendPoint, ...] = ()

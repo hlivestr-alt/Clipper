@@ -72,7 +72,9 @@
 .variant-editor-tablist {
   position: sticky; top: 0; z-index: 10; display: flex; gap: 16px; overflow-x: auto;
   padding: 0 20px; border-bottom: 1px solid var(--line); background: var(--bg);
+  scrollbar-width: none;
 }
+.variant-editor-tablist::-webkit-scrollbar { display: none; }
 .variant-editor-tablist button {
   min-height: 48px; padding: 0; border: 0; border-bottom: 1px solid transparent;
   background: transparent; color: var(--muted); font-size: 13px; white-space: nowrap; cursor: pointer;
@@ -89,28 +91,36 @@
 .variant-tab-section-head p, .variant-context-line { margin: 0; color: var(--muted); font-size: 12px; }
 .variant-field-list { display: grid; }
 .variant-field {
-  display: grid; min-height: 58px; grid-template-columns: minmax(180px, 1fr) minmax(190px, .9fr);
+  display: grid; min-height: 58px; grid-template-columns: minmax(150px, 1fr) minmax(190px, 250px);
   align-items: center; gap: 20px; padding: 10px 0; border-top: 1px solid var(--line);
 }
 .variant-field:first-child { border-top: 0; }
 .variant-field-copy { display: grid; gap: 3px; }
 .variant-field-copy strong { font-weight: 550; }
 .variant-field-copy span, .variant-field > span, .variant-field small { color: var(--muted); font-size: 12px; line-height: 1.4; }
-.variant-field-control { display: flex; min-width: 0; align-items: center; justify-content: flex-end; gap: 8px; }
-.variant-field-control > input:not([type="checkbox"]), .variant-field-control > select { max-width: 250px; }
+.variant-field-control { display: flex; min-width: 0; align-items: center; justify-content: stretch; gap: 8px; }
+.variant-field-control > input:not([type="checkbox"]), .variant-field-control > select { width: 100%; max-width: 250px; }
 .variant-number-input { display: flex; align-items: center; gap: 7px; }
 .variant-number-input input { min-width: 0; }
 .variant-color-input { display: grid; grid-template-columns: 38px minmax(0, 1fr); gap: 8px; }
 .variant-color-input input[type="color"] { padding: 3px; }
-.variant-segmented, .variant-segmented-field { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; }
+.variant-segmented-field {
+  display: grid; min-height: 58px; width: 100%; grid-template-columns: minmax(150px, 1fr) minmax(190px, 250px);
+  align-items: center; gap: 20px; border-top: 1px solid var(--line);
+}
+.variant-segmented-field:first-child { border-top: 0; }
+.variant-segmented { display: flex; width: 100%; flex-wrap: wrap; justify-content: flex-start; gap: 4px; }
 .variant-segmented button {
   min-height: 34px; padding: 0 10px; border: 1px solid var(--line); border-radius: 4px;
   background: transparent; color: var(--muted); cursor: pointer;
 }
 .variant-segmented button:hover, .variant-segmented button[aria-pressed="true"], .variant-segmented button.selected { color: var(--text); background: var(--bg-soft); }
-.variant-toggle { display: flex; min-height: 58px; align-items: center; justify-content: space-between; gap: 20px; border-top: 1px solid var(--line); }
+.variant-toggle {
+  display: grid; min-height: 58px; grid-template-columns: minmax(150px, 1fr) minmax(190px, 250px);
+  align-items: center; gap: 20px; border-top: 1px solid var(--line);
+}
 .variant-toggle:first-child { border-top: 0; }
-.variant-toggle-control { position: relative; display: inline-flex; }
+.variant-toggle-control { position: relative; display: inline-flex; justify-self: end; }
 .variant-toggle-control input { position: absolute; opacity: 0; pointer-events: none; }
 .variant-toggle-control span { display: block; width: 34px; height: 19px; border: 1px solid #424242; border-radius: 99px; background: #161616; }
 .variant-toggle-control span::after { content: ""; display: block; width: 13px; height: 13px; margin: 2px; border-radius: 50%; background: #8b8b8b; transition: transform 120ms ease, background 120ms ease; }
@@ -204,6 +214,8 @@
   .variant-navigator-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .variant-field { grid-template-columns: 1fr; gap: 7px; }
   .variant-field-control { justify-content: flex-start; }
+  .variant-toggle { grid-template-columns: 1fr auto; }
+  .variant-segmented-field { grid-template-columns: 1fr; gap: 7px; padding-block: 10px; }
   .variant-summary-grid, .variant-dynamic-role-grid, .diagnostic-summary-grid, .diagnostic-product-grid, .diagnostic-inventory-grid { grid-template-columns: 1fr; }
 }
 
