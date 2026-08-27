@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -98,6 +100,133 @@ class ModularScannerExecutionTests(unittest.TestCase):
         self.assertTrue(reused)
         self.assertEqual(cached["scan_id"], scan["scan_id"])
         self.assertEqual(analyzer.calls, 1)
+
+    def test_short_candidates_compose_without_short_rejections_and_keep_diagnostics(self) -> None:
+        analyzer = FakeAnalyzer([[
+            self.candidate(0.0, 7.0, confidence=0.8),
+            self.candidate(9.0, 17.0, confidence=0.6),
+        ]])
+        service = self.service(analyzer, production_active=lambda: False)
+        scan, _ = service.start_scan(self.source["source_id"], rescan=True)
+        service.run_scan(scan["scan_id"])
+        completed = service.get_scan(scan["scan_id"])
+        self.assertEqual(completed["accepted_count"], 1)
+        self.assertEqual(completed["rejected_count"], 0)
+        with closing(sqlite3.connect(self.repository.path)) as db:
+            statuses = db.execute(
+                "SELECT reason_code FROM scan_rejections WHERE scan_id=? ORDER BY rejection_id",
+                (scan["scan_id"],),
+            ).fetchall()
+            raw_diagnostics = db.execute(
+                "SELECT validation_diagnostics_json FROM segments WHERE scan_id=?",
+                (scan["scan_id"],),
+            ).fetchone()[0]
+        self.assertEqual(statuses, [("composed_into_segment",), ("composed_into_segment",)])
+        composition = json.loads(raw_diagnostics)["composition"]
+        self.assertEqual([item["ordinal"] for item in composition["source_candidates"]], [0, 1])
+
+    def test_real_july_cleanser_cta_pair_has_no_short_rejections(self) -> None:
+        value = {
+            "segments": [
+                {"start": 220.0, "end": 225.0, "text": "sekarang facial cleanser"},
+                {"start": 229.145, "end": 232.119, "text": "lagi ada diskon dan promo"},
+                {"start": 233.023, "end": 235.533, "text": "harga turun jadi Rp89.000"},
+                {"start": 238.402, "end": 245.640, "text": "cek etalase nomor 1 facial cleanser dan checkout"},
+            ],
+        }
+        window = {
+            "index": 0, "start": 220.0, "end": 245.640,
+            "ownership_start": 220.0, "ownership_end": 245.640,
+            "text": "authoritative July regression window", "segments": value["segments"],
+        }
+        responses = [[
+            {
+                "start_seconds": 229.145, "end_seconds": 235.533, "product": "cleanser", "role": "cta",
+                "confidence": 0.90, "reason": "Promotional price",
+            },
+            {
+                "start_seconds": 238.402, "end_seconds": 245.640, "product": "cleanser", "role": "cta",
+                "confidence": 0.95, "reason": "Check etalase",
+            },
+        ]]
+        self.source = self.repository.upsert_source({**self.source, "duration_seconds": 300.0})
+        scan = self.repository.create_scan(
+            self.source["source_id"], "rescan", ANALYZER_VERSION, PROMPT_VERSION, "exact/model",
+        )
+        self.repository.update_scan(scan["scan_id"], "queued", transcript_id=self.transcript_record["transcript_id"])
+        service = self.service(FakeAnalyzer(responses), production_active=lambda: False)
+        with mock.patch("clipper_app.modular_scanner.service.load_transcript", return_value=value), mock.patch(
+            "clipper_app.modular_scanner.service.build_windows", return_value=[window],
+        ):
+            service.run_scan(scan["scan_id"])
+        completed = service.get_scan(scan["scan_id"])
+        self.assertEqual((completed["accepted_count"], completed["rejected_count"]), (1, 0))
+        with closing(sqlite3.connect(self.repository.path)) as db:
+            codes = db.execute(
+                "SELECT reason_code FROM scan_rejections WHERE scan_id=? ORDER BY rejection_id",
+                (scan["scan_id"],),
+            ).fetchall()
+            segment = db.execute(
+                "SELECT start_seconds,end_seconds,duration_seconds FROM segments WHERE scan_id=?",
+                (scan["scan_id"],),
+            ).fetchone()
+        self.assertEqual(codes, [("composed_into_segment",), ("composed_into_segment",)])
+        self.assertEqual(segment, (229.145, 245.64, 16.495))
+
+    def test_cross_window_generic_product_conflict_precedes_ownership(self) -> None:
+        value = {
+            "segments": [
+                {"start": 860.746, "end": 870.0, "text": "harga lagi turun"},
+                {"start": 870.0, "end": 882.890, "text": "checkout sekarang sebelum harganya berubah"},
+            ],
+        }
+        windows = [
+            {
+                "index": 0, "start": 850.0, "end": 900.0,
+                "ownership_start": 850.0, "ownership_end": 880.0,
+                "text": "window zero", "segments": value["segments"],
+            },
+            {
+                "index": 1, "start": 850.0, "end": 900.0,
+                "ownership_start": 880.0, "ownership_end": 900.0,
+                "text": "window one", "segments": value["segments"],
+            },
+        ]
+        responses = [
+            [
+                {
+                    "start_seconds": 865.917, "end_seconds": 872.305, "product": "serum", "role": "cta",
+                    "confidence": 0.90, "reason": "Price reduction",
+                },
+                {
+                    "start_seconds": 875.174, "end_seconds": 882.890, "product": "serum", "role": "cta",
+                    "confidence": 0.95, "reason": "Checkout urgency",
+                },
+            ],
+            [{
+                "start_seconds": 860.746, "end_seconds": 878.830, "product": "skin_cream", "role": "cta",
+                "confidence": 0.85, "reason": "Price and checkout",
+            }],
+        ]
+        self.source = self.repository.upsert_source({**self.source, "duration_seconds": 1000.0})
+        scan = self.repository.create_scan(
+            self.source["source_id"], "rescan", ANALYZER_VERSION, PROMPT_VERSION, "exact/model",
+        )
+        self.repository.update_scan(scan["scan_id"], "queued", transcript_id=self.transcript_record["transcript_id"])
+        service = self.service(FakeAnalyzer(responses), production_active=lambda: False)
+        with mock.patch("clipper_app.modular_scanner.service.load_transcript", return_value=value), mock.patch(
+            "clipper_app.modular_scanner.service.build_windows", return_value=windows,
+        ):
+            service.run_scan(scan["scan_id"])
+        completed = service.get_scan(scan["scan_id"])
+        self.assertEqual(completed["accepted_count"], 0)
+        with closing(sqlite3.connect(self.repository.path)) as db:
+            codes = [row[0] for row in db.execute(
+                "SELECT reason_code FROM scan_rejections WHERE scan_id=? ORDER BY rejection_id",
+                (scan["scan_id"],),
+            )]
+        self.assertIn("cross_window_product_conflict", codes)
+        self.assertNotIn("overlap_ownership", codes)
 
     def test_rescan_preserves_old_current_until_new_success(self) -> None:
         analyzer = FakeAnalyzer([[self.candidate()], [self.candidate(confidence=0.9)]])

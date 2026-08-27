@@ -15,6 +15,17 @@
 .status-waiting_for_production { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 35%, transparent); }
 .modscan-actions { display: flex; gap: 10px; }
 .modscan-actions button, .modscan-preview-controls button { display: inline-flex; align-items: center; gap: 7px; }
+.modscan-batch-button { margin-left: auto; border-style: dashed; }
+.modscan-batch-confirm, .modscan-batch-progress { border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--line)); border-radius: 12px; padding: 15px; background: color-mix(in srgb, var(--accent) 6%, var(--panel)); display: grid; gap: 12px; }
+.modscan-batch-confirm h3, .modscan-batch-confirm p, .modscan-batch-progress p { margin: 0; }
+.modscan-batch-confirm dl, .modscan-batch-progress dl { margin: 0; display: grid; grid-template-columns: repeat(4, minmax(110px, 1fr)); gap: 8px; }
+.modscan-batch-confirm dl div, .modscan-batch-progress dl div { border: 1px solid var(--line); border-radius: 9px; padding: 9px; display: grid; gap: 3px; }
+.modscan-batch-confirm dt, .modscan-batch-progress dt { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+.modscan-batch-confirm dd, .modscan-batch-progress dd { margin: 0; font-size: 18px; font-weight: 700; }
+.modscan-batch-confirm-actions, .modscan-batch-progress-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.modscan-batch-confirm-actions { justify-content: flex-end; }
+.modscan-batch-progress-heading span { color: var(--muted); text-transform: capitalize; }
+.modscan-batch-notice { margin: 0; color: var(--good); }
 .modscan-progress { display: grid; gap: 7px; }
 .modscan-progress > div { display: flex; justify-content: space-between; color: var(--muted); text-transform: capitalize; }
 .modscan-progress progress { width: 100%; accent-color: var(--accent); }
@@ -48,5 +59,8 @@
   .modscan-source-fields { align-items: stretch; flex-direction: column; }
   .modscan-source-fields label { min-width: 0; }
   .modscan-source-meta { justify-content: flex-start; }
+  .modscan-actions { flex-wrap: wrap; }
+  .modscan-batch-button { width: 100%; margin-left: 0; justify-content: center; }
+  .modscan-batch-confirm dl, .modscan-batch-progress dl { grid-template-columns: repeat(2, 1fr); }
   .modscan-filters { grid-template-columns: 1fr; }
 }

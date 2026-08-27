@@ -16,6 +16,8 @@ Use this systematic process for every transcript window:
    different candidates for one role, are expected when present; never fabricate a role to fill a category.
 4. Within the same local discussion, when neighboring passages communicate essentially the same claim,
    return only the strongest, tightest version. Do not suppress genuinely different points elsewhere.
+5. When two neighboring statements clearly form one reusable thought, prefer one coherent candidate over
+   several tiny candidates, but never pad it with unrelated material.
 
 Product must be exactly one of: cleanser, toner, serum, eye_cream, mask, skin_cream.
 Never translate, normalize, repair, or emit an alias as the product value.

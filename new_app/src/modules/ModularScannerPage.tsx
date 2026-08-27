@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Library, Play, RefreshCw, RotateCcw, Search, Video } from "lucide-react";
+import { Library, ListChecks, Play, RefreshCw, RotateCcw, Search, Video } from "lucide-react";
 
-import { query, sendJson } from "../api";
+import { getJson, query, sendJson } from "../api";
 import { useApiQuery } from "../useApiQuery";
 import "./modularScanner.css";
 
@@ -48,6 +48,38 @@ type SourcesPayload = { sources: ModularSource[] };
 type HistoryPayload = { scans: ModularScan[] };
 type SegmentsPayload = { segments: ModularSegment[] };
 type ScanPayload = { scan: ModularScan; reused: boolean };
+type BatchPreview = {
+  total_eligible: number;
+  already_current: number;
+  already_active: number;
+  would_queue: number;
+  needs_check: number;
+  will_evaluate: number;
+};
+type BatchStatus = {
+  batch_id: string;
+  status: string;
+  total_eligible: number;
+  discovered: number;
+  checked: number;
+  checking: number;
+  already_current: number;
+  already_active: number;
+  queued: number;
+  completed: number;
+  failed: number;
+  remaining: number;
+  currently_running?: { source_id: string; filename: string; status: string } | null;
+};
+type BatchStartPayload = {
+  launched: boolean;
+  reused?: boolean;
+  batch: BatchStatus | null;
+  total_eligible?: number;
+  already_current?: number;
+  already_active?: number;
+  would_queue?: number;
+};
 
 const products = ["cleanser", "toner", "serum", "eye_cream", "mask", "skin_cream"];
 const roles = ["hook", "benefits", "ingredients", "cta"];
@@ -106,6 +138,18 @@ export function ModularScannerPage() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [actionError, setActionError] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [batchPreview, setBatchPreview] = useState<BatchPreview | null>(null);
+  const [batchSubmitting, setBatchSubmitting] = useState(false);
+  const [batchId, setBatchId] = useState("");
+  const [batchSnapshot, setBatchSnapshot] = useState<BatchStatus | null>(null);
+  const [batchNotice, setBatchNotice] = useState("");
+  const batchQuery = useApiQuery<{ batch: BatchStatus }>(
+    batchId ? `/api/modular-scanner/batches/${batchId}` : "",
+    (data) => ["preparing", "running"].includes(data?.batch.status ?? "") ? 1_500 : false,
+    Boolean(batchId)
+  );
+  const batchStatus = batchQuery.envelope?.data.batch ?? batchSnapshot;
+  const batchActive = Boolean(batchStatus && ["preparing", "running"].includes(batchStatus.status));
 
   useEffect(() => {
     if (!sourceId && sources.length) setSourceId(sources[0].source_id);
@@ -124,6 +168,14 @@ export function ModularScannerPage() {
       segmentsQuery.refresh();
     }
   }, [watchedScan.envelope?.data.scan.status]);
+
+  useEffect(() => {
+    if (batchStatus && ["completed", "completed_with_failures", "failed"].includes(batchStatus.status)) {
+      sourcesQuery.refresh();
+      history.refresh();
+      segmentsQuery.refresh();
+    }
+  }, [batchStatus?.status]);
 
   useEffect(() => {
     if (!preview || !videoRef.current) return;
@@ -157,6 +209,41 @@ export function ModularScannerPage() {
       setActionError(error instanceof Error ? error.message : String(error));
     } finally {
       setSubmitting(false);
+    }
+  }
+
+  async function previewBatch() {
+    setBatchSubmitting(true);
+    setActionError("");
+    setBatchNotice("");
+    try {
+      const result = await getJson<BatchPreview>("/api/modular-scanner/batch-scan-preview");
+      setBatchPreview(result.data);
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBatchSubmitting(false);
+    }
+  }
+
+  async function launchBatch() {
+    setBatchSubmitting(true);
+    setActionError("");
+    try {
+      const result = await sendJson<BatchStartPayload>("POST", "/api/modular-scanner/batches");
+      setBatchPreview(null);
+      if (!result.data.launched || !result.data.batch) {
+        setBatchNotice("All eligible VODs already have compatible scans.");
+        return;
+      }
+      setBatchSnapshot(result.data.batch);
+      setBatchId(result.data.batch.batch_id);
+      setBatchNotice(result.data.reused ? "Continuing the active batch." : "Preparing batch...");
+      sourcesQuery.refresh();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBatchSubmitting(false);
     }
   }
 
@@ -207,7 +294,55 @@ export function ModularScannerPage() {
           <button className="secondary-button" disabled={!sourceId || busy || !selectedSource?.current_scan} onClick={() => void start(true)}>
             <RotateCcw size={16} /> Rescan
           </button>
+          <button className="secondary-button modscan-batch-button" disabled={batchSubmitting || batchActive} onClick={() => void previewBatch()}>
+            <ListChecks size={16} /> Scan All Unscanned VODs
+          </button>
         </div>
+        {batchPreview && (
+          <div className="modscan-batch-confirm" role="dialog" aria-label="Batch scan confirmation">
+            <div>
+              <h3>Scan All Unscanned VODs</h3>
+              <p>{batchPreview.total_eligible} VODs found</p>
+            </div>
+            <dl>
+              <div><dt>Already current</dt><dd>{batchPreview.already_current}</dd></div>
+              <div><dt>Already active</dt><dd>{batchPreview.already_active}</dd></div>
+              <div><dt>Will be queued</dt><dd>{batchPreview.would_queue}</dd></div>
+              <div><dt>Needs evaluation</dt><dd>{batchPreview.needs_check}</dd></div>
+            </dl>
+            {batchPreview.will_evaluate === 0 && <p>All eligible VODs already have compatible scans.</p>}
+            <div className="modscan-batch-confirm-actions">
+              <button className="secondary-button" onClick={() => setBatchPreview(null)}>
+                {batchPreview.will_evaluate ? "Cancel" : "Close"}
+              </button>
+              {batchPreview.will_evaluate > 0 && (
+                <button className="primary-button" disabled={batchSubmitting} onClick={() => void launchBatch()}>
+                  Evaluate {batchPreview.will_evaluate} VODs
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+        {batchStatus && (
+          <div className="modscan-batch-progress" aria-label="Batch scan progress">
+            <div className="modscan-batch-progress-heading"><strong>Batch Scan</strong><span>{formatStatus(batchStatus.status)}</span></div>
+            <dl>
+              <div><dt>Total</dt><dd>{batchStatus.total_eligible}</dd></div>
+              <div><dt>Discovered</dt><dd>{batchStatus.discovered}</dd></div>
+              <div><dt>Checked</dt><dd>{batchStatus.checked}</dd></div>
+              <div><dt>Checking</dt><dd>{batchStatus.checking}</dd></div>
+              <div><dt>Already current</dt><dd>{batchStatus.already_current}</dd></div>
+              <div><dt>Already active</dt><dd>{batchStatus.already_active}</dd></div>
+              <div><dt>Queued</dt><dd>{batchStatus.queued}</dd></div>
+              <div><dt>Completed</dt><dd>{batchStatus.completed}</dd></div>
+              <div><dt>Failed</dt><dd>{batchStatus.failed}</dd></div>
+              <div><dt>Remaining</dt><dd>{batchStatus.remaining}</dd></div>
+            </dl>
+            {batchStatus.currently_running && (
+              <p>Currently {formatStatus(batchStatus.currently_running.status)}: <strong>{batchStatus.currently_running.filename}</strong></p>
+            )}
+          </div>
+        )}
         {displayedStatus && (
           <div className="modscan-progress" aria-label="Scan progress">
             <div><span>{formatStatus(displayedStatus.status)}</span><span>{displayedStatus.progress_current}/{displayedStatus.progress_total || "–"} windows</span></div>
@@ -216,6 +351,7 @@ export function ModularScannerPage() {
           </div>
         )}
         {actionError && <p className="error-text">{actionError}</p>}
+        {batchNotice && <p className="modscan-batch-notice">{batchNotice}</p>}
       </article>
 
       <div className="modscan-workspace-grid">

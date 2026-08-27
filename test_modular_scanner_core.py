@@ -102,7 +102,7 @@ class ModularScannerCoreTests(unittest.TestCase):
         self.assertIsNotNone(validate_candidate(base, window, 30.0)[0])
         self.assertEqual(validate_candidate({**base, "start_seconds": 9.0}, window, 30.0)[1].code, "window_bounds")
         self.assertEqual(validate_candidate({**base, "end_seconds": 31.0}, window, 30.0)[1].code, "source_bounds")
-        self.assertEqual(validate_candidate({**base, "product": "serum"}, window, 30.0)[1].code, "product_not_supported")
+        self.assertEqual(validate_candidate({**base, "product": "serum"}, window, 30.0)[1].code, "conflicting_product")
         conflict_window = window_for(transcript((0, 20, "toner dan serum tersedia")))
         self.assertEqual(validate_candidate({**base, "start_seconds": 0.0, "end_seconds": 20.0}, conflict_window, 20.0)[1].code, "conflicting_product")
 

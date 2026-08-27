@@ -113,5 +113,77 @@ describe("ModularScannerPage", () => {
     expect(media.currentTime).toBe(5);
     expect(HTMLMediaElement.prototype.play).toHaveBeenCalled();
   });
+
+  it("previews counts, confirms the queue, and polls compact batch progress", async () => {
+    const batch = {
+      batch_id: "batch-1", status: "running", total_eligible: 5, discovered: 5, checked: 5, checking: 0,
+      already_current: 2, already_active: 1, queued: 2, completed: 1,
+      failed: 0, remaining: 1,
+      currently_running: { source_id: "source-1", filename: "one.mp4", status: "analyzing" }
+    };
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.includes("batch-scan-preview")) {
+        return jsonResponse({
+          total_eligible: 5, already_current: 2, already_active: 1,
+          would_queue: 2, needs_check: 0, will_evaluate: 2
+        });
+      }
+      if (path.endsWith("/api/modular-scanner/batches") && init?.method === "POST") {
+        return jsonResponse({
+          launched: true, reused: false,
+          batch: { ...batch, status: "preparing", total_eligible: 0, discovered: 0, checked: 0, queued: 0, remaining: 0 }
+        });
+      }
+      if (path.includes("/batches/batch-1")) return jsonResponse({ batch });
+      if (path.includes("/sources")) return jsonResponse({ sources: [{
+        source_id: "source-1", filename: "one.mp4", file_size: 100, mtime_ns: 1,
+        duration_seconds: 40, current_scan: currentScan, active_scan: null
+      }] });
+      if (path.includes("/scans?")) return jsonResponse({ scans: [currentScan] });
+      if (path.includes("/segments?")) return jsonResponse({ segments: [segment] });
+      return jsonResponse({});
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: /scan all unscanned vods/i }));
+    const dialog = await screen.findByRole("dialog", { name: "Batch scan confirmation" });
+    expect(dialog.textContent).toContain("5 VODs found");
+    expect(dialog.textContent).toContain("Already current2");
+    expect(dialog.textContent).toContain("Already active1");
+    fireEvent.click(screen.getByRole("button", { name: "Evaluate 2 VODs" }));
+    expect(await screen.findByText("Preparing batch...")).toBeTruthy();
+    const progress = screen.getByLabelText("Batch scan progress");
+    await waitFor(() => expect(progress.textContent).toContain("Remaining1"));
+    expect(progress.textContent).toContain("Completed1");
+    expect(progress.textContent).toContain("one.mp4");
+  });
+
+  it("shows the all-current state without launching a batch", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL, _init?: RequestInit) => {
+      const path = String(input);
+      if (path.includes("batch-scan-preview")) {
+        return jsonResponse({
+          total_eligible: 3, already_current: 3, already_active: 0,
+          would_queue: 0, needs_check: 0, will_evaluate: 0
+        });
+      }
+      if (path.includes("/sources")) return jsonResponse({ sources: [{
+        source_id: "source-1", filename: "one.mp4", file_size: 100, mtime_ns: 1,
+        duration_seconds: 40, current_scan: currentScan, active_scan: null
+      }] });
+      if (path.includes("/scans?")) return jsonResponse({ scans: [currentScan] });
+      if (path.includes("/segments?")) return jsonResponse({ segments: [segment] });
+      return jsonResponse({});
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: /scan all unscanned vods/i }));
+    expect(await screen.findByText("All eligible VODs already have compatible scans.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /evaluate \d+ vods/i })).toBeNull();
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(0);
+    expect(screen.getByRole("button", { name: /scan vod/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^rescan$/i })).toBeTruthy();
+  });
 });
 // @vitest-environment jsdom

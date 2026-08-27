@@ -588,6 +588,27 @@ def create_app(
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         return _envelope(ReadServiceResult({"scan": scan, "reused": False}))
 
+    @api.get("/api/modular-scanner/batch-scan-preview")
+    def modular_batch_scan_preview() -> dict[str, Any]:
+        try:
+            return _envelope(ReadServiceResult(modular_scanner.batch_preview()))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @api.post("/api/modular-scanner/batches", status_code=202)
+    def modular_start_batch() -> dict[str, Any]:
+        try:
+            return _envelope(ReadServiceResult(modular_scanner.start_batch()))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @api.get("/api/modular-scanner/batches/{batch_id}")
+    def modular_batch_status(batch_id: str) -> dict[str, Any]:
+        try:
+            return _envelope(ReadServiceResult({"batch": modular_scanner.batch_status(batch_id)}))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     @api.get("/api/modular-scanner/scans/{scan_id}")
     def modular_scan(scan_id: str) -> dict[str, Any]:
         try:

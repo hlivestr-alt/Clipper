@@ -86,6 +86,8 @@ class ModularScannerApiTests(unittest.TestCase):
         self.assertEqual(self.public.get("/api/modular-scanner/sources").status_code, 401)
         self.assertEqual(self.public.get(f"/api/modular-scanner/media/{self.source['source_id']}").status_code, 401)
         self.assertEqual(self.public.post("/api/modular-scanner/scans", json={"source_id": self.source["source_id"]}).status_code, 401)
+        self.assertEqual(self.public.get("/api/modular-scanner/batch-scan-preview").status_code, 401)
+        self.assertEqual(self.public.post("/api/modular-scanner/batches").status_code, 401)
 
     def test_source_listing_is_opaque_and_selection_does_not_scan(self) -> None:
         response = self.client.get("/api/modular-scanner/sources")
@@ -102,6 +104,35 @@ class ModularScannerApiTests(unittest.TestCase):
         response = self.client.post("/api/modular-scanner/scans", json={"source_id": self.source["source_id"]})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["data"]["scan"]["status"], "queued")
+
+    def test_batch_preview_launch_and_status_use_opaque_summaries(self) -> None:
+        preview = self.client.get("/api/modular-scanner/batch-scan-preview")
+        self.assertEqual(preview.status_code, 200)
+        self.assertEqual(preview.json()["data"]["would_queue"], 1)
+        self.assertNotIn(str(self.vods), preview.text)
+
+        launched = self.client.post("/api/modular-scanner/batches")
+        self.assertEqual(launched.status_code, 202)
+        payload = launched.json()["data"]
+        self.assertTrue(payload["launched"])
+        self.assertEqual(payload["batch"]["status"], "preparing")
+        self.assertEqual(payload["batch"]["queued"], 0)
+        status = self.client.get(f"/api/modular-scanner/batches/{payload['batch']['batch_id']}")
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.json()["data"]["batch"]["status"], "preparing")
+        self.assertEqual(self.client.get("/api/modular-scanner/batches/missing").status_code, 404)
+
+    def test_batch_launch_returns_202_without_source_hashing_or_ffprobe(self) -> None:
+        with mock.patch(
+            "clipper_app.modular_scanner.service.source_record",
+            side_effect=AssertionError("source preparation ran in request"),
+        ), mock.patch(
+            "clipper_app.modular_scanner.media.probe_duration",
+            side_effect=AssertionError("ffprobe ran in request"),
+        ):
+            response = self.client.post("/api/modular-scanner/batches")
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["data"]["batch"]["status"], "preparing")
 
     def test_media_supports_http_range_and_head(self) -> None:
         url = f"/api/modular-scanner/media/{self.source['source_id']}"

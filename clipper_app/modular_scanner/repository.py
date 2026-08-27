@@ -9,7 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
+TRANSCRIPT_RECORD_SCHEMA_VERSION = 3
 
 
 def utc_now() -> str:
@@ -140,6 +141,34 @@ class ScannerRepository:
                     candidate_json TEXT,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS scan_batches (
+                    batch_id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    status TEXT NOT NULL DEFAULT 'preparing',
+                    discovered_count INTEGER NOT NULL DEFAULT 0,
+                    error TEXT
+                );
+                CREATE TABLE IF NOT EXISTS scan_batch_items (
+                    batch_id TEXT NOT NULL REFERENCES scan_batches(batch_id) ON DELETE CASCADE,
+                    source_id TEXT NOT NULL REFERENCES media_sources(source_id),
+                    scan_id TEXT REFERENCES scans(scan_id),
+                    disposition TEXT NOT NULL CHECK(disposition IN (
+                        'queued', 'already_current', 'already_active', 'failed_to_queue'
+                    )),
+                    detail TEXT,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(batch_id, source_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_scan_batch_items_scan ON scan_batch_items(scan_id);
+                CREATE TABLE IF NOT EXISTS scan_batch_failures (
+                    batch_id TEXT NOT NULL REFERENCES scan_batches(batch_id) ON DELETE CASCADE,
+                    item_key TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(batch_id, item_key)
+                );
                 CREATE INDEX IF NOT EXISTS idx_scans_source ON scans(source_id, generation DESC);
                 INSERT INTO schema_meta(version)
                 SELECT {SCHEMA_VERSION} WHERE NOT EXISTS (SELECT 1 FROM schema_meta);
@@ -150,10 +179,25 @@ class ScannerRepository:
                 db.rollback()
                 raise
             row = db.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
-            if row is not None and int(row[0]) == 1:
-                columns = {item[1] for item in db.execute("PRAGMA table_info(segments)").fetchall()}
-                if "validation_diagnostics_json" not in columns:
-                    db.execute("ALTER TABLE segments ADD COLUMN validation_diagnostics_json TEXT NOT NULL DEFAULT '{}'")
+            if row is not None and int(row[0]) in {1, 2, 3}:
+                if int(row[0]) == 1:
+                    columns = {item[1] for item in db.execute("PRAGMA table_info(segments)").fetchall()}
+                    if "validation_diagnostics_json" not in columns:
+                        db.execute("ALTER TABLE segments ADD COLUMN validation_diagnostics_json TEXT NOT NULL DEFAULT '{}'")
+                if int(row[0]) <= 3:
+                    batch_columns = {item[1] for item in db.execute("PRAGMA table_info(scan_batches)").fetchall()}
+                    if "status" not in batch_columns:
+                        db.execute("ALTER TABLE scan_batches ADD COLUMN status TEXT NOT NULL DEFAULT 'preparing'")
+                    if "discovered_count" not in batch_columns:
+                        db.execute("ALTER TABLE scan_batches ADD COLUMN discovered_count INTEGER NOT NULL DEFAULT 0")
+                    if "error" not in batch_columns:
+                        db.execute("ALTER TABLE scan_batches ADD COLUMN error TEXT")
+                    db.execute(
+                        """UPDATE scan_batches SET
+                        status=CASE WHEN completed_at IS NULL THEN 'running' ELSE 'completed' END,
+                        discovered_count=(SELECT COUNT(*) FROM scan_batch_items i WHERE i.batch_id=scan_batches.batch_id)
+                        """
+                    )
                 db.execute("UPDATE schema_meta SET version=?", (SCHEMA_VERSION,))
                 db.commit()
                 row = db.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
@@ -189,6 +233,16 @@ class ScannerRepository:
         with closing(self.connect()) as db:
             return self._dict(db.execute("SELECT * FROM media_sources WHERE source_id=?", (source_id,)).fetchone())
 
+    def source_by_metadata(self, canonical_path: str, file_size: int, mtime_ns: int) -> dict[str, Any] | None:
+        with closing(self.connect()) as db:
+            row = db.execute(
+                """SELECT * FROM media_sources
+                WHERE canonical_path=? AND file_size=? AND mtime_ns=?
+                ORDER BY last_seen_at DESC LIMIT 1""",
+                (canonical_path, file_size, mtime_ns),
+            ).fetchone()
+        return self._dict(row)
+
     def add_transcript(self, source_id: str, origin: str, cache_path: str, fingerprint: str) -> dict[str, Any]:
         transcript_id = uuid.uuid4().hex
         now = utc_now()
@@ -198,11 +252,14 @@ class ScannerRepository:
                     transcript_id, source_id, origin, cache_path, transcript_fingerprint,
                     schema_version, status, created_at, completed_at
                 ) VALUES (?, ?, ?, ?, ?, ?, 'completed', ?, ?)""",
-                (transcript_id, source_id, origin, cache_path, fingerprint, SCHEMA_VERSION, now, now),
+                (
+                    transcript_id, source_id, origin, cache_path, fingerprint,
+                    TRANSCRIPT_RECORD_SCHEMA_VERSION, now, now,
+                ),
             )
             row = db.execute(
                 "SELECT * FROM transcripts WHERE source_id=? AND transcript_fingerprint=? AND schema_version=?",
-                (source_id, fingerprint, SCHEMA_VERSION),
+                (source_id, fingerprint, TRANSCRIPT_RECORD_SCHEMA_VERSION),
             ).fetchone()
         return dict(row)
 
@@ -348,6 +405,121 @@ class ScannerRepository:
                 """INSERT INTO scan_rejections(scan_id, chunk_index, reason_code, detail, candidate_json, created_at)
                 VALUES (?, ?, ?, ?, ?, ?)""",
                 (scan_id, chunk_index, reason_code, detail[:500], json.dumps(candidate, ensure_ascii=False)[:4000], utc_now()),
+            )
+
+    def create_batch(self, items: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        batch_id = uuid.uuid4().hex
+        now = utc_now()
+        with self.transaction() as db:
+            db.execute(
+                "INSERT INTO scan_batches(batch_id, created_at, status) VALUES (?, ?, 'preparing')",
+                (batch_id, now),
+            )
+            for item in items or []:
+                db.execute(
+                    """INSERT INTO scan_batch_items(
+                        batch_id, source_id, scan_id, disposition, detail, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        batch_id, item["source_id"], item.get("scan_id"), item["disposition"],
+                        str(item.get("detail") or "")[:500] or None, now,
+                    ),
+                )
+        return self.get_batch(batch_id) or {"batch_id": batch_id, "created_at": now, "completed_at": None}
+
+    def active_batch(self) -> dict[str, Any] | None:
+        with closing(self.connect()) as db:
+            row = db.execute(
+                """SELECT * FROM scan_batches
+                WHERE status IN ('preparing', 'running')
+                ORDER BY created_at DESC LIMIT 1"""
+            ).fetchone()
+        return self._dict(row)
+
+    def pending_batches(self) -> list[dict[str, Any]]:
+        with closing(self.connect()) as db:
+            rows = db.execute(
+                "SELECT * FROM scan_batches WHERE status='preparing' ORDER BY created_at"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_batch(self, batch_id: str) -> dict[str, Any] | None:
+        with closing(self.connect()) as db:
+            row = db.execute("SELECT * FROM scan_batches WHERE batch_id=?", (batch_id,)).fetchone()
+        return self._dict(row)
+
+    def batch_items(self, batch_id: str) -> list[dict[str, Any]]:
+        with closing(self.connect()) as db:
+            rows = db.execute(
+                """SELECT i.*, m.filename, s.status AS scan_status, s.error AS scan_error
+                FROM scan_batch_items i
+                JOIN media_sources m ON m.source_id=i.source_id
+                LEFT JOIN scans s ON s.scan_id=i.scan_id
+                WHERE i.batch_id=? ORDER BY m.filename COLLATE NOCASE, i.source_id""",
+                (batch_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def add_batch_item(self, batch_id: str, item: dict[str, Any]) -> None:
+        with self.transaction() as db:
+            db.execute(
+                """INSERT INTO scan_batch_items(
+                    batch_id, source_id, scan_id, disposition, detail, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(batch_id, source_id) DO UPDATE SET
+                    scan_id=excluded.scan_id,
+                    disposition=excluded.disposition,
+                    detail=excluded.detail""",
+                (
+                    batch_id, item["source_id"], item.get("scan_id"), item["disposition"],
+                    str(item.get("detail") or "")[:500] or None, utc_now(),
+                ),
+            )
+
+    def add_batch_failure(self, batch_id: str, item_key: str, filename: str, detail: str) -> None:
+        with self.transaction() as db:
+            db.execute(
+                """INSERT INTO scan_batch_failures(batch_id, item_key, filename, detail, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(batch_id, item_key) DO UPDATE SET detail=excluded.detail""",
+                (batch_id, item_key, filename, detail[:500], utc_now()),
+            )
+
+    def batch_failures(self, batch_id: str) -> list[dict[str, Any]]:
+        with closing(self.connect()) as db:
+            rows = db.execute(
+                "SELECT * FROM scan_batch_failures WHERE batch_id=? ORDER BY filename COLLATE NOCASE, item_key",
+                (batch_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def batch_prepared_paths(self, batch_id: str) -> set[str]:
+        with closing(self.connect()) as db:
+            rows = db.execute(
+                """SELECT m.canonical_path AS item_key
+                FROM scan_batch_items i JOIN media_sources m ON m.source_id=i.source_id
+                WHERE i.batch_id=?
+                UNION SELECT item_key FROM scan_batch_failures WHERE batch_id=?""",
+                (batch_id, batch_id),
+            ).fetchall()
+        return {str(row["item_key"]).casefold() for row in rows}
+
+    def update_batch(self, batch_id: str, status: str, **fields: Any) -> None:
+        allowed = {"discovered_count", "error", "completed_at"}
+        values = {key: value for key, value in fields.items() if key in allowed}
+        assignments = ["status=?", *[f"{key}=?" for key in values]]
+        with self.transaction() as db:
+            db.execute(
+                f"UPDATE scan_batches SET {', '.join(assignments)} WHERE batch_id=?",
+                (status, *values.values(), batch_id),
+            )
+
+    def complete_batch(self, batch_id: str, *, with_failures: bool = False) -> None:
+        with self.transaction() as db:
+            db.execute(
+                """UPDATE scan_batches SET status=?, completed_at=COALESCE(completed_at, ?)
+                WHERE batch_id=?""",
+                ("completed_with_failures" if with_failures else "completed", utc_now(), batch_id),
             )
 
     def list_segments(self, scan_id: str, product: str | None = None, role: str | None = None, minimum_confidence: float = 0.0, search: str = "", sort: str = "timestamp") -> list[dict[str, Any]]:

@@ -74,8 +74,7 @@ def revalidate_source(source: dict[str, Any], input_dir: str | Path) -> Path:
         candidate.relative_to(root)
     except ValueError as exc:
         raise PermissionError("Source is outside QUEUE_INPUT_DIR") from exc
-    current = source_record(candidate, include_duration=False)
-    for key in ("source_id", "file_size", "mtime_ns", "content_fingerprint"):
-        if current[key] != source[key]:
-            raise FileNotFoundError("Source VOD changed after discovery")
+    stat = candidate.stat()
+    if stat.st_size != source["file_size"] or stat.st_mtime_ns != source["mtime_ns"]:
+        raise FileNotFoundError("Source VOD changed after discovery")
     return candidate
