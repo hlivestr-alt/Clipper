@@ -6,6 +6,7 @@
 # ── Paths ─────────────────────────────────────────────────────────────────────
 OUTPUT_DIR         = r"D:\output_clips"           # where finished clips go
 WORKING_DIR        = "working"                 # temp files (transcripts, raw cuts)
+MODSCAN_ENABLED    = True                      # standalone /modules scanner
 YOLO_WEIGHTS       = "models/proya_best.pt"    # your trained YOLO weights
 YOLO_PRETRAIN      = "yolov8n.pt"              # base model for training
 DATASET_YAML       = "dataset/proya.yaml"      # YOLO dataset config

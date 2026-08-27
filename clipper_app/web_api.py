@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import mimetypes
 import os
 import asyncio
 import threading
@@ -77,6 +78,7 @@ from clipper_app.contracts.whatsapp_delivery_models import (
     WhatsAppDeliveryItemRequest,
     WhatsAppOutboxAckRequest,
 )
+from clipper_app.modular_scanner import ModularScannerService
 
 try:
     from fastapi import FastAPI, HTTPException, Query, Request, Response, status
@@ -127,6 +129,57 @@ def _read_response(result: ReadServiceResult, request: Request) -> Response:
     if request.headers.get("if-none-match") == etag:
         return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
     return JSONResponse(payload, headers=headers)
+
+
+def _range_file_response(path: Path, request: Request) -> Response:
+    size = path.stat().st_size
+    media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    headers = {"Accept-Ranges": "bytes", "Content-Disposition": f'inline; filename="{path.name}"'}
+    range_header = request.headers.get("range")
+    if not range_header:
+        if request.method == "HEAD":
+            return Response(status_code=200, media_type=media_type, headers={**headers, "Content-Length": str(size)})
+        return FileResponse(path, media_type=media_type, filename=path.name, content_disposition_type="inline", headers=headers)
+    try:
+        unit, value = range_header.strip().split("=", 1)
+        if unit.casefold() != "bytes" or "," in value:
+            raise ValueError
+        start_text, end_text = value.split("-", 1)
+        if not start_text:
+            suffix = int(end_text)
+            if suffix <= 0:
+                raise ValueError
+            start = max(0, size - suffix)
+            end = size - 1
+        else:
+            start = int(start_text)
+            end = int(end_text) if end_text else size - 1
+        if start < 0 or end < start or start >= size:
+            raise ValueError
+        end = min(end, size - 1)
+    except (ValueError, TypeError):
+        return Response(status_code=416, headers={**headers, "Content-Range": f"bytes */{size}"})
+    length = end - start + 1
+    partial_headers = {
+        **headers,
+        "Content-Range": f"bytes {start}-{end}/{size}",
+        "Content-Length": str(length),
+    }
+    if request.method == "HEAD":
+        return Response(status_code=206, media_type=media_type, headers=partial_headers)
+
+    def stream():
+        remaining = length
+        with path.open("rb") as handle:
+            handle.seek(start)
+            while remaining:
+                block = handle.read(min(1024 * 1024, remaining))
+                if not block:
+                    break
+                remaining -= len(block)
+                yield block
+
+    return StreamingResponse(stream(), status_code=206, media_type=media_type, headers=partial_headers)
 
 
 def _direction(direction: str) -> str:
@@ -314,6 +367,7 @@ def create_app(
     security_settings: ApiSecuritySettings | None = None,
     tiktok_oauth_service: TikTokOAuthService | None = None,
     whatsapp_delivery_service: WhatsAppDeliveryService | None = None,
+    modular_scanner_service: ModularScannerService | None = None,
 ) -> FastAPI:
     migrate_legacy_jobs = os.getenv("CLIPPER_MIGRATE_JOB_STORAGE", "").strip().casefold() in {
         "1",
@@ -340,6 +394,7 @@ def create_app(
     compliance_runner = container.compliance
     exporter = container.exports
     whatsapp_delivery = container.whatsapp_delivery
+    modular_scanner = modular_scanner_service or ModularScannerService(read_service.cfg)
     catalog = CatalogDatabase.from_config(read_service.cfg)
     tiktok_oauth = tiktok_oauth_service or TikTokOAuthService.from_environment(read_service.cfg)
     trends = TrendService(catalog, read_service.cfg, oauth_service=tiktok_oauth)
@@ -464,6 +519,7 @@ def create_app(
             yield
         finally:
             stop_signal_monitor()
+            modular_scanner.close()
             if catalog_mode in {"shadow", "catalog"}:
                 stop_catalog_indexer()
 
@@ -501,6 +557,90 @@ def create_app(
     @api.get("/api/health")
     def health() -> dict[str, Any]:
         return _envelope(ReadServiceResult({"status": "ok", "mode": "control"}))
+
+    @api.get("/api/modular-scanner/sources")
+    def modular_sources() -> dict[str, Any]:
+        return _envelope(ReadServiceResult({"sources": modular_scanner.discover()}))
+
+    @api.post("/api/modular-scanner/scans")
+    def modular_start_scan(payload: dict[str, Any]) -> dict[str, Any]:
+        if set(payload) != {"source_id"} or not isinstance(payload.get("source_id"), str):
+            raise HTTPException(status_code=422, detail="Body must contain only source_id")
+        try:
+            scan, reused = modular_scanner.start_scan(payload["source_id"])
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (PermissionError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return _envelope(ReadServiceResult({"scan": scan, "reused": reused}))
+
+    @api.post("/api/modular-scanner/sources/{source_id}/rescan")
+    def modular_rescan(source_id: str) -> dict[str, Any]:
+        try:
+            scan, _ = modular_scanner.start_scan(source_id, rescan=True)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (PermissionError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return _envelope(ReadServiceResult({"scan": scan, "reused": False}))
+
+    @api.get("/api/modular-scanner/scans/{scan_id}")
+    def modular_scan(scan_id: str) -> dict[str, Any]:
+        try:
+            return _envelope(ReadServiceResult({"scan": modular_scanner.get_scan(scan_id)}))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @api.get("/api/modular-scanner/scans")
+    def modular_scan_history(source_id: str) -> dict[str, Any]:
+        try:
+            return _envelope(ReadServiceResult({"scans": modular_scanner.history(source_id)}))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @api.get("/api/modular-scanner/segments")
+    def modular_segments(
+        source_id: str,
+        scan_id: str | None = None,
+        product: str | None = None,
+        role: str | None = None,
+        minimum_confidence: float = Query(0.0, ge=0.0, le=1.0),
+        search: str = Query("", max_length=200),
+        sort: str = Query("timestamp", pattern="^(timestamp|duration|confidence)$"),
+    ) -> dict[str, Any]:
+        try:
+            rows = modular_scanner.segments(
+                source_id=source_id,
+                scan_id=scan_id,
+                product=product,
+                role=role,
+                minimum_confidence=minimum_confidence,
+                search=search,
+                sort=sort,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return _envelope(ReadServiceResult({"segments": rows}))
+
+    @api.get("/api/modular-scanner/media/{source_id}")
+    def modular_media(source_id: str, request: Request) -> Response:
+        try:
+            path = modular_scanner.media_path(source_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return _range_file_response(path, request)
+
+    @api.head("/api/modular-scanner/media/{source_id}")
+    def modular_media_head(source_id: str, request: Request) -> Response:
+        return modular_media(source_id, request)
 
     def _delivery_call(callback: Callable[[], dict[str, Any]]) -> dict[str, Any]:
         try:

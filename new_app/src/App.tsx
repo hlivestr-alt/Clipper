@@ -128,6 +128,7 @@ import { VariantEditorTabs } from "./variants/VariantEditorTabs";
 import { VariantNavigator } from "./variants/VariantNavigator";
 import { VariantPreviewPanel } from "./variants/VariantPreviewPanel";
 import { VariantWorkspace } from "./variants/VariantWorkspace";
+import { ModularScannerPage } from "./modules/ModularScannerPage";
 import type {
   PresetPanelFeedback,
   VariantCommandStatus,
@@ -190,7 +191,7 @@ const mainNav: NavItem[] = [
 
 const toolNav: NavItem[] = [
   { label: "Trends", path: "/trends", match: "/trends", icon: TrendingUp, detail: "TikTok discovery and editing recommendations." },
-  { label: "Modules", path: "/modules", match: "/modules", icon: Library, detail: "Modular workspace is being rebuilt." }
+  { label: "Modules", path: "/modules", match: "/modules", icon: Library, detail: "Scan VODs for reusable product moments." }
 ];
 
 const secondaryNav: NavItem[] = [
@@ -2661,21 +2662,6 @@ function ViolationPanel({
   );
 }
 
-function ModulesPage() {
-  return (
-    <section className="page-stack">
-      <PageTitle
-        title="Modules"
-        detail="The legacy modular system has been removed from Clipper."
-      />
-      <EmptyState
-        icon={Library}
-        title="Modular workspace is being rebuilt."
-        detail="Modular functionality is temporarily unavailable. A replacement will be designed separately."
-      />
-    </section>
-  );
-}
 function ExportsPage() {
   const [outputRoot, setOutputRoot] = useState("");
   const [batchSize, setBatchSize] = useState("");
@@ -4535,7 +4521,7 @@ function RoutedApp() {
         <Route path="/review/compliance" element={<CompliancePage active />} />
         <Route path="/trends" element={<TrendsPage active />} />
         <Route path="/variants" element={<VariationsPage active />} />
-        <Route path="/modules" element={<ModulesPage />} />
+        <Route path="/modules" element={<ModularScannerPage />} />
         <Route path="/deliveries" element={<ExportsPage />} />
         <Route path="/activity" element={<Navigate to="/activity/jobs" replace />} />
         <Route path="/activity/jobs" element={<JobsPage active />} />

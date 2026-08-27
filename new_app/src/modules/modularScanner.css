@@ -1,0 +1,52 @@
+.modscan-page { max-width: 1540px; }
+.modscan-page .page-heading { display: flex; justify-content: space-between; align-items: end; gap: 20px; }
+.modscan-page .page-heading h1 { margin: 4px 0; font-size: clamp(26px, 3vw, 38px); }
+.modscan-page .page-heading p { margin: 0; }
+.modscan-page .eyebrow { color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+.modscan-source-panel { display: grid; gap: 18px; }
+.modscan-source-fields { display: flex; gap: 24px; align-items: end; justify-content: space-between; }
+.modscan-source-fields label { min-width: min(560px, 55vw); display: grid; gap: 7px; }
+.modscan-source-fields label span { color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
+.modscan-source-meta { display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 10px; color: var(--muted); }
+.modscan-source-meta strong { color: var(--text); }
+.modscan-status { border: 1px solid var(--line); border-radius: 999px; padding: 5px 9px; text-transform: capitalize; }
+.status-completed { color: var(--good); border-color: color-mix(in srgb, var(--good) 35%, transparent); }
+.status-failed { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 35%, transparent); }
+.status-waiting_for_production { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 35%, transparent); }
+.modscan-actions { display: flex; gap: 10px; }
+.modscan-actions button, .modscan-preview-controls button { display: inline-flex; align-items: center; gap: 7px; }
+.modscan-progress { display: grid; gap: 7px; }
+.modscan-progress > div { display: flex; justify-content: space-between; color: var(--muted); text-transform: capitalize; }
+.modscan-progress progress { width: 100%; accent-color: var(--accent); }
+.modscan-workspace-grid { display: grid; grid-template-columns: minmax(0, 1.65fr) minmax(310px, .75fr); gap: 18px; align-items: start; }
+.modscan-results-column, .modscan-side-column { min-width: 0; }
+.modscan-side-column { display: grid; gap: 18px; position: sticky; top: 82px; }
+.modscan-filters { display: grid; grid-template-columns: repeat(2, minmax(120px, .7fr)) minmax(120px, .6fr) minmax(220px, 1.5fr) minmax(120px, .7fr); gap: 9px; margin: 16px 0; }
+.modscan-segment-list { display: grid; gap: 10px; }
+.modscan-segment { width: 100%; text-align: left; border: 1px solid var(--line); background: color-mix(in srgb, var(--panel) 91%, white 3%); border-radius: 12px; padding: 15px; color: var(--text); cursor: pointer; display: grid; gap: 8px; }
+.modscan-segment:hover, .modscan-segment.selected { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, var(--panel)); }
+.modscan-segment-head { display: flex; align-items: center; gap: 7px; }
+.modscan-segment-head span { border: 1px solid var(--line); border-radius: 999px; padding: 3px 7px; font-size: 11px; text-transform: uppercase; }
+.modscan-segment-head strong { margin-left: auto; }
+.modscan-timing, .modscan-segment small { color: var(--muted); }
+.modscan-segment p { margin: 0; line-height: 1.55; }
+.modscan-preview-label { color: var(--accent); display: inline-flex; gap: 5px; align-items: center; font-size: 12px; font-weight: 700; }
+.modscan-preview-panel video { display: block; width: 100%; max-height: 55vh; margin-top: 14px; border-radius: 11px; background: #050505; }
+.modscan-preview-controls { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; color: var(--muted); }
+.modscan-history-row { width: 100%; border: 1px solid transparent; border-top-color: var(--line); background: transparent; color: var(--text); padding: 11px 8px; text-align: left; display: flex; justify-content: space-between; cursor: pointer; }
+.modscan-history-row.selected { border-color: var(--accent); border-radius: 9px; background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.modscan-history-row small { color: var(--muted); }
+.modscan-empty { min-height: 210px; display: grid; place-content: center; justify-items: center; gap: 8px; color: var(--muted); text-align: center; }
+.modscan-empty.compact { min-height: 150px; }
+.error-text { color: var(--bad); }
+@media (max-width: 1050px) {
+  .modscan-workspace-grid { grid-template-columns: 1fr; }
+  .modscan-side-column { position: static; }
+  .modscan-filters { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 700px) {
+  .modscan-source-fields { align-items: stretch; flex-direction: column; }
+  .modscan-source-fields label { min-width: 0; }
+  .modscan-source-meta { justify-content: flex-start; }
+  .modscan-filters { grid-template-columns: 1fr; }
+}
