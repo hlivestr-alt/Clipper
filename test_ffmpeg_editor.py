@@ -25,12 +25,30 @@ from ffmpeg_editor import (
     _subtitle_line_centers,
     _subtitle_row_centers,
     _variant_hook_format,
+    _waive_size_only_delivery_failures,
     _write_ass_file,
 )
+from whatsapp_media import DeliveryComplianceResult
 from product_broll import BrollClip, BrollPlan, BrollTransition, RandomBrollPlan, RandomBrollSegment
 
 
 class FfmpegEditorFallbackTests(unittest.TestCase):
+    def test_nondelivery_render_waives_only_size_classification(self):
+        size_only = DeliveryComplianceResult(False, "policy", "render", {}, ["classification_transcode", "oversized"])
+        accepted = _waive_size_only_delivery_failures(size_only, require_target_size=False)
+        self.assertTrue(accepted.compliant)
+        self.assertEqual(accepted.failure_codes, [])
+        self.assertTrue(accepted.diagnostics["size_classification_waived"])
+
+        decode_failure = DeliveryComplianceResult(False, "policy", "render", {}, ["classification_transcode", "full_decode_failed"])
+        rejected = _waive_size_only_delivery_failures(decode_failure, require_target_size=False)
+        self.assertFalse(rejected.compliant)
+        self.assertIn("full_decode_failed", rejected.failure_codes)
+
+        delivery = DeliveryComplianceResult(False, "policy", "render", {}, ["oversized"])
+        required = _waive_size_only_delivery_failures(delivery, require_target_size=True)
+        self.assertFalse(required.compliant)
+
     def test_dynamic_checklist_builds_timed_green_check_filters(self):
         filters = []
         cfg = types.SimpleNamespace(

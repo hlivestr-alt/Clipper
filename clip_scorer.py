@@ -780,7 +780,7 @@ def score_output_folder(
         if not isinstance(row, dict):
             continue
         status = str(row.get("status") or "")
-        if status == "failed" and not include_failed:
+        if status in {"failed", "compliance_blocked"} and not include_failed:
             continue
         if row.get("export_batch_path"):
             continue

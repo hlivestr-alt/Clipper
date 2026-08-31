@@ -117,6 +117,7 @@ function stageAppPayload() {
   removeGenerated(appStage);
   fs.mkdirSync(appStage, { recursive: true });
   fs.cpSync(path.join(projectRoot, "electron"), path.join(appStage, "electron"), { recursive: true });
+  fs.cpSync(path.join(projectRoot, "assets"), path.join(appStage, "assets"), { recursive: true });
 
   const packageJson = readPackageJson();
   const appPackageJson = {

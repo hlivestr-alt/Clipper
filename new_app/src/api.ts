@@ -834,6 +834,295 @@ export type OverviewData = {
   };
 };
 
+export type ModularProduct = "cleanser" | "toner" | "serum" | "eye_cream" | "mask" | "skin_cream";
+export type ModularTemplate = "standard" | "ingredient" | "benefit_focus";
+export type ModularCtaMode = "use_cta" | "no_cta";
+export type IngredientShortagePolicy = "partial" | "fallback_to_standard";
+
+export type ModularPlannerItem = {
+  composition_id?: string;
+  position: number;
+  segment_id: string;
+  scan_id: string;
+  scanner_generation: number;
+  role: string;
+  source_id: string;
+  source_filename: string;
+  start_seconds: number;
+  end_seconds: number;
+  duration_seconds: number;
+  confidence: number;
+  transcript_text: string;
+  reason: string;
+  approved_usage_at_selection: number;
+  current_run_usage_at_selection: number;
+  ranking_metadata?: {
+    joinability?: {
+      joinability_score: number;
+      start_quality: string;
+      end_quality: string;
+      reason_codes: string[];
+      hard_unusable: boolean;
+      boundary_label: "Clean" | "Contextual" | "Unusable";
+    };
+  };
+};
+
+export type ModularPlannerComposition = {
+  composition_id: string;
+  ordinal: number;
+  requested_template: ModularTemplate;
+  actual_template: ModularTemplate;
+  fallback_reason?: string | null;
+  cta_mode: ModularCtaMode;
+  target_min_duration: number;
+  target_max_duration: number;
+  actual_duration: number;
+  distinct_source_count: number;
+  selection_score: number;
+  selection_metadata?: {
+    hook_benefits_continuity?: number;
+    mean_joinability?: number;
+    score_components?: Record<string, number>;
+  };
+  exact_signature: string;
+  near_signature: string;
+  status: "draft" | "approved" | "removed" | "superseded";
+  items: ModularPlannerItem[];
+};
+
+export type ModularPlannerRun = {
+  planner_run_id: string;
+  production_method: "modular_video";
+  product: ModularProduct;
+  requested_template: ModularTemplate;
+  ingredient_shortage_policy: IngredientShortagePolicy;
+  cta_mode: ModularCtaMode;
+  requested_count: number;
+  generated_count: number;
+  shortfall: number;
+  target_min_duration: number;
+  target_max_duration: number;
+  seed: string;
+  planner_version: string;
+  status: "draft" | "approved";
+  revision: number;
+  warnings: Array<Record<string, unknown>>;
+  search_statistics: Record<string, unknown>;
+  compositions: ModularPlannerComposition[];
+  created_at: string;
+  approved_at?: string | null;
+};
+
+export type ModularPlannerInventory = {
+  product: ModularProduct;
+  snapshot_hash: string;
+  roles: Record<string, {
+    segments: number;
+    distinct_sources: number;
+    minimum_duration?: number | null;
+    maximum_duration?: number | null;
+    joinability?: {
+      clean: number;
+      contextual: number;
+      hard_excluded: number;
+    };
+  }>;
+  suggested_durations: Array<{
+    template: ModularTemplate;
+    cta_mode: ModularCtaMode;
+    minimum: number;
+    maximum: number;
+  }>;
+};
+
+export type ModularRenderItem = {
+  render_run_id: string;
+  composition_id: string;
+  product: ModularProduct;
+  template: ModularTemplate;
+  ordinal: number;
+  renderer_version: string;
+  expected_duration: number;
+  rendered_duration?: number | null;
+  duration_delta?: number | null;
+  status: "queued" | "waiting_for_production" | "rendering" | "completed" | "failed";
+  error_code?: string | null;
+  error_message?: string | null;
+  source_verification_seconds?: number | null;
+  extraction_seconds?: number | null;
+  concat_encode_seconds?: number | null;
+  total_seconds?: number | null;
+  normalization: Record<string, unknown>;
+  created_at: string;
+  completed_at?: string | null;
+};
+
+export type ModularRenderRun = {
+  render_run_id: string;
+  planner_run_id: string;
+  planner_manifest_id: string;
+  renderer_version: string;
+  selected_composition_ids: string[];
+  status: "queued" | "waiting_for_production" | "rendering" | "completed" | "partial_failure" | "failed";
+  requested_count: number;
+  succeeded_count: number;
+  failed_count: number;
+  current_composition_id?: string | null;
+  rerender_of_run_id?: string | null;
+  reused?: boolean;
+  items: ModularRenderItem[];
+  created_at: string;
+  completed_at?: string | null;
+};
+
+export type ModularVariantEligibleBase = {
+  render_run_id: string;
+  composition_id: string;
+  product: ModularProduct;
+  ordinal: number;
+  renderer_version: string;
+  rendered_duration?: number | null;
+  base_identity: string;
+};
+
+export type ModularVariantProfileRef = {
+  profile_id: string;
+  name: string;
+  revision: string;
+  variant_count: number;
+};
+
+export type ModularVariantOutput = {
+  media_id: string;
+  variant_index: number;
+  variant_id: string;
+  variant_name: string;
+  url: string;
+  duration: number;
+  width: number;
+  height: number;
+  has_video: boolean;
+  has_audio: boolean;
+  file_size: number;
+  generation_seconds: number;
+};
+
+export type ModularVariantPilotItem = {
+  render_run_id: string;
+  modular_render_item_id: string;
+  planner_run_id: string;
+  composition_id: string;
+  product: ModularProduct;
+  renderer_version: string;
+  base_identity: string;
+  ordinal: number;
+  variant_profile: string;
+  status: "queued" | "waiting_for_production" | "generating" | "completed" | "failed";
+  expected_variant_count: number;
+  produced_variant_count: number;
+  error?: string | null;
+  generation_seconds?: number | null;
+  outputs: ModularVariantOutput[];
+};
+
+export type ModularVariantPilotRun = {
+  run_id: string;
+  profile_id: string;
+  profile_revision: string;
+  status: "queued" | "waiting_for_production" | "generating" | "completed" | "partial_failure" | "failed";
+  requested_base_count: number;
+  requested_variant_count: number;
+  succeeded_base_count: number;
+  failed_base_count: number;
+  total_expected_outputs: number;
+  total_completed_outputs: number;
+  current_render_item_id?: string | null;
+  reused?: boolean;
+  items: ModularVariantPilotItem[];
+};
+
+export type ModularProductionWorkflow = "automatic" | "review_first";
+export type ModularProductionProduct = ModularProduct | "all_products";
+export type ModularProductionStatus =
+  | "planning" | "awaiting_review" | "approved" | "rendering_bases"
+  | "waiting_for_production" | "generating_variants" | "compliance"
+  | "scoring" | "exporting" | "cancelling" | "cancelled"
+  | "completed" | "completed_with_failures" | "failed";
+
+export type ModularProductionVariant = {
+  media_id: string;
+  variant_index: number;
+  variant_id: string;
+  variant_name: string;
+  status: string;
+  duration?: number | null;
+  file_size?: number | null;
+  url: string;
+  lineage: Record<string, unknown>;
+};
+
+export type ModularProductionItem = {
+  composition_id: string;
+  ordinal: number;
+  render_status: string;
+  variant_status: string;
+  produced_variant_count: number;
+  failed_variant_count: number;
+  error_message?: string | null;
+  product?: ModularProduct | null;
+  planner_run_id?: string | null;
+  planner_manifest_id?: string | null;
+  render_run_id?: string | null;
+  variants: ModularProductionVariant[];
+};
+
+export type ModularProductionJob = {
+  job_id: string;
+  workflow_mode: ModularProductionWorkflow;
+  product: ModularProductionProduct;
+  product_scope: "single" | "all";
+  product_allocation: Record<ModularProduct, number> | Partial<Record<ModularProduct, number>>;
+  product_subflows: Record<string, {
+    product: ModularProduct; requested_base_count: number; generated_base_count: number;
+    rendered_base_count: number; failed_base_count: number; generated_variant_count: number;
+    failed_variant_count: number; planner_run_id?: string | null; planner_manifest_id?: string | null;
+    render_run_id?: string | null; status: string; warnings: Array<Record<string, unknown>>;
+  }>;
+  product_plans: Array<ModularPlannerRun & { product: ModularProduct }>;
+  requested_base_count: number;
+  generated_base_count: number;
+  rendered_base_count: number;
+  failed_base_count: number;
+  variants_per_base: number;
+  expected_variant_count: number;
+  generated_variant_count: number;
+  failed_variant_count: number;
+  compliance_passed_count: number;
+  compliance_rejected_count: number;
+  scored_count: number;
+  scoring_failed_count: number;
+  exported_count: number;
+  export_failed_count: number;
+  variant_profile_id: string;
+  variant_profile_revision: string;
+  planner_run_id?: string | null;
+  planner_manifest_id?: string | null;
+  render_run_id?: string | null;
+  status: ModularProductionStatus;
+  current_stage: ModularProductionStatus;
+  stage_progress: number;
+  warnings: Array<Record<string, unknown>>;
+  error_message?: string | null;
+  cancel_requested: boolean;
+  reused?: boolean;
+  created_at: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  timings: Record<string, number>;
+  items: ModularProductionItem[];
+};
+
 export type RequestOptions = {
   signal?: AbortSignal;
   timeoutMs?: number;

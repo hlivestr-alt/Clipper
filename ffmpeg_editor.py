@@ -472,6 +472,20 @@ def _edit_clip_boolean(
     return ok
 
 
+def _waive_size_only_delivery_failures(
+    compliance: DeliveryComplianceResult,
+    *,
+    require_target_size: bool,
+) -> DeliveryComplianceResult:
+    if not require_target_size and set(compliance.failure_codes).issubset(
+        {"oversized", "classification_transcode"}
+    ):
+        compliance.compliant = True
+        compliance.failure_codes = []
+        compliance.diagnostics["size_classification_waived"] = True
+    return compliance
+
+
 def render_clip(
     raw_clip_path: str,
     output_path: str,
@@ -558,6 +572,7 @@ def render_clip(
         policy=policy,
     )
     target_bps = base_plan.target_video_bps
+    require_target_size = bool(getattr(render_cfg, "RENDER_REQUIRE_TARGET_SIZE", True))
     last_error = "render_failed"
     last_compliance: DeliveryComplianceResult | None = None
 
@@ -589,8 +604,11 @@ def render_clip(
                 policy=policy,
                 action=action,
                 expected_duration=validation_expected_duration,
-                require_target_size=True,
+                require_target_size=require_target_size,
                 decode=True,
+            )
+            compliance = _waive_size_only_delivery_failures(
+                compliance, require_target_size=require_target_size,
             )
             compliance.diagnostics.update(
                 {
@@ -676,8 +694,11 @@ def render_clip(
                             policy=policy,
                             action=ProcessingAction.FALLBACK_TRANSCODED,
                             expected_duration=validation_expected_duration,
-                            require_target_size=True,
+                            require_target_size=require_target_size,
                             decode=True,
+                        )
+                        fallback_compliance = _waive_size_only_delivery_failures(
+                            fallback_compliance, require_target_size=require_target_size,
                         )
                         fallback_compliance.diagnostics.update(
                             {

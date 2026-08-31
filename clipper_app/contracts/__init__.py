@@ -83,5 +83,28 @@ from clipper_app.contracts.whatsapp_delivery_models import (
     WhatsAppOutboxAckRequest,
     WhatsAppStatusResponse,
 )
+from clipper_app.contracts.modular_planner_models import (
+    IngredientShortagePolicy,
+    ModularCtaMode,
+    ModularPlannerComposition,
+    ModularPlannerItem,
+    ModularPlannerRevisionRequest,
+    ModularPlannerRunCreateRequest,
+    ModularPlannerRunDetail,
+    ModularProduct,
+    ModularTemplate,
+    SUGGESTED_DURATION_DEFAULTS,
+)
+from clipper_app.contracts.modular_renderer_models import ModularRenderRunCreateRequest
+from clipper_app.contracts.modular_variant_pilot_models import (
+    ModularVariantBaseRef,
+    ModularVariantPilotCreateRequest,
+)
+from clipper_app.contracts.modular_production_models import (
+    ModularProductionContinueRequest,
+    ModularProductionJobCreateRequest,
+    ModularProductionProduct,
+    ModularWorkflowMode,
+)
 
 __all__ = [name for name in globals() if not name.startswith("_")]

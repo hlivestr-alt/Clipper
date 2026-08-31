@@ -2,6 +2,9 @@ import React, { Suspense, lazy } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { appQueryClient } from "./queryClient";
+import { initializeAppearanceTheme } from "./theme";
+
+initializeAppearanceTheme();
 
 const App = lazy(() => import("./App").then((module) => ({ default: module.App })));
 

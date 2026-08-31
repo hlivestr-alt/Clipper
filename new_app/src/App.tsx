@@ -129,6 +129,9 @@ import { VariantNavigator } from "./variants/VariantNavigator";
 import { VariantPreviewPanel } from "./variants/VariantPreviewPanel";
 import { VariantWorkspace } from "./variants/VariantWorkspace";
 import { ModularScannerPage } from "./modules/ModularScannerPage";
+import { ModularPlannerPage } from "./modules/ModularPlannerPage";
+import { AppearanceProvider, useAppearance } from "./theme";
+import type { AppearancePreference } from "./theme";
 import type {
   PresetPanelFeedback,
   VariantCommandStatus,
@@ -205,7 +208,8 @@ const contextTabs: Array<{ match: string; items: Array<{ label: string; path: st
   {
     match: "/production",
     items: [
-      { label: "Live", path: "/production/live", icon: Gauge },
+      { label: "Standard", path: "/production/live", icon: Gauge },
+      { label: "Modular Video", path: "/production/modular", icon: Layers3 },
       { label: "Queue", path: "/production/queue", icon: ListChecks }
     ]
   },
@@ -4295,6 +4299,7 @@ function settingDescription(entry: SettingsReadEntry): string {
 }
 
 function SettingsPage({ active }: { active: boolean }) {
+  const { appearance, resolvedTheme, setAppearance } = useAppearance();
   const settings = useApiQuery<SettingsReadSnapshot>("/api/settings/effective", 30_000, active);
   const groups = settings.envelope?.data.groups ?? {};
   const revision = settings.envelope?.data.revision ?? "";
@@ -4435,10 +4440,42 @@ function SettingsPage({ active }: { active: boolean }) {
       <div className="settings-layout">
         <aside className="settings-subnav" aria-label="Settings categories">
           <button className={!categoryFilter ? "active" : ""} onClick={() => setCategoryFilter("")}>All settings</button>
+          <button className={categoryFilter === "appearance" ? "active" : ""} onClick={() => setCategoryFilter("appearance")}>Appearance</button>
           {categories.map((category) => <button className={categoryFilter === category ? "active" : ""} onClick={() => setCategoryFilter(category)} key={category}>{settingCategoryLabel(category)}</button>)}
           <details className="settings-revision"><summary>Configuration details</summary><small>Revision {revision ? revision.slice(0, 12) : "loading"}</small></details>
         </aside>
       <div className="settings-grid">
+        {(!categoryFilter || categoryFilter === "appearance") && (
+          <article className="panel appearance-panel">
+            <div className="panel-head">
+              <div>
+                <h2>Appearance</h2>
+                <p>Choose how Clipper looks on this device.</p>
+              </div>
+            </div>
+            <div className="appearance-options" role="radiogroup" aria-label="Appearance">
+              {(["system", "light", "dark"] as AppearancePreference[]).map((option) => (
+                <label className="appearance-option" key={option}>
+                  <input
+                    type="radio"
+                    name="clipper-appearance"
+                    value={option}
+                    checked={appearance === option}
+                    onChange={() => setAppearance(option)}
+                  />
+                  <span className="appearance-option-copy">
+                    <strong>{option[0].toUpperCase() + option.slice(1)}</strong>
+                    <span>
+                      {option === "system"
+                        ? `Follow the operating system. Clipper is currently using ${resolvedTheme}.`
+                        : option === "light" ? "Use the minimal light interface." : "Use the approved Clipper dark interface."}
+                    </span>
+                  </span>
+                </label>
+              ))}
+            </div>
+          </article>
+        )}
         {Object.entries(visibleGroups).map(([category, groupEntries]) => (
           <article className="panel" key={category}>
             <div className="panel-head">
@@ -4515,6 +4552,7 @@ function RoutedApp() {
         <Route path="/overview" element={<DashboardPage />} />
         <Route path="/production" element={<Navigate to="/production/live" replace />} />
         <Route path="/production/live" element={<OperationsPage />} />
+        <Route path="/production/modular" element={<ModularPlannerPage />} />
         <Route path="/production/queue" element={<QueuePage />} />
         <Route path="/review" element={<Navigate to="/review/clips" replace />} />
         <Route path="/review/clips" element={<ClipReviewPage active />} />
@@ -4548,8 +4586,10 @@ function RoutedApp() {
 
 export function App() {
   return (
-    <BrowserRouter>
-      <RoutedApp />
-    </BrowserRouter>
+    <AppearanceProvider>
+      <BrowserRouter>
+        <RoutedApp />
+      </BrowserRouter>
+    </AppearanceProvider>
   );
 }

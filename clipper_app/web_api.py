@@ -78,6 +78,21 @@ from clipper_app.contracts.whatsapp_delivery_models import (
     WhatsAppDeliveryItemRequest,
     WhatsAppOutboxAckRequest,
 )
+from clipper_app.contracts.modular_planner_models import (
+    ModularPlannerRevisionRequest,
+    ModularPlannerRunCreateRequest,
+)
+from clipper_app.contracts.modular_renderer_models import ModularRenderRunCreateRequest
+from clipper_app.contracts.modular_variant_pilot_models import ModularVariantPilotCreateRequest
+from clipper_app.contracts.modular_production_models import (
+    ModularProductionContinueRequest,
+    ModularProductionJobCreateRequest,
+)
+from clipper_app.modular_planner import ModularPlannerService, PlannerConflictError
+from clipper_app.modular_production import ModularProductionConflict, ModularProductionService
+from clipper_app.modular_renderer import ModularRendererConflict, ModularRendererService
+from clipper_app.modular_variants import ModularVariantService
+from clipper_app.modular_variant_pilot import ModularVariantPilotConflict, ModularVariantPilotService
 from clipper_app.modular_scanner import ModularScannerService
 
 try:
@@ -368,6 +383,10 @@ def create_app(
     tiktok_oauth_service: TikTokOAuthService | None = None,
     whatsapp_delivery_service: WhatsAppDeliveryService | None = None,
     modular_scanner_service: ModularScannerService | None = None,
+    modular_planner_service: ModularPlannerService | None = None,
+    modular_renderer_service: ModularRendererService | None = None,
+    modular_variant_pilot_service: ModularVariantPilotService | None = None,
+    modular_production_service: ModularProductionService | None = None,
 ) -> FastAPI:
     migrate_legacy_jobs = os.getenv("CLIPPER_MIGRATE_JOB_STORAGE", "").strip().casefold() in {
         "1",
@@ -395,6 +414,25 @@ def create_app(
     exporter = container.exports
     whatsapp_delivery = container.whatsapp_delivery
     modular_scanner = modular_scanner_service or ModularScannerService(read_service.cfg)
+    modular_planner = modular_planner_service or ModularPlannerService(read_service.cfg)
+    modular_renderer = modular_renderer_service or ModularRendererService(
+        read_service.cfg, planner=modular_planner,
+    )
+    modular_variant_pilot = modular_variant_pilot_service or ModularVariantPilotService(
+        read_service.cfg, renderer=modular_renderer, planner=modular_planner,
+    )
+    modular_variants = ModularVariantService(
+        read_service.cfg, renderer=modular_renderer, planner=modular_planner,
+    )
+    modular_production = modular_production_service or ModularProductionService(
+        read_service.cfg,
+        planner=modular_planner,
+        renderer=modular_renderer,
+        variants=modular_variants,
+        compliance=compliance_runner,
+        scoring=scorer,
+        exports=exporter,
+    )
     catalog = CatalogDatabase.from_config(read_service.cfg)
     tiktok_oauth = tiktok_oauth_service or TikTokOAuthService.from_environment(read_service.cfg)
     trends = TrendService(catalog, read_service.cfg, oauth_service=tiktok_oauth)
@@ -520,6 +558,9 @@ def create_app(
         finally:
             stop_signal_monitor()
             modular_scanner.close()
+            modular_production.close()
+            modular_renderer.close()
+            modular_variant_pilot.close()
             if catalog_mode in {"shadow", "catalog"}:
                 stop_catalog_indexer()
 
@@ -662,6 +703,207 @@ def create_app(
     @api.head("/api/modular-scanner/media/{source_id}")
     def modular_media_head(source_id: str, request: Request) -> Response:
         return modular_media(source_id, request)
+
+    def _planner_call(callback: Callable[[], Any]) -> dict[str, Any]:
+        try:
+            return _envelope(ReadServiceResult(callback()))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except PlannerConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @api.get("/api/modular-planner/inventory")
+    def modular_planner_inventory(product: str) -> dict[str, Any]:
+        return _planner_call(lambda: modular_planner.inventory(product))
+
+    @api.post("/api/modular-planner/runs", status_code=201)
+    def modular_planner_create_run(payload: ModularPlannerRunCreateRequest) -> dict[str, Any]:
+        return _planner_call(lambda: modular_planner.create_run(payload))
+
+    @api.get("/api/modular-planner/runs")
+    def modular_planner_runs(
+        status_filter: str | None = Query(default=None, alias="status"),
+        limit: int = Query(default=50, ge=1, le=100),
+    ) -> dict[str, Any]:
+        return _planner_call(lambda: {"runs": modular_planner.list_runs(status_filter, limit)})
+
+    @api.get("/api/modular-planner/runs/{run_id}")
+    def modular_planner_run(run_id: str) -> dict[str, Any]:
+        return _planner_call(lambda: modular_planner.get_run(run_id))
+
+    @api.post("/api/modular-planner/runs/{run_id}/compositions/{composition_id}/regenerate")
+    def modular_planner_regenerate(
+        run_id: str, composition_id: str, payload: ModularPlannerRevisionRequest,
+    ) -> dict[str, Any]:
+        return _planner_call(lambda: modular_planner.regenerate(run_id, composition_id, payload.expected_revision))
+
+    @api.post("/api/modular-planner/runs/{run_id}/compositions/{composition_id}/remove")
+    def modular_planner_remove(
+        run_id: str, composition_id: str, payload: ModularPlannerRevisionRequest,
+    ) -> dict[str, Any]:
+        return _planner_call(lambda: modular_planner.remove(run_id, composition_id, payload.expected_revision))
+
+    @api.post("/api/modular-planner/runs/{run_id}/approve")
+    def modular_planner_approve(run_id: str, payload: ModularPlannerRevisionRequest) -> dict[str, Any]:
+        return _planner_call(lambda: modular_planner.approve(run_id, payload.expected_revision))
+
+    @api.get("/api/modular-planner/runs/{run_id}/manifest")
+    def modular_planner_manifest(run_id: str) -> dict[str, Any]:
+        return _planner_call(lambda: modular_planner.manifest(run_id, public=True))
+
+    def _renderer_call(callback: Callable[[], Any]) -> dict[str, Any]:
+        try:
+            return _envelope(ReadServiceResult(callback()))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ModularRendererConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @api.post("/api/modular-renderer/runs", status_code=202)
+    def modular_renderer_create_run(payload: ModularRenderRunCreateRequest) -> dict[str, Any]:
+        def create() -> dict[str, Any]:
+            run, reused = modular_renderer.create_run(payload)
+            return {**run, "reused": reused}
+        return _renderer_call(create)
+
+    @api.get("/api/modular-renderer/runs")
+    def modular_renderer_runs(
+        planner_run_id: str,
+        limit: int = Query(default=20, ge=1, le=100),
+    ) -> dict[str, Any]:
+        return _renderer_call(lambda: {"runs": modular_renderer.list_runs(planner_run_id, limit)})
+
+    @api.get("/api/modular-renderer/runs/{render_run_id}")
+    def modular_renderer_run(render_run_id: str) -> dict[str, Any]:
+        return _renderer_call(lambda: modular_renderer.get_run(render_run_id))
+
+    @api.get("/api/modular-renderer/runs/{render_run_id}/media/{composition_id}")
+    def modular_renderer_media(render_run_id: str, composition_id: str, request: Request) -> Response:
+        try:
+            path = modular_renderer.media_path(render_run_id, composition_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ModularRendererConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return _range_file_response(path, request)
+
+    @api.head("/api/modular-renderer/runs/{render_run_id}/media/{composition_id}")
+    def modular_renderer_media_head(render_run_id: str, composition_id: str, request: Request) -> Response:
+        return modular_renderer_media(render_run_id, composition_id, request)
+
+    @api.get("/api/modular-variant-pilot/profiles")
+    def modular_variant_profiles() -> dict[str, Any]:
+        return _envelope(ReadServiceResult(modular_variant_pilot.profiles()))
+
+    @api.get("/api/modular-variant-pilot/eligible")
+    def modular_variant_eligible(planner_run_id: str = Query(min_length=1, max_length=128)) -> dict[str, Any]:
+        return _envelope(ReadServiceResult({"bases": modular_variant_pilot.eligible(planner_run_id)}))
+
+    @api.post("/api/modular-variant-pilot/runs", status_code=202)
+    def modular_variant_create(payload: ModularVariantPilotCreateRequest) -> dict[str, Any]:
+        try:
+            run, reused = modular_variant_pilot.create_run(payload)
+            return _envelope(ReadServiceResult(run | {"reused": reused}))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except (ValueError, ModularVariantPilotConflict) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @api.get("/api/modular-variant-pilot/runs")
+    def modular_variant_runs(limit: int = Query(default=20, ge=1, le=100)) -> dict[str, Any]:
+        return _envelope(ReadServiceResult({"runs": modular_variant_pilot.list_runs(limit)}))
+
+    @api.get("/api/modular-variant-pilot/runs/{run_id}")
+    def modular_variant_run(run_id: str) -> dict[str, Any]:
+        try:
+            return _envelope(ReadServiceResult(modular_variant_pilot.get_run(run_id)))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @api.get("/api/modular-variant-pilot/media/{media_id}")
+    def modular_variant_media(media_id: str, request: Request) -> Response:
+        try:
+            path = modular_variant_pilot.media_path(media_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (FileNotFoundError, PermissionError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return _range_file_response(path, request)
+
+    @api.head("/api/modular-variant-pilot/media/{media_id}")
+    def modular_variant_media_head(media_id: str, request: Request) -> Response:
+        return modular_variant_media(media_id, request)
+
+    def _modular_production_call(callback: Callable[[], Any]) -> dict[str, Any]:
+        try:
+            return _envelope(ReadServiceResult(callback()))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except (ModularProductionConflict, PlannerConflictError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @api.get("/api/modular-production/profiles")
+    def modular_production_profiles() -> dict[str, Any]:
+        return _modular_production_call(modular_production.profiles)
+
+    @api.post("/api/modular-production/jobs", status_code=202)
+    def modular_production_create(payload: ModularProductionJobCreateRequest) -> dict[str, Any]:
+        def create() -> dict[str, Any]:
+            job, reused = modular_production.create_job(payload)
+            return {**job, "reused": reused}
+        return _modular_production_call(create)
+
+    @api.get("/api/modular-production/jobs")
+    def modular_production_jobs(limit: int = Query(default=50, ge=1, le=100)) -> dict[str, Any]:
+        return _modular_production_call(lambda: {"jobs": modular_production.list_jobs(limit)})
+
+    @api.get("/api/modular-production/jobs/{job_id}")
+    def modular_production_job(job_id: str) -> dict[str, Any]:
+        return _modular_production_call(lambda: modular_production.get_job(job_id))
+
+    @api.post("/api/modular-production/jobs/{job_id}/continue", status_code=202)
+    def modular_production_continue(
+        job_id: str, payload: ModularProductionContinueRequest,
+    ) -> dict[str, Any]:
+        return _modular_production_call(lambda: modular_production.continue_job(job_id, payload))
+
+    @api.post("/api/modular-production/jobs/{job_id}/cancel", status_code=202)
+    def modular_production_cancel(job_id: str) -> dict[str, Any]:
+        return _modular_production_call(lambda: modular_production.cancel(job_id))
+
+    @api.get("/api/modular-production/media/{media_id}")
+    def modular_production_media(media_id: str, request: Request) -> Response:
+        try:
+            path = modular_production.media_path(media_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return _range_file_response(path, request)
+
+    @api.head("/api/modular-production/media/{media_id}")
+    def modular_production_media_head(media_id: str, request: Request) -> Response:
+        return modular_production_media(media_id, request)
 
     def _delivery_call(callback: Callable[[], dict[str, Any]]) -> dict[str, Any]:
         try:

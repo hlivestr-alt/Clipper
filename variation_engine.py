@@ -646,7 +646,9 @@ def _profile_variants(base_cfg, seed: int | None = None) -> list[VariantConfig] 
         return None
 
     try:
-        profile = load_active_profile(base_cfg)
+        profile = getattr(base_cfg, "_variation_profile_override", None)
+        if profile is None:
+            profile = load_active_profile(base_cfg)
     except Exception as exc:
         log.warning("Ignoring invalid variation profile; using legacy variants: %s", exc)
         return None
@@ -810,7 +812,7 @@ def resolve_variant_plan(
 
     try:
         from variation_profile import has_active_profile
-        saved_profile = has_active_profile(base_cfg)
+        saved_profile = bool(getattr(base_cfg, "_variation_profile_override", None)) or has_active_profile(base_cfg)
     except Exception:
         saved_profile = False
 

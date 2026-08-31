@@ -10,6 +10,7 @@
     "dev": "vite --host 127.0.0.1 --port 5173",
     "build": "tsc -b && vite build",
     "test": "vitest run",
+    "icon:generate": "node scripts/generate-icon.cjs",
     "preview": "vite preview --host 127.0.0.1 --port 5173",
     "desktop:dev": "pnpm build && electron .",
     "desktop:test": "node --test electron/*.test.cjs",
@@ -44,6 +45,8 @@
       "electron/main.cjs",
       "electron/preload.cjs",
       "electron/runtime.cjs",
+      "assets/icon.png",
+      "assets/icon.ico",
       "package.json",
       "!node_modules/**/*"
     ],
@@ -55,6 +58,7 @@
       }
     ],
     "win": {
+      "icon": "assets/icon.ico",
       "target": [
         "portable"
       ],

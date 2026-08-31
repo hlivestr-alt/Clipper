@@ -36,6 +36,11 @@ let currentRuntime = {
   last_error: ""
 };
 const backendLog = [];
+const appIconPath = path.join(__dirname, "..", "assets", process.platform === "win32" ? "icon.ico" : "icon.png");
+
+if (process.platform === "win32") {
+  app.setAppUserModelId("id.clipper.operations");
+}
 
 function pushLog(source, chunk) {
   const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk || "");
@@ -65,23 +70,25 @@ function errorHtml(title, message, detail) {
   <meta charset="utf-8" />
   <title>${escapeHtml(title)}</title>
   <style>
-    :root { color-scheme: dark; font-family: Inter, "Segoe UI", system-ui, sans-serif; background: #0b0d12; color: #f4f6fa; }
-    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0b0d12; }
-    main { width: min(760px, calc(100vw - 48px)); border: 1px solid #353c49; border-radius: 12px; background: #11141a; padding: 28px; box-shadow: 0 24px 80px rgba(0,0,0,.45); }
-    .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 28px; color: #a2aaba; font-weight: 650; }
-    .mark { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 9px; background: #7c5cfc; color: white; }
+    :root { color-scheme: light; font-family: Inter, "Segoe UI", system-ui, sans-serif; background: #F7F7F5; color: #18181B; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #F7F7F5; }
+    main { width: min(760px, calc(100vw - 48px)); border: 1px solid #E2E2DF; border-radius: 8px; background: #FFFFFF; padding: 28px; box-shadow: 0 8px 30px rgb(0 0 0 / 8%); }
+    .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 28px; color: #71717A; font-weight: 650; }
+    .mark { position: relative; width: 34px; height: 34px; border: 2px solid #18181B; border-right-color: transparent; border-radius: 50%; }
+    .mark::after { content: ""; position: absolute; right: -1px; bottom: 2px; width: 5px; height: 5px; border-radius: 50%; background: #18181B; }
     h1 { margin: 0 0 8px; font-size: 1.5rem; }
-    p { color: #a2aaba; line-height: 1.55; }
-    pre { max-height: 300px; overflow: auto; white-space: pre-wrap; background: #0b0d12; color: #d9deea; border: 1px solid #272c36; border-radius: 8px; padding: 14px; }
+    p { color: #71717A; line-height: 1.55; }
+    pre { max-height: 300px; overflow: auto; white-space: pre-wrap; background: #F4F4F2; color: #3F3F46; border: 1px solid #D4D4D0; border-radius: 6px; padding: 14px; }
     .actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
-    button { min-height: 38px; border: 1px solid #353c49; border-radius: 6px; padding: 0 14px; background: #171b23; color: #f4f6fa; font: inherit; cursor: pointer; }
-    button.primary { border-color: #7c5cfc; background: #7c5cfc; }
-    button:hover { filter: brightness(1.1); }
+    button { min-height: 38px; border: 1px solid #D4D4D0; border-radius: 6px; padding: 0 14px; background: transparent; color: #18181B; font: inherit; cursor: pointer; }
+    button.primary { border-color: #18181B; background: #18181B; color: #FFFFFF; }
+    button:hover { background: #F0F0EE; }
+    button.primary:hover { background: #09090B; }
   </style>
 </head>
 <body>
   <main>
-    <div class="brand"><span class="mark">C</span><span>Clipper desktop</span></div>
+    <div class="brand"><span class="mark" aria-hidden="true"></span><span>Clipper desktop</span></div>
     <h1>${escapeHtml(title)}</h1>
     <p>${escapeHtml(message)}</p>
     <pre>${escapeHtml(detail)}</pre>
@@ -99,7 +106,8 @@ function createFailureWindow(title, message, detail) {
   const window = new BrowserWindow({
     width: 860,
     height: 640,
-    backgroundColor: "#08111f",
+    backgroundColor: "#F7F7F5",
+    icon: appIconPath,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       nodeIntegration: false,
@@ -333,7 +341,8 @@ async function createMainWindow(runtime) {
     frame: false,
     autoHideMenuBar: true,
     show: false,
-    backgroundColor: "#0b0d12",
+    backgroundColor: "#0a0a0a",
+    icon: appIconPath,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       nodeIntegration: false,

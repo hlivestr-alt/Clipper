@@ -70,6 +70,6 @@ If startup fails, a local diagnostic window reports the command, project root, P
 
 `electron/build-portable.cjs` invokes electron-builder and contains Windows recovery paths for rename timing failures and partially prepared unpacked directories. The compiled renderer is packaged as an external resource and served by FastAPI through `CLIPPER_STATIC_DIR`; hashed assets receive immutable caching while the SPA entry is served without long-term caching.
 
-No installer, auto-update, code-signing identity, custom application icon, or bundled production runtime is currently configured.
+No installer, auto-update, code-signing identity, or bundled production runtime is currently configured. The Windows package and Electron windows use the canonical Clipper icon from `new_app/assets/icon.ico`.
 
 `run_new_app.ps1` remains the browser-development and rollback launcher.

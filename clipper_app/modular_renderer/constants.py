@@ -1,0 +1,9 @@
+from __future__ import annotations
+
+RENDERER_VERSION = "modular-renderer-v1.1"
+OUTPUT_FPS = 30
+OUTPUT_SAMPLE_RATE = 48_000
+OUTPUT_VIDEO_CODEC = "libx264"
+OUTPUT_AUDIO_CODEC = "aac"
+OUTPUT_PIXEL_FORMAT = "yuv420p"
+WAIT_POLL_SECONDS = 5.0

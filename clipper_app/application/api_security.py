@@ -69,6 +69,14 @@ def is_sensitive_read(path: str) -> bool:
         return True
     if normalized.startswith("/api/modular-scanner"):
         return True
+    if normalized.startswith("/api/modular-planner"):
+        return True
+    if normalized.startswith("/api/modular-renderer"):
+        return True
+    if normalized.startswith("/api/modular-variant-pilot"):
+        return True
+    if normalized.startswith("/api/modular-production"):
+        return True
     if normalized.startswith("/api/integrations/tiktok/oauth") and normalized != "/api/integrations/tiktok/oauth/callback":
         return True
     return False
