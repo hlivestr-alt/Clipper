@@ -846,11 +846,14 @@ def scan_output_dir(
         raise ValueError(f"Unsupported manifest format: {manifest_path}")
 
     resolved_working = Path(working_dir) if working_dir is not None else Path(getattr(cfg, "WORKING_DIR", "working")) / output_root.name
-    transcript_path = resolved_working / "transcript.json"
-    if not transcript_path.exists() and "__" in output_root.name:
-        transcript_path = Path(getattr(cfg, "WORKING_DIR", "working")) / output_root.name.split("__", 1)[0] / "transcript.json"
-    if not transcript_path.exists():
-        raise FileNotFoundError(f"Transcript not found for compliance re-scan: {transcript_path}")
+    from clipper_app.storage.transcripts import resolve_effective_transcript_path
+
+    transcript_path = resolve_effective_transcript_path(resolved_working)
+    if transcript_path is None and "__" in output_root.name:
+        base_working = Path(getattr(cfg, "WORKING_DIR", "working")) / output_root.name.split("__", 1)[0]
+        transcript_path = resolve_effective_transcript_path(base_working)
+    if transcript_path is None:
+        raise FileNotFoundError(f"Transcript not found for compliance re-scan: {resolved_working}")
 
     transcript_payload = json.loads(transcript_path.read_text(encoding="utf-8"))
     transcript_words = transcript_payload.get("words", []) if isinstance(transcript_payload, dict) else []

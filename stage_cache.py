@@ -286,7 +286,15 @@ def stage_fingerprint_matches(
     extra: dict[str, Any] | None = None,
 ) -> bool:
     target = sidecar_path(output_path)
-    if not Path(output_path).exists() or not target.exists():
+    output_exists = Path(output_path).exists()
+    if not output_exists and Path(output_path).name == "transcript.json":
+        try:
+            from clipper_app.storage.transcripts import resolve_effective_transcript_path
+
+            output_exists = resolve_effective_transcript_path(Path(output_path).parent) is not None
+        except Exception:
+            output_exists = False
+    if not output_exists or not target.exists():
         return False
     try:
         payload = json.loads(target.read_text(encoding="utf-8"))

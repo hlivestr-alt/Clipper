@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -53,17 +52,21 @@ def find_production_transcript(source: dict[str, Any], cfg: Any) -> Path | None:
     if not working.is_dir():
         return None
     try:
+        from clipper_app.storage.transcripts import resolve_effective_transcript_path
         from transcriber import transcript_cache_is_compatible
         from stage_cache import stage_fingerprint_matches
     except ImportError:
         return None
-    candidates = sorted(
-        (path for path in working.glob(f"{Path(source['filename']).stem}*/transcript.json") if "modular_scanner" not in path.parts),
-        key=lambda path: path.stat().st_mtime_ns,
-        reverse=True,
-    )
+    candidates: list[tuple[Path, Path]] = []
+    for run_dir in working.glob(f"{Path(source['filename']).stem}*"):
+        if not run_dir.is_dir() or "modular_scanner" in run_dir.parts:
+            continue
+        effective = resolve_effective_transcript_path(run_dir)
+        if effective is not None:
+            candidates.append((run_dir, effective))
+    candidates.sort(key=lambda row: row[1].stat().st_mtime_ns, reverse=True)
     expected_path = str(Path(source["canonical_path"]).resolve()).casefold()
-    for candidate in candidates:
+    for run_dir, candidate in candidates:
         try:
             raw = json.loads(candidate.read_text(encoding="utf-8"))
             if not transcript_cache_is_compatible(raw, cfg):
@@ -71,7 +74,7 @@ def find_production_transcript(source: dict[str, Any], cfg: Any) -> Path | None:
             declared = str((raw.get("metadata") or {}).get("source_video_path") or "")
             if not declared or str(Path(declared).resolve()).casefold() != expected_path:
                 continue
-            if not stage_fingerprint_matches(candidate, source["canonical_path"], cfg, "transcribe"):
+            if not stage_fingerprint_matches(run_dir / "transcript.json", source["canonical_path"], cfg, "transcribe"):
                 continue
             canonical_transcript(raw)
             return candidate
@@ -81,12 +84,15 @@ def find_production_transcript(source: dict[str, Any], cfg: Any) -> Path | None:
 
 
 def copy_production_transcript(source: dict[str, Any], cfg: Any, target: Path) -> dict[str, Any] | None:
+    """Compatibility shim: resolve production data without making a second artifact.
+
+    ``target`` remains in the signature for callers from before canonical transcript
+    storage, but intentionally is not created.
+    """
     production = find_production_transcript(source, cfg)
     if production is None:
         return None
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(production, target)
-    return load_transcript(target)
+    return load_transcript(production)
 
 
 def transcribe_fresh(source: dict[str, Any], cfg: Any, target_dir: Path) -> dict[str, Any]:
@@ -95,7 +101,6 @@ def transcribe_fresh(source: dict[str, Any], cfg: Any, target_dir: Path) -> dict
     target_dir.mkdir(parents=True, exist_ok=True)
     raw = transcribe(source["canonical_path"], str(target_dir), cfg)
     transcript = canonical_transcript(raw)
-    write_transcript_atomic(target_dir / "transcript.json", raw)
     return transcript
 
 

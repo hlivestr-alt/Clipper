@@ -3136,9 +3136,11 @@ def _infer_working_dir(output_dir: Path, cfg) -> Path:
 
 
 def _load_transcript_words(working_dir: Path) -> list[dict[str, Any]]:
-    transcript_path = working_dir / "transcript.json"
-    if not transcript_path.exists():
-        log.warning("Transcript not found for batch scoring: %s", transcript_path)
+    from clipper_app.storage.transcripts import resolve_effective_transcript_path
+
+    transcript_path = resolve_effective_transcript_path(working_dir)
+    if transcript_path is None:
+        log.warning("Transcript not found for batch scoring: %s", working_dir)
         return []
     try:
         payload = json.loads(transcript_path.read_text(encoding="utf-8"))
@@ -3455,6 +3457,9 @@ def _move_scored_clips_by_tier(scores: list[dict[str, Any]], output_dir: Path, c
         return stats
 
     output_dir = output_dir.resolve(strict=False)
+    from clipper_app.storage.publishing import ManagedPublisher, managed_working_dir
+
+    publisher = ManagedPublisher.from_working_dir(managed_working_dir(cfg, output_dir))
     export_threshold = float(getattr(cfg, "SCORER_EXPORT_READY_THRESHOLD", 7.0) or 7.0)
     review_threshold = float(getattr(cfg, "SCORER_REVIEW_THRESHOLD", 5.0) or 5.0)
     plans: list[dict[str, Any]] = []
@@ -3506,12 +3511,34 @@ def _move_scored_clips_by_tier(scores: list[dict[str, Any]], output_dir: Path, c
                 except OSError:
                     same_file = False
             if not same_file and source_exists:
-                if destination_exists:
-                    destination = resolve_within_root(output_dir, destination, kind="file")
-                    destination.unlink()
                 source = resolve_within_root(output_dir, source, kind="file")
                 destination = resolve_within_root(output_dir, destination)
-                shutil.move(str(source), str(destination))
+                from clipper_app.storage.models import LifecycleClass
+                lifecycle = {
+                    "export_ready": LifecycleClass.EXPORT,
+                    "review_needed": LifecycleClass.REVIEW,
+                    "rejected": LifecycleClass.REJECTED,
+                }[tier]
+                publisher.move(
+                    source,
+                    destination,
+                    lifecycle_class=lifecycle,
+                    owner_identity=str(score.get("media_id") or score.get("clip_id") or source.stem),
+                    evidence={
+                        "tier": tier,
+                        "score": score.get("total_score"),
+                        "output_root": str(output_dir),
+                        "retention_days": (
+                            int(getattr(cfg, "STORAGE_REVIEW_RETENTION_DAYS", 30))
+                            if tier == "review_needed"
+                            else int(getattr(cfg, "STORAGE_REJECTED_RETENTION_DAYS", 14))
+                            if tier == "rejected"
+                            else None
+                        ),
+                    },
+                    replace=destination_exists,
+                    move_impl=shutil.move,
+                )
                 stats["moved"] += 1
             else:
                 stats["already_sorted"] += 1

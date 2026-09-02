@@ -535,6 +535,24 @@ class ModularProductionService:
                     **row, "job_id": job["job_id"], "composition_id": composition_id,
                     "status": "completed", "lineage_json": lineage,
                 })
+                from clipper_app.storage.models import LifecycleClass
+                from clipper_app.storage.publishing import quick_content_identity
+                from clipper_app.storage.registry import ArtifactRegistry
+
+                produced_path = Path(str(row["output_path"])).resolve(strict=True)
+                content_identity = quick_content_identity(produced_path)
+                ArtifactRegistry.from_working_dir(getattr(self.cfg, "WORKING_DIR", "working")).register_artifact(
+                    artifact_id=f"clip_media_{row['media_id']}",
+                    artifact_type="MODULAR_VARIANT",
+                    canonical_path=produced_path,
+                    fingerprint=content_identity,
+                    content_identity=content_identity,
+                    owner_identity=str(row["media_id"]),
+                    lifecycle_class=LifecycleClass.PENDING,
+                    pinned=True,
+                    pin_reason="modular_production_pending_scoring",
+                    regeneration_evidence={"lineage": lineage},
+                )
 
             try:
                 rows = self.variants.generate(
@@ -700,6 +718,11 @@ class ModularProductionService:
 
     @staticmethod
     def _lineage_base(job: dict[str, Any], adapted: dict[str, Any], composition: dict[str, Any]) -> dict[str, Any]:
+        transcript_dependencies = [
+            dict(item["transcript"])
+            for item in (adapted.get("transcript_diagnostics") or {}).get("items", [])
+            if isinstance(item, dict) and isinstance(item.get("transcript"), dict)
+        ]
         return {
             "modular_production_job_id": job["job_id"],
             "product": adapted["product"],
@@ -719,6 +742,16 @@ class ModularProductionService:
                 "start_seconds": row["start_seconds"], "end_seconds": row["end_seconds"],
             } for row in composition.get("items", [])],
             "transcript_diagnostics": adapted["transcript_diagnostics"],
+            "transcript_dependencies": transcript_dependencies,
+            "regeneration": {
+                "status": "METADATA_COMPLETE_DEPENDENCIES_UNVERIFIED" if transcript_dependencies else "UNVERIFIED",
+                "recipe_revision": "modular-production-lineage-v1",
+                "required_components": [
+                    "source_fingerprint_chain", "planner_manifest_id", "renderer_version",
+                    "variant_profile_revision", "transcript_dependencies",
+                ],
+                "missing_or_unverified": [] if transcript_dependencies else ["transcript_dependencies"],
+            },
         }
 
     def _finish_timing(self, job_id: str, stage: str, started: float) -> None:

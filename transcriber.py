@@ -4,6 +4,7 @@
 # =============================================================================
 
 import gc
+import hashlib
 import importlib.util
 import json
 import logging
@@ -11,6 +12,7 @@ import os
 import re
 import sys
 import types
+import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -22,6 +24,74 @@ ALIGNMENT_SUBPROCESS_OUTPUT = "transcript.aligned_subprocess.json"
 
 
 def transcribe(video_path: str, output_dir: str, cfg) -> dict:
+    """Return a canonical transcript and attach a small reference to this run."""
+    from clipper_app.storage.transcripts import (
+        RAW_CHECKPOINT_NAME,
+        TRANSCRIPT_NAME,
+        TranscriptArtifactStore,
+        build_transcript_descriptor,
+    )
+
+    run_dir = Path(output_dir)
+    store = TranscriptArtifactStore.from_config(cfg)
+    descriptor = build_transcript_descriptor(video_path, cfg, TRANSCRIPT_SCHEMA_VERSION)
+    artifact = store.find(descriptor)
+    if artifact is not None:
+        store.attach(run_dir, artifact, descriptor)
+        log.info("Loading canonical transcript artifact %s", artifact.artifact_id)
+        return json.loads(artifact.transcript_path.read_text(encoding="utf-8"))
+
+    # Import a compatible legacy cache once, but only when its source/settings
+    # fingerprint proves it still describes the current bytes.  Path equality
+    # alone is intentionally insufficient.
+    legacy_path = run_dir / TRANSCRIPT_NAME
+    if legacy_path.is_file():
+        legacy = _read_json_file(legacy_path)
+        if (
+            legacy is not None
+            and transcript_cache_is_compatible(legacy, cfg)
+            and _legacy_cache_fingerprint_matches(legacy_path, video_path, cfg)
+        ):
+            raw = run_dir / RAW_CHECKPOINT_NAME
+            artifact = store.import_legacy(
+                legacy_path,
+                descriptor,
+                legacy_raw_checkpoint=raw if raw.is_file() else None,
+            )
+            store.attach(run_dir, artifact, descriptor)
+            return legacy
+
+    with store.lock(str(descriptor["artifact_id"])):
+        artifact = store.find(descriptor)
+        if artifact is not None:
+            store.attach(run_dir, artifact, descriptor)
+            return json.loads(artifact.transcript_path.read_text(encoding="utf-8"))
+
+        staging = store.new_staging_dir(str(descriptor["artifact_id"]))
+        legacy_checkpoint = run_dir / RAW_CHECKPOINT_NAME
+        if legacy_checkpoint.is_file():
+            checkpoint = load_cached_raw_transcription_checkpoint(str(run_dir), video_path, cfg)
+            if checkpoint is not None:
+                shutil.copy2(legacy_checkpoint, staging / RAW_CHECKPOINT_NAME)
+        result = _transcribe_to_directory(video_path, str(staging), cfg)
+        metadata = result.setdefault("metadata", {})
+        metadata["transcript_artifact_id"] = descriptor["artifact_id"]
+        metadata["transcript_artifact_fingerprint"] = descriptor["fingerprint"]
+        metadata["source_byte_identity"] = descriptor["source_byte_identity"]
+        metadata["transcription_fingerprint"] = hashlib.sha256(
+            json.dumps(descriptor["transcription"], sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+        metadata["alignment_fingerprint"] = hashlib.sha256(
+            json.dumps(descriptor["alignment"], sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+        _write_json_atomic(staging / TRANSCRIPT_NAME, result)
+        artifact = store.commit(staging, descriptor)
+        store.attach(run_dir, artifact, descriptor)
+        log.info("Transcript committed as canonical artifact %s", artifact.artifact_id)
+        return result
+
+
+def _transcribe_to_directory(video_path: str, output_dir: str, cfg) -> dict:
     """
     Transcribe a video file using faster-whisper and, by default, refine the
     word timings with WhisperX forced alignment.
@@ -144,6 +214,7 @@ def _run_faster_whisper_transcription(
             "checkpoint_kind": "raw_transcription",
             "source_video_path": str(Path(video_path).resolve()),
             "whisper_model_size": getattr(cfg, "WHISPER_MODEL_SIZE", None),
+            "whisper_compute": getattr(cfg, "WHISPER_COMPUTE", None),
             "whisper_language": getattr(cfg, "WHISPER_LANGUAGE", None),
             "whisper_beam_size": getattr(cfg, "WHISPER_BEAM_SIZE", None),
             "whisper_best_of": getattr(cfg, "WHISPER_BEST_OF", None),
@@ -248,8 +319,10 @@ def build_text_chunks(transcript: dict, chunk_duration: float, overlap: float) -
 
 
 def load_cached_transcript(output_dir: str) -> Optional[dict]:
-    transcript_path = Path(output_dir) / "transcript.json"
-    if not transcript_path.exists():
+    from clipper_app.storage.transcripts import resolve_effective_transcript_path
+
+    transcript_path = resolve_effective_transcript_path(output_dir)
+    if transcript_path is None:
         return None
     try:
         with open(transcript_path, "r", encoding="utf-8") as f:
@@ -260,8 +333,10 @@ def load_cached_transcript(output_dir: str) -> Optional[dict]:
 
 
 def load_cached_raw_transcription_checkpoint(output_dir: str, video_path: str, cfg) -> Optional[dict]:
-    checkpoint_path = _raw_transcription_checkpoint_path(output_dir)
-    if not checkpoint_path.exists():
+    from clipper_app.storage.transcripts import resolve_effective_raw_checkpoint_path
+
+    checkpoint_path = resolve_effective_raw_checkpoint_path(output_dir)
+    if checkpoint_path is None:
         return None
 
     try:
@@ -326,6 +401,17 @@ def _raw_transcription_checkpoint_is_compatible(checkpoint: dict, video_path: st
     if desired_backend and desired_backend != _desired_word_alignment_backend(cfg):
         return False
 
+    expected_settings = {
+        "whisper_model_size": getattr(cfg, "WHISPER_MODEL_SIZE", None),
+        "whisper_compute": getattr(cfg, "WHISPER_COMPUTE", None),
+        "whisper_language": getattr(cfg, "WHISPER_LANGUAGE", None),
+        "whisper_beam_size": getattr(cfg, "WHISPER_BEAM_SIZE", 5),
+        "whisper_best_of": getattr(cfg, "WHISPER_BEST_OF", 5),
+    }
+    for key, expected in expected_settings.items():
+        if metadata.get(key) != expected:
+            return False
+
     raw_words = _collect_raw_checkpoint_words(checkpoint)
     return bool(raw_words) and _word_timings_are_valid(raw_words)
 
@@ -347,6 +433,23 @@ def _write_json_atomic(path: Path, payload: dict) -> None:
     with open(temp_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     os.replace(temp_path, path)
+
+
+def _read_json_file(path: Path) -> Optional[dict]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _legacy_cache_fingerprint_matches(transcript_path: Path, video_path: str, cfg) -> bool:
+    try:
+        from stage_cache import stage_fingerprint_matches
+
+        return stage_fingerprint_matches(transcript_path, video_path, cfg, "transcribe")
+    except Exception:
+        return False
 
 
 def _normalize_timestamp(value) -> float:

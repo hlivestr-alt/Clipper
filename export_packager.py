@@ -295,6 +295,7 @@ def _package_export_batches_impl(
             batch_root=batch_root,
             now_iso=_now_iso(),
             dry_run=dry_run,
+            cfg=cfg,
         )
         intake_count = len(intaken_candidates)
         if not dry_run:
@@ -442,6 +443,9 @@ def _package_export_batches_impl(
         moved_items.extend(diversity_moved)
         errors.extend(diversity_errors)
     else:
+        from clipper_app.storage.publishing import ManagedPublisher, managed_working_dir
+
+        publisher = ManagedPublisher.from_working_dir(managed_working_dir(cfg, root))
         for candidate, source_path_before, destination, relative_destination, item_payload in move_plans:
             try:
                 source_dir = resolve_within_root(root, candidate.source_dir, kind="dir")
@@ -451,13 +455,24 @@ def _package_export_batches_impl(
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 source_path_before = resolve_within_root(export_ready_root, source_path_before, kind="file")
                 destination = resolve_within_root(batch_root, destination)
-                shutil.move(str(source_path_before), str(destination))
+                from clipper_app.storage.models import LifecycleClass
+                def reconcile_export(_source: Path, moved_to: Path, _operation_id: str) -> None:
+                    _update_source_manifest(candidate.source_dir, candidate.clip_id, relative_destination, item_payload)
+                    _update_source_scores_summary(candidate.source_dir, candidate.clip_id, relative_destination, moved_to)
+
+                publisher.move(
+                    source_path_before,
+                    destination,
+                    lifecycle_class=LifecycleClass.EXPORT,
+                    owner_identity=candidate.source_clip_key,
+                    reconcile=reconcile_export,
+                    evidence={"batch_folder": item_payload.get("batch_folder"), "clip_id": candidate.clip_id},
+                    move_impl=shutil.move,
+                )
             except Exception as exc:
                 errors.append(f"{source_path_before} -> {destination}: {exc}")
                 continue
 
-            _update_source_manifest(candidate.source_dir, candidate.clip_id, relative_destination, item_payload)
-            _update_source_scores_summary(candidate.source_dir, candidate.clip_id, relative_destination, destination)
             moved_items.append(item_payload)
 
     if diversity_state is not None and not dry_run:
@@ -719,6 +734,20 @@ def _execute_diversity_move_plans(
                 except OSError:
                     pass
                 continue
+
+        from clipper_app.storage.models import LifecycleClass
+        from clipper_app.storage.publishing import ManagedPublisher, managed_working_dir
+
+        publisher = ManagedPublisher.from_working_dir(managed_working_dir(cfg, root))
+        for candidate, source_path_before, destination, _relative_destination, _item_payload in plans:
+            published_path = final_folder / destination.name
+            publisher.record_completed_transition(
+                source_path_before,
+                published_path,
+                lifecycle_class=LifecycleClass.EXPORT,
+                owner_identity=candidate.source_clip_key,
+                evidence={"batch_folder": folder_number, "clip_id": candidate.clip_id, "batch_atomic": True},
+            )
 
         for candidate, _source_path_before, destination, relative_destination, item_payload in plans:
             item_payload.update(
@@ -1072,11 +1101,15 @@ def _intake_diversity_candidates(
     batch_root: Path,
     now_iso: str,
     dry_run: bool,
+    cfg=None,
 ) -> tuple[list[ExportCandidate], list[str]]:
     pending_root = resolve_within_root(batch_root, batch_root / "_pending")
     pending = diversity_state.setdefault("pending", {})
     errors: list[str] = []
     intaken: list[ExportCandidate] = []
+    from clipper_app.storage.publishing import ManagedPublisher, managed_working_dir
+
+    publisher = ManagedPublisher.from_working_dir(managed_working_dir(cfg, root))
     planned_destinations: set[str] = set()
     if pending_root.exists():
         planned_destinations = {
@@ -1108,7 +1141,15 @@ def _intake_diversity_candidates(
             source_path = resolve_within_root(export_ready_root, candidate.source_path, kind="file")
             destination = resolve_within_root(pending_root, destination)
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(source_path), str(destination))
+            from clipper_app.storage.models import LifecycleClass
+            publisher.move(
+                source_path,
+                destination,
+                lifecycle_class=LifecycleClass.PENDING,
+                owner_identity=candidate.source_clip_key,
+                evidence={"pending_intake": True, "clip_id": candidate.clip_id},
+                move_impl=shutil.move,
+            )
         except Exception as exc:
             errors.append(f"pending intake {candidate.source_path} -> {destination}: {exc}")
             continue

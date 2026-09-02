@@ -60,6 +60,10 @@ class VideoQueueSchedulingTests(unittest.TestCase):
                 WORD_ALIGNMENT_BACKEND = "whisperx"
                 WHISPERX_ACCEPT_RAW_FALLBACK_CACHE = True
 
+            from stage_cache import write_stage_fingerprint
+
+            write_stage_fingerprint(previous_working_dir / "transcript.json", video, Cfg, "transcribe")
+
             reused = _reuse_base_transcript_for_tagged_run(
                 str(video),
                 target_working_dir,
@@ -68,8 +72,11 @@ class VideoQueueSchedulingTests(unittest.TestCase):
             )
 
             self.assertTrue(reused)
-            self.assertTrue((target_working_dir / "transcript.json").exists())
-            self.assertTrue((target_working_dir / "transcript.raw_checkpoint.json").exists())
+            self.assertFalse((target_working_dir / "transcript.json").exists())
+            self.assertFalse((target_working_dir / "transcript.raw_checkpoint.json").exists())
+            reference = json.loads((target_working_dir / "transcript.artifact.json").read_text(encoding="utf-8"))
+            self.assertTrue(Path(reference["transcript_path"]).is_file())
+            self.assertTrue(Path(reference["raw_checkpoint_path"]).is_file())
 
     def test_yolo_queue_backfills_next_transcribe_before_scan_finishes(self):
         with tempfile.TemporaryDirectory() as temp_dir:

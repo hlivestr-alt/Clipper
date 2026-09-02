@@ -298,7 +298,7 @@ class ModularScannerExecutionTests(unittest.TestCase):
         self.assertEqual(analyzer.calls, 1)
         self.assertEqual(service.get_scan(scan["scan_id"])["status"], "completed")
 
-    def test_compatible_production_transcript_is_copied_not_modified(self) -> None:
+    def test_compatible_production_transcript_is_reused_without_copy(self) -> None:
         production_dir = self.working / self.vod.stem
         production_path = production_dir / "transcript.json"
         production = {
@@ -313,7 +313,7 @@ class ModularScannerExecutionTests(unittest.TestCase):
         ):
             copied = copy_production_transcript(self.source, self.cfg, target)
         self.assertIsNotNone(copied)
-        self.assertTrue(target.is_file())
+        self.assertFalse(target.exists())
         self.assertEqual(production_path.read_bytes(), original)
 
 

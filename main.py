@@ -158,6 +158,7 @@ def _clip_version_dir(moment: dict, clip_id: str) -> str | None:
 def _process_clip_job(job: dict, video_path: str, transcript_words: list, product_events: list, cut_only: bool, cfg) -> dict:
     from ffmpeg_editor import cut_raw_clip, get_words_for_clip
     from vision_scanner import get_events_for_clip
+    from clipper_app.storage.raw_lifecycle import RawLifecycleManager
 
     output_path = job["output_path"]
     raw_path    = job["raw_path"]
@@ -290,12 +291,19 @@ def _process_clip_job(job: dict, video_path: str, transcript_words: list, produc
         cut_ok = cut_raw_clip(video_path, job["start"], job["end"], raw_path, cfg=cfg)
 
     if not cut_ok:
+        if Path(raw_path).is_file():
+            raw_lifecycle = RawLifecycleManager.from_working_dir(getattr(cfg, "WORKING_DIR", "working"))
+            raw_lifecycle.register_new(raw_path, owner_job=str(job["clip_id"]))
+            raw_lifecycle.mark_failed(raw_path)
         return {
             "clip_id": job["clip_id"],
             "status": "failed",
             "output_filename": job["output_filename"],
             "manifest": _build_manifest_row(job, 0, "failed"),
         }
+
+    raw_lifecycle = RawLifecycleManager.from_working_dir(getattr(cfg, "WORKING_DIR", "working"))
+    job["raw_operation_id"] = raw_lifecycle.register_new(raw_path, owner_job=str(job["clip_id"]))
 
     if cut_only:
         from uuid import uuid4
@@ -335,8 +343,6 @@ def _process_clip_job(job: dict, video_path: str, transcript_words: list, produc
                 else ",".join(delivery.failure_codes if delivery else [])
             )
             cut_status = "failed"
-        if Path(raw_path).exists():
-            os.remove(raw_path)
         return {
             "clip_id": job["clip_id"],
             "status": cut_status,
@@ -394,9 +400,6 @@ def _process_clip_job(job: dict, video_path: str, transcript_words: list, produc
         dynamic_text_plan=job.get("dynamic_text_plan"),
         cfg=edit_cfg,
     )
-
-    if Path(raw_path).exists():
-        os.remove(raw_path)
 
     job["delivery_compliance"] = (
         render_result.delivery_compliance.to_dict()
@@ -1475,6 +1478,48 @@ def _render_clip_jobs_incremental(
                     last_clip_id=last_clip_id,
                     last_clip_status=last_clip_status,
                 )
+                raw_lifecycle = None
+                try:
+                    from clipper_app.storage.raw_lifecycle import RawLifecycleManager
+
+                    raw_lifecycle = RawLifecycleManager.from_working_dir(getattr(cfg, "WORKING_DIR", "working"))
+                    if clip_status == "ok":
+                        from clipper_app.storage.models import LifecycleClass
+                        from clipper_app.storage.publishing import quick_content_identity
+                        from clipper_app.storage.registry import ArtifactRegistry, stable_id
+
+                        output_artifact_path = Path(job["output_path"]).resolve(strict=True)
+                        content_identity = quick_content_identity(output_artifact_path)
+                        output_artifact_id = stable_id(
+                            "clip", [content_identity, str(job.get("clip_id") or output_artifact_path.stem)]
+                        )
+                        ArtifactRegistry.from_working_dir(getattr(cfg, "WORKING_DIR", "working")).register_artifact(
+                            artifact_id=output_artifact_id,
+                            artifact_type="CLIP",
+                            canonical_path=output_artifact_path,
+                            fingerprint=content_identity,
+                            content_identity=content_identity,
+                            owner_identity=str(job.get("clip_id") or ""),
+                            lifecycle_class=LifecycleClass.PENDING,
+                            pinned=True,
+                            pin_reason="rendered_pending_scoring",
+                            regeneration_evidence={
+                                "source_video": str(video_path),
+                                "settings_revision": job.get("settings_revision"),
+                                "manifest_path": str(manifest_path),
+                            },
+                        )
+                        raw_lifecycle.cleanup_after_manifest_commit(
+                            job["raw_path"],
+                            successor_path=job["output_path"],
+                            manifest_path=manifest_path,
+                            clip_id=str(job["clip_id"]),
+                            validation=job.get("delivery_compliance"),
+                        )
+                    elif Path(job["raw_path"]).is_file():
+                        raw_lifecycle.mark_failed(job["raw_path"])
+                except Exception as exc:
+                    log.warning("Raw lifecycle finalization retained %s: %s", job["raw_path"], exc)
 
                 _report(
                     progress_callback,
@@ -3186,10 +3231,11 @@ def main():
         import config as cfg
         import json
         from word_corrector import preview_corrections
+        from clipper_app.storage.transcripts import resolve_effective_transcript_path
         working_dir = str(Path(cfg.WORKING_DIR) / Path(args.video).stem)
-        transcript_path = Path(working_dir) / "transcript.json"
-        if not transcript_path.exists():
-            print(f"No cached transcript found at {transcript_path}")
+        transcript_path = resolve_effective_transcript_path(working_dir)
+        if transcript_path is None:
+            print(f"No cached transcript found for {working_dir}")
             print("Run the pipeline once (or just transcription) first.")
             sys.exit(1)
         with open(transcript_path, encoding="utf-8") as f:

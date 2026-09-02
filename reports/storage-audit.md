@@ -4,6 +4,10 @@ Audit date: 2026-08-31 (Asia/Shanghai)
 Project root: `C:\Data\Clipper Ai Trends`  
 Method: read-only filesystem metadata scan, targeted SHA-256 hashing, read-only SQLite queries, and source-code tracing. Sizes are logical file sizes and use binary units unless marked as raw bytes.
 
+> **Phase 1 implementation status (2026-09-01):** The architecture work described in this audit has been implemented for new operations. Canonical transcript references now prevent new tagged-run transcript/checkpoint copies, managed artifacts and publish transitions are recorded, and all 119 strongly identifiable stale modular-production paths were reconciled without deleting media. The original measurements and findings below remain the audit baseline. See `reports\storage-phase1-implementation.md` and `reports\storage-reconciliation.md`. Historical bulk cleanup was **not** performed; legacy/untracked data remains protected and the reclamation path is dry-run only.
+
+> **Phase 2A migration status (2026-09-01):** Historical project migration is complete for strongly proven candidates. A verified, resumable journal migrated 5,285 historical runs to 261 pinned canonical transcript artifacts, retired 10,311 redundant run-local transcript/checkpoint files, and replaced 112 exact cross-role B-roll copies with verified hardlink aliases. All 102 unverified transcript runs and all 150 historical raw cuts were retained. The final journal snapshot observed 9,495,670,784 additional free bytes after accounting for backups and migration metadata. `D:\output_clips` and `D:\VOD` were inventory-only and were not cleaned. See `reports\storage-phase2a-migration.md` and `reports\storage-phase2a-manifest.json`.
+
 ## Executive Summary
 
 | Measure | Finding |

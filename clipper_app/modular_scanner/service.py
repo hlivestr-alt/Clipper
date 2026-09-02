@@ -27,7 +27,6 @@ from .media import revalidate_source, source_record
 from .repository import ScannerRepository, utc_now
 from .transcripts import (
     build_windows,
-    copy_production_transcript,
     load_transcript,
     transcript_fingerprint,
     transcribe_fresh,
@@ -590,7 +589,11 @@ class ModularScannerService:
         self.repository.update_scan(scan_id, "transcribing", started_at=utc_now())
         target_dir = self.storage_root / "transcripts" / source["source_id"]
         transcript = transcribe_fresh(source, self.cfg, target_dir)
-        path = target_dir / "transcript.json"
+        from clipper_app.storage.transcripts import resolve_effective_transcript_path
+
+        path = resolve_effective_transcript_path(target_dir)
+        if path is None:
+            raise RuntimeError("Canonical scanner transcript was not committed")
         record = self.repository.add_transcript(
             source["source_id"], "scanner", str(path), transcript_fingerprint(transcript),
         )
@@ -605,12 +608,14 @@ class ModularScannerService:
                     return record
             except (OSError, ValueError, json.JSONDecodeError):
                 pass
-        target = self.storage_root / "transcripts" / source["source_id"] / "transcript.json"
-        transcript = copy_production_transcript(source, self.cfg, target)
-        if transcript is None:
+        from .transcripts import find_production_transcript
+
+        production_path = find_production_transcript(source, self.cfg)
+        if production_path is None:
             return None
+        transcript = load_transcript(production_path)
         return self.repository.add_transcript(
-            source["source_id"], "production", str(target), transcript_fingerprint(transcript),
+            source["source_id"], "production", str(production_path), transcript_fingerprint(transcript),
         )
 
     def _wait_for_production(self, scan_id: str) -> None:

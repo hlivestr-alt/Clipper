@@ -6,6 +6,11 @@
 # ── Paths ─────────────────────────────────────────────────────────────────────
 OUTPUT_DIR         = r"D:\output_clips"           # where finished clips go
 WORKING_DIR        = "working"                 # temp files (transcripts, raw cuts)
+
+# Storage Phase 1 only classifies new review/rejected outputs.  Historical
+# files remain KEEP, and the reclamation planner is dry-run only.
+STORAGE_REVIEW_RETENTION_DAYS = 30
+STORAGE_REJECTED_RETENTION_DAYS = 14
 MODSCAN_ENABLED    = True                      # standalone /modules scanner
 YOLO_WEIGHTS       = "models/proya_best.pt"    # your trained YOLO weights
 YOLO_PRETRAIN      = "yolov8n.pt"              # base model for training

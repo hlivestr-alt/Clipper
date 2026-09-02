@@ -723,6 +723,20 @@ class VideoQueueRunner:
             stage_state["finished_at"] = self._now_iso()
             stage_state["duration_sec"] = round(duration, 3)
             stage_state["last_error"] = None
+            if job.stage == "transcribe":
+                try:
+                    from clipper_app.storage.transcripts import reference_metadata
+
+                    reference = reference_metadata(entry["working_dir"])
+                    if reference:
+                        entry["transcript_artifact"] = {
+                            "artifact_id": reference.get("artifact_id"),
+                            "fingerprint": reference.get("fingerprint"),
+                            "canonical_path": reference.get("canonical_path"),
+                            "schema_version": reference.get("schema_version"),
+                        }
+                except Exception as exc:
+                    log.warning("Could not serialize transcript artifact reference: %s", exc)
             if job.stage == EDIT_STAGE:
                 stage_state["active_clip_renders"] = 0
                 stage_state["render_paused"] = False
@@ -2251,15 +2265,27 @@ def _reuse_base_transcript_for_tagged_run(
         return False
 
     from transcriber import load_cached_transcript, transcript_cache_is_compatible
+    from clipper_app.storage.transcripts import (
+        TranscriptArtifactStore,
+        build_transcript_descriptor,
+        resolve_effective_raw_checkpoint_path,
+        resolve_effective_transcript_path,
+    )
+    from transcriber import TRANSCRIPT_SCHEMA_VERSION
 
     stem = Path(video_path).stem
-    tagged_transcript = load_cached_transcript(str(tagged_working_dir))
-    if tagged_transcript is not None and transcript_cache_is_compatible(tagged_transcript, cfg):
-        log.info(f"Loading cached transcript from {tagged_working_dir / 'transcript.json'}")
+    store = TranscriptArtifactStore.from_config(cfg)
+    descriptor = build_transcript_descriptor(video_path, cfg, TRANSCRIPT_SCHEMA_VERSION)
+    canonical = store.find(descriptor)
+    if canonical is not None:
+        store.attach(tagged_working_dir, canonical, descriptor)
+        log.info("Reusing canonical transcript artifact %s", canonical.artifact_id)
         return True
 
     for source_working_dir in _iter_transcript_reuse_candidates(stem, tagged_working_dir, cfg):
-        source_transcript_path = source_working_dir / "transcript.json"
+        source_transcript_path = resolve_effective_transcript_path(source_working_dir)
+        if source_transcript_path is None:
+            continue
         source_transcript = load_cached_transcript(str(source_working_dir))
         if source_transcript is None:
             continue
@@ -2272,17 +2298,21 @@ def _reuse_base_transcript_for_tagged_run(
         if not _transcript_source_matches_video(source_transcript, video_path):
             log.info(f"Prior transcript belongs to a different source video; skipping: {source_transcript_path}")
             continue
+        if not stage_fingerprint_matches(source_working_dir / "transcript.json", video_path, cfg, "transcribe"):
+            log.info("Prior transcript source/settings fingerprint is stale; skipping: %s", source_transcript_path)
+            continue
 
-        tagged_working_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source_transcript_path, tagged_working_dir / "transcript.json")
-
-        source_raw_checkpoint = source_working_dir / "transcript.raw_checkpoint.json"
-        if source_raw_checkpoint.exists():
-            shutil.copy2(source_raw_checkpoint, tagged_working_dir / "transcript.raw_checkpoint.json")
+        source_raw_checkpoint = resolve_effective_raw_checkpoint_path(source_working_dir)
+        canonical = store.import_legacy(
+            source_transcript_path,
+            descriptor,
+            legacy_raw_checkpoint=source_raw_checkpoint,
+        )
+        store.attach(tagged_working_dir, canonical, descriptor)
 
         log.info(
-            "Reusing compatible aligned transcript from prior run for redo: "
-            f"{source_transcript_path} -> {tagged_working_dir / 'transcript.json'}"
+            "Imported compatible legacy transcript once and attached canonical artifact: "
+            "%s -> %s", source_transcript_path, canonical.artifact_id
         )
         return True
 
@@ -2333,9 +2363,14 @@ def _safe_resolve(path: Path) -> Path:
 
 
 def _transcript_candidate_mtime(path: Path) -> float:
-    transcript_path = path / "transcript.json"
     try:
-        if transcript_path.exists():
+        from clipper_app.storage.transcripts import resolve_effective_transcript_path
+
+        transcript_path = resolve_effective_transcript_path(path)
+    except Exception:
+        transcript_path = path / "transcript.json"
+    try:
+        if transcript_path is not None and transcript_path.exists():
             return transcript_path.stat().st_mtime
         return path.stat().st_mtime
     except OSError:
