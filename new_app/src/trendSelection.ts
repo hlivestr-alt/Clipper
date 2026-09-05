@@ -76,7 +76,7 @@ export function completedTrendDownloadCount(videos: TrendVideo[]): number {
   videos.forEach((video) => references.set(`${video.hashtag_id}:${video.video_id}`, video));
   return Array.from(references.values()).filter((video) =>
     Boolean(video.media_status)
-    || ["downloaded", "failed", "interrupted"].includes(video.download_status ?? "")
+    || ["downloaded", "reused", "failed", "interrupted"].includes(video.download_status ?? "")
   ).length;
 }
 

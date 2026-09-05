@@ -451,7 +451,7 @@ export type TrendVideo = {
   file_sha256?: string | null;
   media_status?: "media_ready" | "analyzing" | "analyzed" | "failed" | null;
   media_error?: string | null;
-  download_status?: "queued" | "downloading" | "downloaded" | "failed" | "interrupted" | null;
+  download_status?: "queued" | "downloading" | "downloaded" | "reused" | "failed" | "interrupted" | null;
   download_error?: string | null;
   downloaded_relative_path?: string | null;
 };
@@ -485,6 +485,10 @@ export type TrendVideoDiagnostics = {
 
 export type TrendDownloadSummary = {
   targets: number;
+  target_references: number;
+  unique_videos: number;
+  saved: number;
+  new: number;
   queued: number;
   downloading: number;
   downloaded: number;

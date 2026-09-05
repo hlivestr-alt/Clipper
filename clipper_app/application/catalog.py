@@ -15,7 +15,7 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 from uuid import uuid4
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 DEFAULT_EVENT_RETENTION_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_EVENT_RETENTION_ROWS = 50_000
 
@@ -142,6 +142,9 @@ class CatalogDatabase:
                 ("relevance_type", "TEXT NOT NULL DEFAULT ''"),
                 ("matched_brand", "TEXT"),
                 ("classification_reason", "TEXT NOT NULL DEFAULT ''"),
+            ),
+            "trend_media_links": (
+                ("validated_at", "TEXT"),
             ),
         }
         for table, definitions in additions.items():
@@ -1335,6 +1338,7 @@ CREATE TABLE IF NOT EXISTS trend_media_links (
     approved_at TEXT NOT NULL,
     approved_by TEXT NOT NULL,
     error TEXT,
+    validated_at TEXT,
     updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS trend_fingerprints (

@@ -9,9 +9,11 @@ import shutil
 import statistics
 import subprocess
 import sys
+import threading
 import urllib.parse
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 from uuid import uuid4
@@ -44,6 +46,14 @@ TIKTOK_VIDEO_HASHTAG_BATCH_LIMIT = 10
 TIKTOK_RANKED_VIDEO_LIMIT = 20
 TIKTOK_POST_METADATA_CONCURRENCY = 8
 TIKTOK_PLAYER_DATA_SOURCE = "web_core"
+TIKTOK_DOWNLOAD_CIRCUIT_BREAKER_THRESHOLD = 3
+TIKTOK_MEDIA_HOST_SUFFIXES = (
+    ".tiktok.com",
+    ".tiktokcdn.com",
+    ".tiktokv.com",
+    ".byteoversea.com",
+    ".ibytedtos.com",
+)
 SUGGESTED_PROFILE_FIELDS = {
     "hook_type",
     "subtitle_enabled",
@@ -58,6 +68,9 @@ SUGGESTED_PROFILE_FIELDS = {
 }
 
 logger = logging.getLogger(__name__)
+
+_VIDEO_ACQUISITION_LOCKS_GUARD = threading.Lock()
+_VIDEO_ACQUISITION_LOCKS: dict[tuple[str, str], threading.Lock] = {}
 
 WINDOWS_INVALID_FOLDER_CHARS = re.compile(r'[\x00-\x1f<>:"/\\|?*]')
 WINDOWS_RESERVED_FOLDER_NAMES = re.compile(
@@ -75,6 +88,44 @@ class TikTokDiscoveryError(TrendServiceError):
         super().__init__(message)
         self.code = code
         self.request_id = request_id
+
+
+@dataclass(frozen=True)
+class DownloadFailure:
+    category: str
+    signature: str
+    message: str
+    systemic: bool
+
+
+class DownloadCircuitBreaker:
+    def __init__(self, threshold: int = TIKTOK_DOWNLOAD_CIRCUIT_BREAKER_THRESHOLD) -> None:
+        self.threshold = max(2, int(threshold))
+        self.signature = ""
+        self.consecutive_count = 0
+        self.failure: DownloadFailure | None = None
+
+    @property
+    def tripped(self) -> bool:
+        return self.failure is not None
+
+    def success(self) -> None:
+        self.signature = ""
+        self.consecutive_count = 0
+
+    def failed(self, error: str) -> DownloadFailure:
+        failure = _classify_download_error(error)
+        if not failure.systemic:
+            self.success()
+            return failure
+        if failure.signature == self.signature:
+            self.consecutive_count += 1
+        else:
+            self.signature = failure.signature
+            self.consecutive_count = 1
+        if self.consecutive_count >= self.threshold:
+            self.failure = failure
+        return failure
 
 
 class TikTokDiscoveryClient:
@@ -557,6 +608,65 @@ class TrendRepository:
             (_sanitize_download_error(error), now, now, snapshot_id, hashtag_id, video_id),
         )
 
+    def record_failed_reference(
+        self,
+        *,
+        row: dict[str, Any],
+        run_id: str,
+        source_url: str,
+        error: str,
+        attempted: bool,
+    ) -> None:
+        now = utc_now()
+        self.database.execute(
+            "INSERT INTO trend_media_downloads("
+            "snapshot_id,hashtag_id,video_id,hashtag_name,normalized_hashtag,final_rank,run_id,source_url,"
+            "status,error,attempt_count,started_at,completed_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,'failed',?,?,?, ?,?) "
+            "ON CONFLICT(snapshot_id,hashtag_id,video_id) DO UPDATE SET "
+            "hashtag_name=excluded.hashtag_name,normalized_hashtag=excluded.normalized_hashtag,"
+            "final_rank=excluded.final_rank,run_id=excluded.run_id,source_url=excluded.source_url,"
+            "status='failed',error=excluded.error,"
+            "attempt_count=trend_media_downloads.attempt_count+excluded.attempt_count,"
+            "started_at=excluded.started_at,completed_at=excluded.completed_at,updated_at=excluded.updated_at",
+            (
+                str(row["snapshot_id"]), str(row["hashtag_id"]), str(row["video_id"]),
+                str(row.get("hashtag_name") or ""),
+                normalize_hashtag_folder_name(row.get("hashtag_name")), int(row["final_rank"]),
+                run_id, source_url, _sanitize_download_error(error), 1 if attempted else 0,
+                now if attempted else None, now, now,
+            ),
+        )
+
+    def interrupt_download(
+        self,
+        *,
+        row: dict[str, Any],
+        run_id: str,
+        source_url: str,
+        error: str,
+    ) -> None:
+        """Record an unattempted item without increasing its attempt count."""
+        now = utc_now()
+        self.database.execute(
+            "INSERT INTO trend_media_downloads("
+            "snapshot_id,hashtag_id,video_id,hashtag_name,normalized_hashtag,final_rank,run_id,source_url,"
+            "status,error,attempt_count,completed_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,'interrupted',?,0,?,?) "
+            "ON CONFLICT DO UPDATE SET "
+            "hashtag_name=excluded.hashtag_name,normalized_hashtag=excluded.normalized_hashtag,"
+            "final_rank=excluded.final_rank,run_id=excluded.run_id,source_url=excluded.source_url,"
+            "status='interrupted',error=excluded.error,completed_at=excluded.completed_at,"
+            "updated_at=excluded.updated_at",
+            (
+                str(row["snapshot_id"]), str(row["hashtag_id"]), str(row["video_id"]),
+                str(row.get("hashtag_name") or ""),
+                normalize_hashtag_folder_name(row.get("hashtag_name")),
+                int(row["final_rank"]), run_id, source_url,
+                _sanitize_download_error(error), now, now,
+            ),
+        )
+
     def complete_hashtag_downloads(
         self,
         records: Iterable[dict[str, Any]],
@@ -573,30 +683,7 @@ class TrendRepository:
             if ranked_rows:
                 snapshot_id = str(ranked_rows[0]["snapshot_id"])
                 hashtag_id = str(ranked_rows[0]["hashtag_id"])
-                connection.execute(
-                    "UPDATE trend_videos SET final_rank=NULL "
-                    "WHERE snapshot_id=? AND hashtag_id=?",
-                    (snapshot_id, hashtag_id),
-                )
-                for row in ranked_rows:
-                    connection.execute(
-                        "UPDATE trend_videos SET final_rank=?,is_available=1,exclusion_reason=NULL "
-                        "WHERE snapshot_id=? AND hashtag_id=? AND video_id=?",
-                        (
-                            int(row["final_rank"]), snapshot_id, hashtag_id,
-                            str(row["video_id"]),
-                        ),
-                    )
                 for video_id, error in failed_errors.items():
-                    connection.execute(
-                        "UPDATE trend_videos SET is_available=0,exclusion_reason='unavailable',"
-                        "availability_evidence=? "
-                        "WHERE snapshot_id=? AND hashtag_id=? AND video_id=?",
-                        (
-                            f"Download validation failed: {_sanitize_download_error(error)}"[:1000],
-                            snapshot_id, hashtag_id, video_id,
-                        ),
-                    )
                     connection.execute(
                         "UPDATE trend_media_downloads SET status='failed',error=?,completed_at=?,updated_at=? "
                         "WHERE snapshot_id=? AND hashtag_id=? AND video_id=?",
@@ -651,28 +738,74 @@ class TrendRepository:
         video_rows: Iterable[dict[str, Any]] | None = None,
     ) -> dict[str, int]:
         rows = list(video_rows) if video_rows is not None else self.videos(snapshot_id)
+        unique_rows = {str(row["video_id"]): row for row in rows}
+        saved_ids = {
+            video_id for video_id, row in unique_rows.items()
+            if row.get("media_status") in {"media_ready", "analyzing", "analyzed"}
+            and bool(row.get("relative_path"))
+        }
         summary = {
-            "targets": len(rows), "queued": 0, "downloading": 0, "downloaded": 0,
-            "reused": 0, "approved": 0, "failed": 0, "interrupted": 0,
+            "targets": len(rows),
+            "target_references": len(rows),
+            "unique_videos": len(unique_rows),
+            "saved": len(saved_ids),
+            "new": len(unique_rows) - len(saved_ids),
+            "queued": 0, "downloading": 0, "downloaded": 0,
+            "reused": 0, "approved": len(saved_ids), "failed": 0, "interrupted": 0,
         }
         for row in rows:
-            if row.get("media_status") in {"media_ready", "analyzing", "analyzed"}:
-                summary["approved"] += 1
             status = str(row.get("download_status") or "")
             if status in summary:
                 summary[status] += 1
-            if status == "downloaded" and str(row.get("download_snapshot_id") or "") != snapshot_id:
-                summary["reused"] += 1
         return summary
+
+    def record_reference(
+        self,
+        *,
+        row: dict[str, Any],
+        run_id: str,
+        source_url: str,
+        status: str,
+        media: dict[str, Any],
+        extractor_version: str,
+        attempted: bool,
+    ) -> None:
+        now = utc_now()
+        self.database.execute(
+            "INSERT INTO trend_media_downloads("
+            "snapshot_id,hashtag_id,video_id,hashtag_name,normalized_hashtag,final_rank,run_id,source_url,"
+            "relative_path,file_sha256,file_size,file_mtime_ns,duration_seconds,status,error,"
+            "extractor_version,attempt_count,started_at,completed_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,?,?,?,?) "
+            "ON CONFLICT(snapshot_id,hashtag_id,video_id) DO UPDATE SET "
+            "hashtag_name=excluded.hashtag_name,normalized_hashtag=excluded.normalized_hashtag,"
+            "final_rank=excluded.final_rank,run_id=excluded.run_id,source_url=excluded.source_url,"
+            "relative_path=excluded.relative_path,file_sha256=excluded.file_sha256,"
+            "file_size=excluded.file_size,file_mtime_ns=excluded.file_mtime_ns,"
+            "duration_seconds=excluded.duration_seconds,status=excluded.status,error=NULL,"
+            "extractor_version=excluded.extractor_version,"
+            "attempt_count=trend_media_downloads.attempt_count+excluded.attempt_count,"
+            "started_at=excluded.started_at,completed_at=excluded.completed_at,updated_at=excluded.updated_at",
+            (
+                str(row["snapshot_id"]), str(row["hashtag_id"]), str(row["video_id"]),
+                str(row.get("hashtag_name") or ""),
+                normalize_hashtag_folder_name(row.get("hashtag_name")), int(row["final_rank"]),
+                run_id, source_url, str(media["relative_path"]), str(media["file_sha256"]),
+                int(media["file_size"]), int(media["file_mtime_ns"]),
+                float(media.get("duration_seconds") or 0.0), status, extractor_version,
+                1 if attempted else 0, now if attempted else None, now, now,
+            ),
+        )
 
     def link_media(self, video_id: str, relative_path: str, file_sha256: str, stat: Any, actor: str) -> dict[str, Any]:
         now = utc_now()
         self.database.execute(
-            "INSERT INTO trend_media_links(video_id,relative_path,file_sha256,file_size,file_mtime_ns,status,approved_at,approved_by,error,updated_at) "
-            "VALUES(?,?,?,?,?,'media_ready',?,?,NULL,?) ON CONFLICT(video_id) DO UPDATE SET "
+            "INSERT INTO trend_media_links(video_id,relative_path,file_sha256,file_size,file_mtime_ns,status,approved_at,approved_by,error,validated_at,updated_at) "
+            "VALUES(?,?,?,?,?,'media_ready',?,?,NULL,?,?) ON CONFLICT(video_id) DO UPDATE SET "
             "relative_path=excluded.relative_path,file_sha256=excluded.file_sha256,file_size=excluded.file_size,file_mtime_ns=excluded.file_mtime_ns," 
-            "status='media_ready',approved_at=excluded.approved_at,approved_by=excluded.approved_by,error=NULL,updated_at=excluded.updated_at",
-            (video_id, relative_path, file_sha256, int(stat.st_size), int(stat.st_mtime_ns), now, actor, now),
+            "status='media_ready',approved_at=excluded.approved_at,approved_by=excluded.approved_by,error=NULL,"
+            "validated_at=excluded.validated_at,updated_at=excluded.updated_at",
+            (video_id, relative_path, file_sha256, int(stat.st_size), int(stat.st_mtime_ns), now, actor, now, now),
         )
         return {"video_id": video_id, "relative_path": relative_path, "file_sha256": file_sha256, "status": "media_ready", "approved_at": now, "approved_by": actor}
 
@@ -753,7 +886,15 @@ class TrendService:
 
     @property
     def media_root(self) -> Path:
-        configured = Path(str(getattr(self.cfg, "TREND_MEDIA_DIR", "working/trends/media") or "working/trends/media"))
+        configured = Path(str(getattr(self.cfg, "TREND_MEDIA_DIR", r"D:\Trend Videos") or r"D:\Trend Videos"))
+        return (configured if configured.is_absolute() else Path.cwd() / configured).resolve()
+
+    @property
+    def legacy_media_root(self) -> Path:
+        configured = Path(str(
+            getattr(self.cfg, "TREND_LEGACY_MEDIA_DIR", "working/trends/media")
+            or "working/trends/media"
+        ))
         return (configured if configured.is_absolute() else Path.cwd() / configured).resolve()
 
     def configuration(self) -> dict[str, Any]:
@@ -982,6 +1123,13 @@ class TrendService:
                 "unrelated hashtags were not used to fill the list."
             )
         hashtag_ids = {str(item["hashtag_id"]) for item in hashtags}
+        candidate_video_ids = {
+            str(item["video_id"])
+            for item in self.repository.candidates(snapshot_id)
+            if str(item["hashtag_id"]) in hashtag_ids
+        }
+        for video_id in candidate_video_ids:
+            self._reusable_canonical_media(video_id, actor="system:trend-page")
         valid_rows = [
             item for item in self.repository.videos(snapshot_id)
             if str(item["hashtag_id"]) in hashtag_ids
@@ -1081,14 +1229,18 @@ class TrendService:
         snapshot_id = str(request.snapshot_id or "").strip()
         if self.repository.snapshot(snapshot_id) is None:
             raise TrendServiceError("Trend snapshot was not found.")
-        available, extractor_version = self._ytdlp_configuration()
-        if not available:
-            raise TrendServiceError("yt-dlp is unavailable in the backend Python environment.")
-        reserve = max(0, int(getattr(self.cfg, "TREND_YTDLP_MIN_FREE_BYTES", 5 * 1024**3)))
-        self.media_root.mkdir(parents=True, exist_ok=True)
-        if _free_disk_bytes(self.media_root) < reserve:
-            raise TrendServiceError("Trend media storage does not meet the configured free-disk reserve.")
+        return self._download_all_canonical(
+            request, snapshot_id=snapshot_id, run_id=str(run_id or uuid4().hex), actor=actor
+        )
 
+    def _download_all_canonical(
+        self,
+        request: Any,
+        *,
+        snapshot_id: str,
+        run_id: str,
+        actor: str,
+    ) -> dict[str, Any]:
         relevant_hashtag_ids = {
             str(item["hashtag_id"])
             for item in filter_relevant_hashtags(
@@ -1104,57 +1256,665 @@ class TrendService:
         ]
         if not rows:
             raise TrendServiceError("The selected trend snapshot has no video references to download.")
-        run_id = str(run_id or uuid4().hex)
-        groups: dict[str, list[dict[str, Any]]] = {}
-        for row in rows:
-            groups.setdefault(str(row["hashtag_id"]), []).append(row)
-        normalized_owners: dict[str, str] = {}
-        for hashtag_id, hashtag_rows in groups.items():
-            normalized = normalize_hashtag_folder_name(hashtag_rows[0].get("hashtag_name"))
-            owner = normalized_owners.setdefault(normalized, hashtag_id)
-            if owner != hashtag_id:
-                raise TrendServiceError(
-                    "Two hashtags normalize to the same download folder; no folders were changed."
-                )
-        concurrency = max(1, min(4, int(getattr(self.cfg, "TREND_YTDLP_CONCURRENCY", 2))))
-        timeout = max(30, int(getattr(self.cfg, "TREND_YTDLP_TIMEOUT_SECONDS", 600)))
-        downloaded = reused = approved = bytes_written = 0
-        failures: list[dict[str, str]] = []
-        hashtag_results: list[dict[str, Any]] = []
-        for hashtag_rows in groups.values():
-            result = self._refresh_hashtag_folder(
-                snapshot_id=snapshot_id,
-                rows=hashtag_rows,
-                run_id=run_id,
-                retry_failed=bool(request.retry_failed),
-                extractor_version=extractor_version,
-                reserve=reserve,
-                timeout=timeout,
-                concurrency=concurrency,
-                actor=actor,
-            )
-            hashtag_results.append(result)
-            downloaded += int(result["downloaded_count"])
-            reused += int(result["reused_count"])
-            approved += int(result["saved_count"])
-            bytes_written += int(result["bytes_written"])
-            failures.extend(result["failures"])
 
+        references: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            references.setdefault(str(row["video_id"]), []).append(row)
+
+        self.media_root.mkdir(parents=True, exist_ok=True)
+        library = resolve_within_root(self.media_root, "library", must_exist=False)
+        library.mkdir(parents=True, exist_ok=True)
+        media_by_id: dict[str, dict[str, Any]] = {}
+        integrity_conflicts: dict[str, str] = {}
+        for video_id in references:
+            media, conflict = self._reusable_canonical_media(video_id, actor=actor)
+            if media is not None:
+                media_by_id[video_id] = media
+            elif conflict:
+                integrity_conflicts[video_id] = conflict
+
+        retry_failed = bool(getattr(request, "retry_failed", False))
+        skipped_errors: dict[str, str] = {}
+        for video_id, video_rows in references.items():
+            previous = self.repository.download(
+                snapshot_id, str(video_rows[0]["hashtag_id"]), video_id
+            )
+            if (
+                video_id not in media_by_id
+                and video_id not in integrity_conflicts
+                and previous is not None
+                and str(previous.get("status")) == "failed"
+                and not retry_failed
+            ):
+                skipped_errors[video_id] = str(
+                    previous.get("error") or "Previous download failed; retry was not requested."
+                )
+        new_ids = [
+            video_id for video_id in references
+            if video_id not in media_by_id
+            and video_id not in integrity_conflicts
+            and video_id not in skipped_errors
+        ]
+        extractor_version = ""
+        reserve = max(0, int(getattr(self.cfg, "TREND_YTDLP_MIN_FREE_BYTES", 5 * 1024**3)))
+        timeout = max(30, int(getattr(self.cfg, "TREND_YTDLP_TIMEOUT_SECONDS", 600)))
+        concurrency = max(1, min(4, int(getattr(self.cfg, "TREND_YTDLP_CONCURRENCY", 2))))
+        circuit = DownloadCircuitBreaker(int(getattr(
+            self.cfg, "TREND_DOWNLOAD_CIRCUIT_BREAKER_THRESHOLD",
+            TIKTOK_DOWNLOAD_CIRCUIT_BREAKER_THRESHOLD,
+        )))
+        downloaded_ids: set[str] = set()
+        failures: list[dict[str, str]] = []
+        network_errors: dict[str, str] = {}
+
+        if new_ids:
+            available, extractor_version = self._ytdlp_configuration()
+            if not available:
+                raise TrendServiceError("yt-dlp is unavailable in the backend Python environment.")
+            if _free_disk_bytes(self.media_root) < reserve:
+                raise TrendServiceError("Trend media storage does not meet the configured free-disk reserve.")
+
+            first_id = new_ids[0]
+            first_row = references[first_id][0]
+            try:
+                source_url = _validated_tiktok_video_url(str(first_row.get("share_url") or ""), first_id)
+                media_by_id[first_id] = self._acquire_canonical_media(
+                    first_row, source_url=source_url, timeout=timeout, reserve=reserve,
+                    actor=actor,
+                )
+                downloaded_ids.add(first_id)
+                circuit.success()
+            except Exception as exc:
+                error = _sanitize_download_error(f"{type(exc).__name__}: {exc}")
+                network_errors[first_id] = error
+                failure = circuit.failed(error)
+                if failure.systemic:
+                    self._record_canonical_failure(references[first_id], run_id, error)
+                    interruption = (
+                        "Bulk download stopped because the preflight detected a shared downloader failure. "
+                        f"{failure.message}"
+                    )
+                    self._interrupt_canonical_references(
+                        (row for video_id in new_ids[1:] for row in references[video_id]),
+                        run_id=run_id, error=interruption,
+                    )
+                    raise TrendServiceError(
+                        "TikTok downloads are currently unavailable: the configured downloader "
+                        f"failed during preflight. Details: {failure.message}"
+                    ) from exc
+
+            remaining = [video_id for video_id in new_ids[1:] if video_id not in media_by_id]
+            with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="trend-download") as executor:
+                offset = 0
+                while offset < len(remaining) and not circuit.tripped:
+                    wave = remaining[offset:offset + concurrency]
+                    pending = {}
+                    for video_id in wave:
+                        row = references[video_id][0]
+                        try:
+                            source_url = _validated_tiktok_video_url(
+                                str(row.get("share_url") or ""), video_id
+                            )
+                        except TrendServiceError as exc:
+                            network_errors[video_id] = _sanitize_download_error(str(exc))
+                            continue
+                        pending[executor.submit(
+                            self._acquire_canonical_media, row, source_url=source_url,
+                            timeout=timeout, reserve=reserve, actor=actor,
+                        )] = video_id
+                    for future in as_completed(pending):
+                        video_id = pending[future]
+                        try:
+                            media_by_id[video_id] = future.result()
+                            downloaded_ids.add(video_id)
+                            circuit.success()
+                        except Exception as exc:
+                            error = _sanitize_download_error(f"{type(exc).__name__}: {exc}")
+                            network_errors[video_id] = error
+                            circuit.failed(error)
+                    offset += len(wave)
+
+                if circuit.tripped and offset < len(remaining):
+                    untouched = remaining[offset:]
+                    interruption = (
+                        "Bulk download stopped because a shared downloader failure was detected. "
+                        f"{circuit.failure.message if circuit.failure else 'TikTok downloader failed repeatedly.'}"
+                    )
+                    self._interrupt_canonical_references(
+                        (row for video_id in untouched for row in references[video_id]),
+                        run_id=run_id, error=interruption,
+                    )
+                    for video_id in remaining[:offset]:
+                        if video_id in network_errors:
+                            self._record_canonical_failure(
+                                references[video_id], run_id, network_errors[video_id]
+                            )
+                    for video_id, media in media_by_id.items():
+                        for index, row in enumerate(references[video_id]):
+                            was_network_download = video_id in downloaded_ids and index == 0
+                            self.repository.record_reference(
+                                row=row, run_id=run_id,
+                                source_url=str(row.get("share_url") or ""),
+                                status="downloaded" if was_network_download else "reused",
+                                media=media, extractor_version=extractor_version,
+                                attempted=was_network_download,
+                            )
+                    self._write_canonical_hashtag_metadata(rows, media_by_id)
+                    raise TrendServiceError(
+                        "TikTok downloader failed repeatedly. "
+                        f"{len(untouched)} videos were not attempted. "
+                        f"Details: {circuit.failure.message if circuit.failure else interruption}"
+                    )
+
+        for video_id, error in integrity_conflicts.items():
+            self._record_canonical_failure(references[video_id], run_id, error, attempted=False)
+            failures.append({"video_id": video_id, "error": error})
+        for video_id, error in skipped_errors.items():
+            self._record_canonical_failure(
+                references[video_id], run_id, error, attempted=False
+            )
+            failures.append({"video_id": video_id, "error": error})
+        for video_id, error in network_errors.items():
+            if video_id not in downloaded_ids:
+                self._record_canonical_failure(references[video_id], run_id, error)
+                failures.append({"video_id": video_id, "error": error})
+
+        reused_ids = set(media_by_id) - downloaded_ids
+        for video_id, media in media_by_id.items():
+            for index, row in enumerate(references[video_id]):
+                was_network_download = video_id in downloaded_ids and index == 0
+                self.repository.record_reference(
+                    row=row, run_id=run_id,
+                    source_url=str(row.get("share_url") or ""),
+                    status="downloaded" if was_network_download else "reused",
+                    media=media, extractor_version=extractor_version,
+                    attempted=was_network_download,
+                )
+
+        self._write_canonical_hashtag_metadata(rows, media_by_id)
         result = {
             "snapshot_id": snapshot_id,
             "run_id": run_id,
-            "target_count": len(rows),
-            "downloaded_count": downloaded,
-            "reused_count": reused,
-            "approved_count": approved,
+            "target_reference_count": len(rows),
+            "unique_video_count": len(references),
+            "saved_count": len(media_by_id),
+            "approved_count": len(media_by_id),
+            "downloaded_count": len(downloaded_ids),
+            "reused_count": len(reused_ids),
+            "new_count": len(references) - len(media_by_id),
             "failed_count": len(failures),
-            "bytes_written": bytes_written,
-            "failures": failures[:100],
-            "hashtags": hashtag_results,
+            "failures": failures,
+            "bytes_written": sum(
+                int(media_by_id[video_id]["file_size"]) for video_id in downloaded_ids
+            ),
+            "library": str(library),
         }
-        if approved == 0:
-            raise TrendServiceError("No TikTok videos could be downloaded or reused. See the per-video download errors.")
+        if not media_by_id and failures:
+            raise TrendServiceError(
+                "No TikTok videos could be downloaded or reused. See the per-video download errors."
+            )
         return result
+
+    def _canonical_relative_path(self, video_id: str) -> str:
+        trend_download_filename(1, video_id)
+        return (Path("library") / f"{video_id}.mp4").as_posix()
+
+    def _reusable_canonical_media(
+        self, video_id: str, *, actor: str
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        relative_path = self._canonical_relative_path(video_id)
+        path = resolve_within_root(self.media_root, relative_path, must_exist=False)
+        link = self.repository.media_link(video_id)
+        if not path.is_file():
+            if link is not None:
+                self.repository.set_media_status(
+                    video_id, "missing", "Canonical media file is missing."
+                )
+            return None, None
+        try:
+            stat = path.stat()
+            if (
+                link is not None
+                and str(link.get("relative_path")) == relative_path
+                and int(link.get("file_size") or -1) == int(stat.st_size)
+                and int(link.get("file_mtime_ns") or -1) == int(stat.st_mtime_ns)
+                and str(link.get("status") or "") in {"media_ready", "analyzing", "analyzed"}
+            ):
+                return {**link, "duration_seconds": 0.0}, None
+            probe = _probe_downloaded_video(path)
+            digest = _file_sha256(path)
+            if link is not None and link.get("file_sha256") and digest != link["file_sha256"]:
+                error = "Canonical media changed unexpectedly; local integrity conflict requires review."
+                self.repository.set_media_status(video_id, "integrity_conflict", error)
+                return None, error
+            linked = self.repository.link_media(video_id, relative_path, digest, stat, actor)
+            return {**linked, "file_size": stat.st_size, "file_mtime_ns": stat.st_mtime_ns,
+                    "duration_seconds": float(probe["duration_seconds"])}, None
+        except (OSError, TrendServiceError) as exc:
+            return None, _sanitize_download_error(str(exc))
+
+    def _acquire_canonical_media(
+        self,
+        row: dict[str, Any],
+        *,
+        source_url: str,
+        timeout: int,
+        reserve: int,
+        actor: str,
+    ) -> dict[str, Any]:
+        video_id = str(row["video_id"])
+        lock_key = (os.path.normcase(str(self.media_root)), video_id)
+        with _VIDEO_ACQUISITION_LOCKS_GUARD:
+            lock = _VIDEO_ACQUISITION_LOCKS.setdefault(lock_key, threading.Lock())
+        with lock:
+            cached, conflict = self._reusable_canonical_media(video_id, actor=actor)
+            if cached is not None:
+                return cached
+            if conflict:
+                raise TrendServiceError(conflict)
+            if _free_disk_bytes(self.media_root) < reserve:
+                raise TrendServiceError("Free-disk reserve reached before download started.")
+            library = resolve_within_root(self.media_root, "library", must_exist=False)
+            library.mkdir(parents=True, exist_ok=True)
+            work_dir = resolve_within_root(
+                self.media_root, f"library/.{video_id}.{uuid4().hex}.download", must_exist=False
+            )
+            work_dir.mkdir(parents=False, exist_ok=False)
+            try:
+                produced = Path(self.download_runner(video_id, source_url, work_dir, timeout)).resolve()
+                try:
+                    produced.relative_to(work_dir)
+                except ValueError as exc:
+                    raise TrendServiceError(
+                        "yt-dlp returned a file outside its temporary download directory."
+                    ) from exc
+                if not produced.is_file() or produced.suffix.casefold() != ".mp4":
+                    raise TrendServiceError("yt-dlp did not produce a completed MP4 video file.")
+                probe = _probe_downloaded_video(produced)
+                digest = _file_sha256(produced)
+                target = resolve_within_root(
+                    self.media_root, self._canonical_relative_path(video_id), must_exist=False
+                )
+                os.replace(produced, target)
+                stat = target.stat()
+                linked = self.repository.link_media(
+                    video_id, self._canonical_relative_path(video_id), digest, stat, actor
+                )
+                return {
+                    **linked, "file_size": int(stat.st_size),
+                    "file_mtime_ns": int(stat.st_mtime_ns),
+                    "duration_seconds": float(probe["duration_seconds"]),
+                }
+            finally:
+                if work_dir.exists():
+                    shutil.rmtree(work_dir)
+
+    def _record_canonical_failure(
+        self,
+        rows: list[dict[str, Any]],
+        run_id: str,
+        error: str,
+        attempted: bool = True,
+    ) -> None:
+        for index, row in enumerate(rows):
+            self.repository.record_failed_reference(
+                row=row, run_id=run_id, source_url=str(row.get("share_url") or ""),
+                error=error, attempted=attempted and index == 0,
+            )
+
+    def _interrupt_canonical_references(
+        self, rows: Iterable[dict[str, Any]], *, run_id: str, error: str
+    ) -> int:
+        count = 0
+        for row in rows:
+            self.repository.interrupt_download(
+                row=row, run_id=run_id, source_url=str(row.get("share_url") or ""), error=error
+            )
+            count += 1
+        return count
+
+    def _write_canonical_hashtag_metadata(
+        self, rows: list[dict[str, Any]], media_by_id: dict[str, dict[str, Any]]
+    ) -> None:
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            groups.setdefault(str(row["hashtag_id"]), []).append(row)
+        for hashtag_rows in groups.values():
+            normalized = normalize_hashtag_folder_name(hashtag_rows[0].get("hashtag_name"))
+            folder = resolve_within_root(
+                self.media_root, f"hashtags/{normalized}", must_exist=False
+            )
+            folder.mkdir(parents=True, exist_ok=True)
+            videos = [
+                {
+                    "rank": int(row["final_rank"]),
+                    "video_id": str(row["video_id"]),
+                    "media": f"../../library/{row['video_id']}.mp4",
+                    "share_url": str(row.get("share_url") or ""),
+                }
+                for row in hashtag_rows if str(row["video_id"]) in media_by_id
+            ]
+            target = folder / "metadata.json"
+            temporary = folder / f".metadata.{uuid4().hex}.tmp"
+            temporary.write_text(json.dumps({
+                "hashtag": normalized,
+                "source_hashtag": str(hashtag_rows[0].get("hashtag_name") or ""),
+                "snapshot_id": str(hashtag_rows[0]["snapshot_id"]),
+                "updated_at": utc_now(),
+                "videos": videos,
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(temporary, target)
+
+    def audit_legacy_media(self, legacy_root: Path | None = None) -> dict[str, Any]:
+        root = (legacy_root or self.legacy_media_root).resolve()
+        files = sorted(root.rglob("*.mp4")) if root.is_dir() else []
+        path_ids: dict[str, str] = {}
+        for table in ("trend_media_downloads", "trend_media_links"):
+            for row in self.database.query(
+                f"SELECT video_id,relative_path FROM {table} WHERE relative_path IS NOT NULL"
+            ):
+                try:
+                    path = resolve_within_root(root, str(row["relative_path"]), must_exist=False)
+                except UnsafePathError:
+                    continue
+                path_ids[os.path.normcase(str(path))] = str(row["video_id"])
+
+        groups: dict[str, list[dict[str, Any]]] = {}
+        invalid: list[dict[str, str]] = []
+        unknown: list[str] = []
+        for path in files:
+            video_id = path_ids.get(os.path.normcase(str(path.resolve())))
+            if video_id is None:
+                match = re.fullmatch(r"(?:\d{3}_)?([A-Za-z0-9_-]{1,128})\.mp4", path.name)
+                if match:
+                    video_id = match.group(1)
+            if video_id is None:
+                unknown.append(str(path))
+                continue
+            try:
+                probe = _probe_downloaded_video(path)
+                digest = _file_sha256(path)
+                stat = path.stat()
+                groups.setdefault(video_id, []).append({
+                    "path": path, "sha256": digest, "size": int(stat.st_size),
+                    "mtime_ns": int(stat.st_mtime_ns),
+                    "duration_seconds": float(probe["duration_seconds"]),
+                })
+            except (OSError, TrendServiceError) as exc:
+                invalid.append({"path": str(path), "error": _sanitize_download_error(str(exc))})
+
+        conflicts = []
+        duplicate_file_count = 0
+        duplicate_bytes = 0
+        for video_id, items in groups.items():
+            hashes: dict[str, list[dict[str, Any]]] = {}
+            for item in items:
+                hashes.setdefault(str(item["sha256"]), []).append(item)
+            if len(hashes) > 1:
+                conflicts.append({
+                    "video_id": video_id,
+                    "hashes": {digest: [str(item["path"]) for item in matches]
+                               for digest, matches in hashes.items()},
+                })
+            for matches in hashes.values():
+                duplicate_file_count += max(0, len(matches) - 1)
+                duplicate_bytes += sum(int(item["size"]) for item in matches[1:])
+        missing_links = 0
+        for link in self.database.query("SELECT relative_path FROM trend_media_links"):
+            try:
+                present = resolve_within_root(
+                    root, str(link["relative_path"]), must_exist=False
+                ).is_file()
+            except UnsafePathError:
+                present = False
+            if not present:
+                missing_links += 1
+        return {
+            "root": str(root), "physical_mp4_count": len(files),
+            "physical_bytes": sum(path.stat().st_size for path in files),
+            "unique_video_ids": len(groups), "duplicate_video_ids": sum(
+                1 for items in groups.values() if len(items) > 1
+            ),
+            "duplicate_file_count": duplicate_file_count,
+            "duplicate_bytes": duplicate_bytes,
+            "missing_database_links": missing_links,
+            "invalid_files": invalid, "unknown_files": unknown,
+            "hash_conflicts": conflicts, "groups": groups,
+        }
+
+    def migrate_legacy_media(
+        self,
+        legacy_root: Path | None = None,
+        *,
+        cleanup: bool = False,
+        actor: str = "system:trend-media-migration",
+    ) -> dict[str, Any]:
+        audit = self.audit_legacy_media(legacy_root)
+        root = Path(audit["root"])
+        library = resolve_within_root(self.media_root, "library", must_exist=False)
+        library.mkdir(parents=True, exist_ok=True)
+        migrated = 0
+        reused = 0
+        removed = 0
+        reclaimed = 0
+        conflicts: list[dict[str, Any]] = []
+        left_behind: list[str] = list(audit["unknown_files"])
+        conflict_ids = {item["video_id"] for item in audit["hash_conflicts"]}
+
+        for video_id, items in audit["groups"].items():
+            target = resolve_within_root(
+                self.media_root, self._canonical_relative_path(video_id), must_exist=False
+            )
+            link = self.repository.media_link(video_id)
+            chosen: dict[str, Any] | None = None
+            if video_id in conflict_ids:
+                expected_hash = str(link.get("file_sha256") or "") if link else ""
+                authoritative = [item for item in items if item["sha256"] == expected_hash]
+                if len({item["sha256"] for item in authoritative}) == 1 and authoritative:
+                    chosen = authoritative[0]
+                else:
+                    conflicts.append(next(
+                        item for item in audit["hash_conflicts"] if item["video_id"] == video_id
+                    ))
+                    left_behind.extend(str(item["path"]) for item in items)
+                    continue
+            else:
+                chosen = items[0]
+
+            if target.is_file():
+                try:
+                    target_hash = _file_sha256(target)
+                    _probe_downloaded_video(target)
+                except (OSError, TrendServiceError):
+                    target_hash = ""
+                if target_hash != chosen["sha256"]:
+                    conflicts.append({
+                        "video_id": video_id,
+                        "reason": "canonical target differs from validated legacy source",
+                        "paths": [str(target), str(chosen["path"])],
+                    })
+                    left_behind.extend(str(item["path"]) for item in items)
+                    continue
+                reused += 1
+            else:
+                temporary = library / f".{video_id}.{uuid4().hex}.migration"
+                try:
+                    shutil.copy2(chosen["path"], temporary)
+                    with temporary.open("r+b") as handle:
+                        os.fsync(handle.fileno())
+                    if _file_sha256(temporary) != chosen["sha256"]:
+                        raise TrendServiceError("Migrated media checksum did not match its source.")
+                    _probe_downloaded_video(temporary)
+                    os.replace(temporary, target)
+                    migrated += 1
+                finally:
+                    if temporary.exists():
+                        temporary.unlink()
+
+            stat = target.stat()
+            self.repository.link_media(
+                video_id, self._canonical_relative_path(video_id), chosen["sha256"], stat, actor
+            )
+            canonical_hash = _file_sha256(target)
+            _probe_downloaded_video(target)
+            if cleanup:
+                for item in items:
+                    source = Path(item["path"])
+                    if (
+                        source.is_file()
+                        and item["sha256"] == canonical_hash
+                        and _is_relative_to(source, root)
+                    ):
+                        size = source.stat().st_size
+                        source.unlink()
+                        removed += 1
+                        reclaimed += size
+                    else:
+                        left_behind.append(str(source))
+
+        canonical_ids = {
+            path.stem for path in library.glob("*.mp4") if path.is_file()
+        }
+        for link in self.database.query("SELECT video_id,status FROM trend_media_links"):
+            video_id = str(link["video_id"])
+            if video_id not in canonical_ids and str(link["status"]) != "missing":
+                self.repository.set_media_status(
+                    video_id, "missing", "No validated canonical media file is present."
+                )
+
+        return {
+            **{key: value for key, value in audit.items() if key != "groups"},
+            "new_root": str(self.media_root), "library": str(library),
+            "files_migrated": migrated, "canonical_files_reused": reused,
+            "source_files_removed": removed, "source_bytes_removed": reclaimed,
+            "bytes_reclaimed": int(audit["duplicate_bytes"]) if cleanup else 0,
+            "conflicts": conflicts, "files_left_behind": sorted(set(left_behind)),
+        }
+
+    def _existing_download_source(self, row: dict[str, Any]) -> Path | None:
+        downloads_root = resolve_within_root(self.media_root, "downloads", must_exist=False)
+        normalized_hashtag = normalize_hashtag_folder_name(row.get("hashtag_name"))
+        final_dir = resolve_within_root(
+            self.media_root, f"downloads/{normalized_hashtag}", must_exist=False
+        )
+        video_id = str(row["video_id"])
+        expected_name = trend_download_filename(int(row["final_rank"]), video_id)
+        return (
+            _find_existing_ranked_video(final_dir, expected_name, video_id)
+            or _find_legacy_video(downloads_root, video_id)
+        )
+
+    def _interrupt_rows(self, rows: Iterable[dict[str, Any]], *, run_id: str, error: str) -> int:
+        interrupted = 0
+        for row in rows:
+            if self._existing_download_source(row) is not None:
+                continue
+            video_id = str(row["video_id"])
+            try:
+                source_url = _validated_tiktok_video_url(str(row.get("share_url") or ""), video_id)
+            except TrendServiceError:
+                source_url = ""
+            self.repository.interrupt_download(
+                row=row, run_id=run_id, source_url=source_url, error=error
+            )
+            interrupted += 1
+        return interrupted
+
+    def _preflight_download(
+        self,
+        *,
+        rows: list[dict[str, Any]],
+        run_id: str,
+        retry_failed: bool,
+        reserve: int,
+        timeout: int,
+    ) -> tuple[Path | None, dict[tuple[str, str], Path], dict[tuple[str, str], dict[str, str]]]:
+        candidates: list[tuple[dict[str, Any], str]] = []
+        for row in rows:
+            if self._existing_download_source(row) is not None:
+                continue
+            existing = self.repository.download(
+                str(row["snapshot_id"]), str(row["hashtag_id"]), str(row["video_id"])
+            )
+            if existing and existing.get("status") == "failed" and not retry_failed:
+                continue
+            video_id = str(row["video_id"])
+            try:
+                source_url = _validated_tiktok_video_url(str(row.get("share_url") or ""), video_id)
+            except TrendServiceError:
+                continue
+            candidates.append((row, source_url))
+        if not candidates:
+            return None, {}, {}
+
+        downloads_root = resolve_within_root(self.media_root, "downloads", must_exist=False)
+        downloads_root.mkdir(parents=True, exist_ok=True)
+        preflight_dir = resolve_within_root(
+            self.media_root, f"downloads/.preflight.{uuid4().hex}.tmp", must_exist=False
+        )
+        preflight_dir.mkdir(parents=False, exist_ok=False)
+        failures: dict[tuple[str, str], dict[str, str]] = {}
+        try:
+            for row, source_url in candidates[:3]:
+                video_id = str(row["video_id"])
+                hashtag_id = str(row["hashtag_id"])
+                self.repository.queue_download(
+                    video_id=video_id,
+                    snapshot_id=str(row["snapshot_id"]),
+                    hashtag_id=hashtag_id,
+                    hashtag_name=str(row.get("hashtag_name") or ""),
+                    normalized_hashtag=normalize_hashtag_folder_name(row.get("hashtag_name")),
+                    final_rank=int(row["final_rank"]),
+                    run_id=run_id,
+                    source_url=source_url,
+                )
+                try:
+                    record = self._download_one_to_stage(
+                        str(row["snapshot_id"]), hashtag_id, row, source_url,
+                        preflight_dir, trend_download_filename(int(row["final_rank"]), video_id),
+                        reserve, timeout, normalize_hashtag_folder_name(row.get("hashtag_name")),
+                    )
+                    path = preflight_dir / Path(record["relative_path"]).name
+                    return preflight_dir, {(hashtag_id, video_id): path}, failures
+                except Exception as exc:
+                    error = _sanitize_download_error(f"{type(exc).__name__}: {exc}")
+                    self.repository.fail_download(str(row["snapshot_id"]), hashtag_id, video_id, error)
+                    failure = _classify_download_error(error)
+                    failures[(hashtag_id, video_id)] = {"video_id": video_id, "error": error}
+                    if failure.systemic:
+                        interruption = (
+                            "Bulk download stopped because the preflight detected a shared downloader failure. "
+                            f"{failure.message}"
+                        )
+                        self._interrupt_rows(
+                            (
+                                item for item in rows
+                                if (str(item["hashtag_id"]), str(item["video_id"]))
+                                != (hashtag_id, video_id)
+                            ),
+                            run_id=run_id,
+                            error=interruption,
+                        )
+                        raise TrendServiceError(
+                            "TikTok downloads are currently unavailable: the configured downloader "
+                            f"failed during preflight. Details: {failure.message}"
+                        ) from exc
+            failed_keys = set(failures)
+            self._interrupt_rows(
+                (
+                    item for item in rows
+                    if (str(item["hashtag_id"]), str(item["video_id"])) not in failed_keys
+                ),
+                run_id=run_id,
+                error="Bulk download stopped because no available video passed preflight.",
+            )
+            raise TrendServiceError(
+                "TikTok downloads could not start: no available video passed the three-item preflight."
+            )
+        except BaseException:
+            if preflight_dir.exists():
+                shutil.rmtree(preflight_dir)
+            raise
 
     def _refresh_hashtag_folder(
         self,
@@ -1168,6 +1928,9 @@ class TrendService:
         timeout: int,
         concurrency: int,
         actor: str,
+        circuit: DownloadCircuitBreaker,
+        preflight_files: dict[tuple[str, str], Path],
+        preflight_failures: dict[tuple[str, str], dict[str, str]],
     ) -> dict[str, Any]:
         hashtag_id = str(rows[0]["hashtag_id"])
         hashtag_name = str(rows[0].get("hashtag_name") or "")
@@ -1204,15 +1967,21 @@ class TrendService:
         try:
             for row in rows:
                 video_id = str(row["video_id"])
+                download_key = (hashtag_id, video_id)
                 final_rank = int(row["final_rank"])
                 expected_name = trend_download_filename(final_rank, video_id)
                 existing_record = self.repository.download(snapshot_id, hashtag_id, video_id)
-                source = _find_existing_ranked_video(final_dir, expected_name, video_id)
+                preflight_source = preflight_files.get(download_key)
+                source = preflight_source
+                if source is None:
+                    source = _find_existing_ranked_video(final_dir, expected_name, video_id)
                 if source is None:
                     source = _find_legacy_video(downloads_root, video_id)
                 source_url = ""
                 if source is None:
-                    if existing_record and existing_record.get("status") == "failed" and not retry_failed:
+                    if download_key in preflight_failures:
+                        failures.append(preflight_failures[download_key])
+                    elif existing_record and existing_record.get("status") == "failed" and not retry_failed:
                         failures.append({
                             "video_id": video_id,
                             "error": _sanitize_download_error(
@@ -1229,23 +1998,28 @@ class TrendService:
                                 "video_id": video_id,
                                 "error": _sanitize_download_error(str(exc)),
                             })
-                self.repository.queue_download(
-                    video_id=video_id,
-                    snapshot_id=snapshot_id,
-                    hashtag_id=hashtag_id,
-                    hashtag_name=hashtag_name,
-                    normalized_hashtag=normalized_hashtag,
-                    final_rank=final_rank,
-                    run_id=run_id,
-                    source_url=source_url,
-                )
+                if preflight_source is None and download_key not in preflight_failures:
+                    self.repository.queue_download(
+                        video_id=video_id,
+                        snapshot_id=snapshot_id,
+                        hashtag_id=hashtag_id,
+                        hashtag_name=hashtag_name,
+                        normalized_hashtag=normalized_hashtag,
+                        final_rank=final_rank,
+                        run_id=run_id,
+                        source_url=source_url,
+                    )
                 if source is not None:
                     target = stage_dir / expected_name
                     shutil.copy2(source, target)
                     prepared[video_id] = self._prepared_download_record(
                         snapshot_id, hashtag_id, row, target, normalized_hashtag
                     )
-                    reused += 1
+                    if preflight_source is not None:
+                        downloaded += 1
+                        bytes_written += int(target.stat().st_size)
+                    else:
+                        reused += 1
                 elif source_url:
                     downloads.append({
                         "row": row,
@@ -1253,40 +2027,71 @@ class TrendService:
                         "target_name": expected_name,
                     })
 
+            unattempted: list[dict[str, Any]] = []
             with ThreadPoolExecutor(
                 max_workers=concurrency, thread_name_prefix="trend-download"
             ) as executor:
-                pending = {
-                    executor.submit(
-                        self._download_one_to_stage,
-                        snapshot_id,
-                        hashtag_id,
-                        item["row"],
-                        item["source_url"],
-                        stage_dir,
-                        item["target_name"],
-                        reserve,
-                        timeout,
-                        normalized_hashtag,
-                    ): item
-                    for item in downloads
-                }
-                for future in as_completed(pending):
-                    item = pending[future]
-                    video_id = str(item["row"]["video_id"])
-                    try:
-                        record = future.result()
-                        prepared[video_id] = record
-                        downloaded += 1
-                        bytes_written += int(record["file_size"])
-                    except Exception as exc:
-                        error = _sanitize_download_error(f"{type(exc).__name__}: {exc}")
-                        failures.append({"video_id": video_id, "error": error})
+                for offset in range(0, len(downloads), concurrency):
+                    if circuit.tripped:
+                        unattempted.extend(downloads[offset:])
+                        break
+                    wave = downloads[offset:offset + concurrency]
+                    pending = {
+                        executor.submit(
+                            self._download_one_to_stage,
+                            snapshot_id,
+                            hashtag_id,
+                            item["row"],
+                            item["source_url"],
+                            stage_dir,
+                            item["target_name"],
+                            reserve,
+                            timeout,
+                            normalized_hashtag,
+                        ): item
+                        for item in wave
+                    }
+                    for future in as_completed(pending):
+                        item = pending[future]
+                        video_id = str(item["row"]["video_id"])
+                        try:
+                            record = future.result()
+                            prepared[video_id] = record
+                            downloaded += 1
+                            bytes_written += int(record["file_size"])
+                            circuit.success()
+                        except Exception as exc:
+                            error = _sanitize_download_error(f"{type(exc).__name__}: {exc}")
+                            failures.append({"video_id": video_id, "error": error})
+                            circuit.failed(error)
+                    if circuit.tripped:
+                        unattempted.extend(downloads[offset + len(wave):])
+                        break
 
+            interruption_error = ""
+            if circuit.tripped:
+                interruption_error = (
+                    "Bulk download stopped because a shared downloader failure was detected. "
+                    f"{circuit.failure.message if circuit.failure else 'TikTok downloader failed repeatedly.'}"
+                )
+                self._interrupt_rows(
+                    (item["row"] for item in unattempted),
+                    run_id=run_id,
+                    error=interruption_error,
+                )
+
+            interrupted_ids = {
+                str(item["row"]["video_id"])
+                for item in unattempted
+            }
             failed_ids = {item["video_id"] for item in failures}
             for row in rows:
                 video_id = str(row["video_id"])
-                if video_id not in prepared and video_id not in failed_ids:
+                if (
+                    video_id not in prepared
+                    and video_id not in failed_ids
+                    and video_id not in interrupted_ids
+                ):
                     failures.append({
                         "video_id": video_id,
                         "error": "The video could not be prepared for this hashtag refresh.",
@@ -1302,7 +2107,7 @@ class TrendService:
                         )
                 for row in rows:
                     video_id = str(row["video_id"])
-                    if video_id not in failed_ids:
+                    if video_id not in failed_ids and video_id not in interrupted_ids:
                         error = "Hashtag refresh aborted; previous successful folder was preserved."
                         self.repository.fail_download(snapshot_id, hashtag_id, video_id, error)
                 return {
@@ -1318,33 +2123,22 @@ class TrendService:
                         "video_id": "",
                         "error": "Hashtag refresh did not prepare every ranked video.",
                     }],
+                    "circuit_break": ({
+                        "error": circuit.failure.message if circuit.failure else interruption_error,
+                        "unattempted_count": len(unattempted),
+                    } if circuit.tripped else None),
                 }
 
             successful_rows: list[dict[str, Any]] = []
-            temporary_renames: list[tuple[Path, Path, dict[str, Any], dict[str, Any]]] = []
+            ordered_records: list[dict[str, Any]] = []
             for row in rows:
                 video_id = str(row["video_id"])
                 record = prepared.get(video_id)
                 if record is None:
                     continue
                 ranked_row = dict(row)
-                ranked_row["final_rank"] = len(successful_rows) + 1
                 successful_rows.append(ranked_row)
-                current_path = stage_dir / Path(record["relative_path"]).name
-                temporary_path = stage_dir / f".rerank.{uuid4().hex}.mp4"
-                os.replace(current_path, temporary_path)
-                temporary_renames.append((temporary_path, current_path, ranked_row, record))
-
-            ordered_records: list[dict[str, Any]] = []
-            for temporary_path, _old_path, ranked_row, record in temporary_renames:
-                video_id = str(ranked_row["video_id"])
-                filename = trend_download_filename(int(ranked_row["final_rank"]), video_id)
-                target = stage_dir / filename
-                os.replace(temporary_path, target)
                 record["final_rank"] = int(ranked_row["final_rank"])
-                record["relative_path"] = (
-                    Path("downloads") / normalized_hashtag / filename
-                ).as_posix()
                 ordered_records.append(record)
 
             for child in stage_dir.iterdir():
@@ -1393,6 +2187,10 @@ class TrendService:
                 "example_filenames": [Path(record["relative_path"]).name for record in ordered_records[:3]],
                 "stale_files_remaining": False,
                 "failures": failures,
+                "circuit_break": ({
+                    "error": circuit.failure.message if circuit.failure else interruption_error,
+                    "unattempted_count": len(unattempted),
+                } if circuit.tripped else None),
             }
         finally:
             if stage_dir.exists() and not moved:
@@ -1856,6 +2654,14 @@ def normalize_hashtag_folder_name(hashtag: Any) -> str:
     return normalized
 
 
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
 def trend_download_filename(rank: int, video_id: Any) -> str:
     normalized_video_id = str(video_id or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", normalized_video_id):
@@ -2132,7 +2938,50 @@ def _validated_tiktok_video_url(value: str, video_id: str) -> str:
     return urllib.parse.urlunsplit(("https", hostname, parsed.path, "", ""))
 
 
+def _validated_tiktok_media_url(value: str) -> str:
+    try:
+        parsed = urllib.parse.urlsplit(str(value or ""))
+    except ValueError as exc:
+        raise TrendServiceError("TikTok player metadata returned a malformed media URL.") from exc
+    hostname = (parsed.hostname or "").casefold().rstrip(".")
+    allowed = any(
+        hostname == suffix.removeprefix(".") or hostname.endswith(suffix)
+        for suffix in TIKTOK_MEDIA_HOST_SUFFIXES
+    )
+    if parsed.scheme.casefold() != "https" or not allowed:
+        raise TrendServiceError("TikTok player metadata returned a media URL outside approved TikTok CDN hosts.")
+    return str(value)
+
+
+def _resolve_provider_media_url(video_id: str) -> str:
+    payload = TikTokDiscoveryClient("", "").post_metadata(video_id)
+    items = [value for value in (payload.get("items") or []) if isinstance(value, dict)]
+    item = next(
+        (
+            value for value in items
+            if str(value.get("id_str") or value.get("id") or "") == video_id
+        ),
+        items[0] if len(items) == 1 else {},
+    )
+    video_info = item.get("video_info") if isinstance(item, dict) else None
+    if not isinstance(video_info, dict):
+        raise TrendServiceError("Video is unavailable: TikTok returned no playable video metadata.")
+    urls = video_info.get("url_list")
+    if not isinstance(urls, list):
+        play_addr = video_info.get("play_addr")
+        urls = play_addr.get("url_list") if isinstance(play_addr, dict) else []
+    for value in urls or []:
+        if isinstance(value, str) and value.strip():
+            try:
+                return _validated_tiktok_media_url(value.strip())
+            except TrendServiceError:
+                continue
+    raise TrendServiceError("Video is unavailable: TikTok returned no approved playable media URL.")
+
+
 def _run_ytdlp(video_id: str, source_url: str, target_dir: Path, timeout: int) -> Path:
+    source_url = _validated_tiktok_video_url(source_url, video_id)
+    media_url = _resolve_provider_media_url(video_id)
     output_template = str(target_dir / f"{video_id}.%(ext)s")
     command = [
         sys.executable,
@@ -2150,13 +2999,17 @@ def _run_ytdlp(video_id: str, source_url: str, target_dir: Path, timeout: int) -
         "2",
         "--fragment-retries",
         "2",
+        "--add-header",
+        "User-Agent:Mozilla/5.0",
+        "--add-header",
+        f"Referer:https://www.tiktok.com/player/v1/{video_id}",
         "--merge-output-format",
         "mp4",
         "-f",
         "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
         "-o",
         output_template,
-        source_url,
+        media_url,
     ]
     try:
         result = subprocess.run(
@@ -2172,7 +3025,9 @@ def _run_ytdlp(video_id: str, source_url: str, target_dir: Path, timeout: int) -
     except OSError as exc:
         raise TrendServiceError("yt-dlp could not be started.") from exc
     if result.returncode != 0:
-        raise TrendServiceError(_sanitize_download_error(result.stderr or "yt-dlp failed to download this video."))
+        raise TrendServiceError(_sanitize_download_error(
+            result.stderr or "yt-dlp failed to download the TikTok provider media."
+        ))
     candidates = sorted(
         (
             path for path in target_dir.glob(f"{video_id}.*")
@@ -2184,6 +3039,63 @@ def _run_ytdlp(video_id: str, source_url: str, target_dir: Path, timeout: int) -
     if not candidates:
         raise TrendServiceError("yt-dlp completed without producing a supported video file.")
     return candidates[0]
+
+
+def _classify_download_error(error: str) -> DownloadFailure:
+    raw = _sanitize_download_error(error)
+    message = raw.casefold()
+    if "unexpected webpage response" in message or "unexpected response from webpage request" in message:
+        return DownloadFailure(
+            "tiktok_challenge", "tiktok_challenge_unexpected_response",
+            "TikTok extractor returned an unexpected webpage response.", True,
+        )
+    if "universal data for rehydration" in message or "could not read the current webpage" in message:
+        return DownloadFailure(
+            "tiktok_challenge", "tiktok_challenge_rehydration",
+            "TikTok extractor could not read the current webpage response.", True,
+        )
+    if any(value in message for value in ("http error 429", "too many requests", "rate limit")):
+        return DownloadFailure(
+            "rate_limit", "tiktok_rate_limit",
+            "TikTok rate-limited the downloader.", True,
+        )
+    if any(value in message for value in ("http error 403", "forbidden", "challenge cookie")):
+        return DownloadFailure(
+            "tiktok_challenge", "tiktok_access_challenge",
+            "TikTok rejected the configured download request.", True,
+        )
+    if any(value in message for value in ("connection timed out", "timed out", "timeout")):
+        return DownloadFailure(
+            "network", "network_timeout",
+            "TikTok request timed out while contacting the provider.", True,
+        )
+    if any(value in message for value in ("tls connect", "ssl", "certificate")):
+        return DownloadFailure(
+            "network", "network_tls",
+            "The downloader could not establish a secure connection to TikTok.", True,
+        )
+    if any(value in message for value in ("proxy", "could not resolve", "name resolution", "network is unreachable")):
+        return DownloadFailure(
+            "network", "network_connectivity",
+            "The downloader could not reach TikTok through the configured network.", True,
+        )
+    if any(value in message for value in (
+        "video is unavailable", "private video", "deleted video", "http error 404", "not available",
+    )):
+        return DownloadFailure("unavailable", "individual_unavailable", "Video is unavailable.", False)
+    if any(value in message for value in (
+        "ffprobe", "invalid duration", "must contain", "video stream", "mp4 container", "corrupt",
+    )):
+        return DownloadFailure("validation", "media_validation", raw, False)
+    if any(value in message for value in (
+        "yt-dlp could not be started", "completed without producing", "no supported video file",
+        "impersonate target", "extractor failed",
+    )):
+        return DownloadFailure(
+            "extractor", "downloader_configuration",
+            "The configured TikTok downloader could not produce a video.", True,
+        )
+    return DownloadFailure("individual", "individual_download_failure", raw, False)
 
 
 def _probe_downloaded_video(path: Path) -> dict[str, Any]:
@@ -2237,8 +3149,23 @@ def _free_disk_bytes(path: Path) -> int:
 
 def _sanitize_download_error(message: str) -> str:
     sanitized = str(message or "Download failed.").replace("\r", " ").replace("\n", " ")
+    lowered = sanitized.casefold()
+    if "unexpected response from webpage request" in lowered:
+        return "TikTok extractor returned an unexpected webpage response."
+    if "unable to extract universal data for rehydration" in lowered:
+        return "TikTok extractor could not read the current webpage response."
     sanitized = re.sub(r"https?://\S+", "[url]", sanitized, flags=re.IGNORECASE)
-    sanitized = re.sub(r"(?i)(cookie|authorization|access[-_ ]?token|secret)\s*[:=]\s*\S+", r"\1=[redacted]", sanitized)
+    sanitized = re.sub(
+        r"(?i)authorization\s*[:=]\s*(?:bearer\s+)?\S+",
+        "authorization=[redacted]",
+        sanitized,
+    )
+    sanitized = re.sub(
+        r"(?i)(cookie|access[-_ ]?token|refresh[-_ ]?token|secret|signature|session(?:id)?)\s*[:=]\s*\S+",
+        r"\1=[redacted]",
+        sanitized,
+    )
+    sanitized = re.sub(r"(?i)bearer\s+[A-Za-z0-9._~+\-/]+=*", "Bearer [redacted]", sanitized)
     for secret in (
         os.getenv("TIKTOK_APP_SECRET", "").strip(),
         os.getenv("TIKTOK_ACCESS_TOKEN", "").strip(),

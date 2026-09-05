@@ -26,6 +26,7 @@ from clipper_app.application.trends import (
     normalize_hashtag_folder_name,
     _run_ytdlp,
     _sanitize_download_error,
+    _validated_tiktok_media_url,
     _validated_tiktok_video_url,
     trend_download_filename,
     trend_download_relative_path,
@@ -456,7 +457,7 @@ class TrendServiceTests(unittest.TestCase):
             self.service.link_media("v1-1", "../outside.mp4", "operator:test")
         self.assertEqual(result["hashtag_count"], 10)
 
-    def test_bulk_download_keeps_per_hashtag_copies_and_reuses_ranked_files(self):
+    def test_bulk_download_deduplicates_same_video_across_hashtags(self):
         hashtag_payload = _hashtag_payload(2)
         for item in hashtag_payload["data"]["list"]:
             item["hashtag_name"] = f"skincare{item['rank_position']}"
@@ -484,23 +485,178 @@ class TrendServiceTests(unittest.TestCase):
             self.database.execute("DELETE FROM trend_media_links WHERE video_id='v1-1'")
             second = service.download_all(request, run_id="run-two", actor="operator:test")
 
-        self.assertEqual(first["downloaded_count"], 2)
-        self.assertEqual(second["reused_count"], 2)
-        self.assertEqual(second["approved_count"], 2)
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(first["downloaded_count"], 1)
+        self.assertEqual(first["target_reference_count"], 2)
+        self.assertEqual(first["unique_video_count"], 1)
+        self.assertEqual(second["reused_count"], 1)
+        self.assertEqual(second["approved_count"], 1)
+        self.assertEqual(len(calls), 1)
         row = TrendRepository(self.database).download(snapshot["snapshot_id"], "h1", "v1-1")
-        self.assertEqual(row["status"], "downloaded")
-        self.assertEqual(row["attempt_count"], 2)
-        self.assertTrue((self.media / "downloads" / "skincare1" / "001_v1-1.mp4").is_file())
-        self.assertTrue((self.media / "downloads" / "skincare2" / "001_v1-1.mp4").is_file())
+        self.assertEqual(row["status"], "reused")
+        self.assertEqual(row["attempt_count"], 1)
+        self.assertTrue((self.media / "library" / "v1-1.mp4").is_file())
+        self.assertEqual(len(list(self.media.rglob("*.mp4"))), 1)
+        self.assertTrue((self.media / "hashtags" / "skincare1" / "metadata.json").is_file())
+        self.assertTrue((self.media / "hashtags" / "skincare2" / "metadata.json").is_file())
         link = TrendRepository(self.database).media_link("v1-1")
         self.assertEqual(link["status"], "media_ready")
         self.assertEqual(link["approved_by"], "operator:test")
         page_video = service.page(category_name="ALL")["videos"][0]
-        self.assertEqual(page_video["download_status"], "downloaded")
+        self.assertEqual(page_video["download_status"], "reused")
         self.assertEqual(page_video["media_status"], "media_ready")
 
-    def test_successful_refresh_reconciles_ranks_stale_files_metadata_and_database(self):
+    def test_preflight_download_is_reused_as_the_first_saved_item(self):
+        hashtags = _hashtag_payload(1)
+        hashtags["data"]["list"][0]["hashtag_name"] = "skincare"
+        snapshot = TrendRepository(self.database).save_snapshot(
+            country_code="ID", date_range="1DAY", category_name="ALL",
+            hashtag_payload=hashtags, video_payload=_video_payload(groups=1, videos=3),
+        )
+        calls = []
+
+        def fake_download(video_id, _source_url, target_dir, _timeout):
+            calls.append(video_id)
+            path = target_dir / f"{video_id}.mp4"
+            path.write_bytes(video_id.encode("ascii"))
+            return path
+
+        service = TrendService(self.database, self.cfg, download_runner=fake_download)
+        service._ytdlp_cache = (True, "2026.08.19")
+        with mock.patch(
+            "clipper_app.application.trends._probe_downloaded_video",
+            return_value={"duration_seconds": 1.0},
+        ):
+            result = service.download_all(SimpleNamespace(
+                snapshot_id=snapshot["snapshot_id"], rights_confirmed=True, retry_failed=True,
+            ))
+        self.assertEqual(calls[0], "v1-1")
+        self.assertCountEqual(calls, ["v1-1", "v1-2", "v1-3"])
+        self.assertEqual(result["downloaded_count"], 3)
+        self.assertTrue((self.media / "library" / "v1-1.mp4").is_file())
+
+    def test_preflight_systemic_failure_aborts_and_interrupts_unattempted_items(self):
+        hashtags = _hashtag_payload(1)
+        hashtags["data"]["list"][0]["hashtag_name"] = "skincare"
+        snapshot = TrendRepository(self.database).save_snapshot(
+            country_code="ID", date_range="1DAY", category_name="ALL",
+            hashtag_payload=hashtags, video_payload=_video_payload(groups=1, videos=4),
+        )
+        calls = []
+
+        def fail_download(video_id, *_args):
+            calls.append(video_id)
+            raise TrendServiceError(
+                "ERROR: [TikTok] Unexpected response from webpage request token=secret"
+            )
+
+        service = TrendService(self.database, self.cfg, download_runner=fail_download)
+        service._ytdlp_cache = (True, "2026.08.19")
+        with self.assertRaisesRegex(TrendServiceError, "failed during preflight"):
+            service.download_all(SimpleNamespace(
+                snapshot_id=snapshot["snapshot_id"], rights_confirmed=True, retry_failed=True,
+            ))
+        self.assertEqual(calls, ["v1-1"])
+        records = self.database.query(
+            "SELECT video_id,status,attempt_count,error FROM trend_media_downloads ORDER BY final_rank"
+        )
+        self.assertEqual(records[0]["status"], "failed")
+        self.assertEqual(
+            records[0]["error"],
+            "TikTok extractor returned an unexpected webpage response.",
+        )
+        self.assertEqual(
+            [(row["status"], row["attempt_count"]) for row in records[1:]],
+            [("interrupted", 0), ("interrupted", 0), ("interrupted", 0)],
+        )
+        self.assertNotIn("secret", " ".join(str(row["error"]) for row in records))
+
+    def test_repeated_systemic_failures_trip_circuit_breaker(self):
+        self.cfg.TREND_YTDLP_CONCURRENCY = 1
+        hashtags = _hashtag_payload(1)
+        hashtags["data"]["list"][0]["hashtag_name"] = "skincare"
+        snapshot = TrendRepository(self.database).save_snapshot(
+            country_code="ID", date_range="1DAY", category_name="ALL",
+            hashtag_payload=hashtags, video_payload=_video_payload(groups=1, videos=6),
+        )
+        calls = []
+
+        def mixed_download(video_id, _source_url, target_dir, _timeout):
+            calls.append(video_id)
+            if video_id != "v1-1":
+                raise TrendServiceError("curl: (28) Connection timed out after 30000 milliseconds")
+            path = target_dir / f"{video_id}.mp4"
+            path.write_bytes(b"valid")
+            return path
+
+        service = TrendService(self.database, self.cfg, download_runner=mixed_download)
+        service._ytdlp_cache = (True, "2026.08.19")
+        with (
+            mock.patch(
+                "clipper_app.application.trends._probe_downloaded_video",
+                return_value={"duration_seconds": 1.0},
+            ),
+            self.assertRaisesRegex(TrendServiceError, "2 videos were not attempted"),
+        ):
+            service.download_all(SimpleNamespace(
+                snapshot_id=snapshot["snapshot_id"], rights_confirmed=True, retry_failed=True,
+            ))
+        self.assertEqual(calls, ["v1-1", "v1-2", "v1-3", "v1-4"])
+        statuses = {
+            row["video_id"]: row["status"]
+            for row in self.database.query("SELECT video_id,status FROM trend_media_downloads")
+        }
+        self.assertEqual(statuses["v1-1"], "downloaded")
+        self.assertEqual([statuses["v1-2"], statuses["v1-3"], statuses["v1-4"]], ["failed"] * 3)
+        self.assertEqual([statuses["v1-5"], statuses["v1-6"]], ["interrupted"] * 2)
+
+    def test_failed_and_interrupted_items_retry_without_redownloading_successes(self):
+        hashtags = _hashtag_payload(1)
+        hashtags["data"]["list"][0]["hashtag_name"] = "skincare"
+        snapshot = TrendRepository(self.database).save_snapshot(
+            country_code="ID", date_range="1DAY", category_name="ALL",
+            hashtag_payload=hashtags, video_payload=_video_payload(groups=1, videos=3),
+        )
+        first_calls = []
+
+        def broken(video_id, *_args):
+            first_calls.append(video_id)
+            raise TrendServiceError("Unexpected response from webpage request")
+
+        broken_service = TrendService(self.database, self.cfg, download_runner=broken)
+        broken_service._ytdlp_cache = (True, "2026.08.19")
+        with self.assertRaises(TrendServiceError):
+            broken_service.download_all(SimpleNamespace(
+                snapshot_id=snapshot["snapshot_id"], rights_confirmed=True, retry_failed=True,
+            ))
+        repaired_calls = []
+
+        def repaired(video_id, _source_url, target_dir, _timeout):
+            repaired_calls.append(video_id)
+            path = target_dir / f"{video_id}.mp4"
+            path.write_bytes(video_id.encode("ascii"))
+            return path
+
+        repaired_service = TrendService(self.database, self.cfg, download_runner=repaired)
+        repaired_service._ytdlp_cache = (True, "2026.08.19")
+        with mock.patch(
+            "clipper_app.application.trends._probe_downloaded_video",
+            return_value={"duration_seconds": 1.0},
+        ):
+            repaired_service.download_all(SimpleNamespace(
+                snapshot_id=snapshot["snapshot_id"], rights_confirmed=True, retry_failed=True,
+            ))
+            repaired_service.download_all(SimpleNamespace(
+                snapshot_id=snapshot["snapshot_id"], rights_confirmed=True, retry_failed=True,
+            ))
+        self.assertEqual(first_calls, ["v1-1"])
+        self.assertEqual(repaired_calls[0], "v1-1")
+        self.assertCountEqual(repaired_calls, ["v1-1", "v1-2", "v1-3"])
+        self.assertEqual(
+            self.database.scalar("SELECT COUNT(*) FROM trend_media_downloads WHERE status='reused'"),
+            3,
+        )
+
+    def test_rank_changes_reuse_migrated_canonical_media(self):
         hashtag_payload = _hashtag_payload(1)
         hashtag_payload["data"]["list"][0]["hashtag_name"] = "#Moisturizer"
         video_payload = _video_payload(groups=1, videos=3)
@@ -531,6 +687,7 @@ class TrendServiceTests(unittest.TestCase):
             "clipper_app.application.trends._probe_downloaded_video",
             return_value={"duration_seconds": 4.0},
         ):
+            service.migrate_legacy_media(folder)
             result = service.download_all(SimpleNamespace(
                 snapshot_id=snapshot["snapshot_id"], rights_confirmed=True, retry_failed=True,
             ))
@@ -540,16 +697,18 @@ class TrendServiceTests(unittest.TestCase):
         self.assertEqual(calls, ["v1-3"])
         self.assertEqual(
             sorted(path.name for path in folder.iterdir()),
-            ["001_v1-1.mp4", "002_v1-2.mp4", "003_v1-3.mp4", "metadata.json"],
+            ["002_v1-2.mp4", "003_v1-1.mp4", "020_stale.mp4"],
         )
-        metadata = json.loads((folder / "metadata.json").read_text(encoding="utf-8"))
+        metadata = json.loads((
+            self.media / "hashtags" / "moisturizer" / "metadata.json"
+        ).read_text(encoding="utf-8"))
         self.assertEqual(metadata["hashtag"], "moisturizer")
         self.assertEqual(
-            [(item["rank"], item["filename"], item["relative_path"]) for item in metadata["videos"]],
+            [(item["rank"], item["video_id"], item["media"]) for item in metadata["videos"]],
             [
-                (1, "001_v1-1.mp4", "moisturizer/001_v1-1.mp4"),
-                (2, "002_v1-2.mp4", "moisturizer/002_v1-2.mp4"),
-                (3, "003_v1-3.mp4", "moisturizer/003_v1-3.mp4"),
+                (1, "v1-1", "../../library/v1-1.mp4"),
+                (2, "v1-2", "../../library/v1-2.mp4"),
+                (3, "v1-3", "../../library/v1-3.mp4"),
             ],
         )
         database_rows = self.database.query(
@@ -563,18 +722,18 @@ class TrendServiceTests(unittest.TestCase):
                 for row in database_rows
             ],
             [
-                ("v1-1", 1, "downloads/moisturizer/001_v1-1.mp4", "downloaded"),
-                ("v1-2", 2, "downloads/moisturizer/002_v1-2.mp4", "downloaded"),
-                ("v1-3", 3, "downloads/moisturizer/003_v1-3.mp4", "downloaded"),
+                ("v1-1", 1, "library/v1-1.mp4", "reused"),
+                ("v1-2", 2, "library/v1-2.mp4", "reused"),
+                ("v1-3", 3, "library/v1-3.mp4", "downloaded"),
             ],
         )
         page = service.page(category_name="ALL")
         self.assertEqual(
             [
-                (video["final_rank"], Path(video["downloaded_relative_path"]).name)
+                (video["final_rank"], video["downloaded_relative_path"])
                 for video in page["videos"]
             ],
-            [(1, "001_v1-1.mp4"), (2, "002_v1-2.mp4"), (3, "003_v1-3.mp4")],
+            [(1, "library/v1-1.mp4"), (2, "library/v1-2.mp4"), (3, "library/v1-3.mp4")],
         )
 
     def test_download_url_validation_and_error_sanitization(self):
@@ -593,6 +752,17 @@ class TrendServiceTests(unittest.TestCase):
         self.assertNotIn("https://", sanitized)
         self.assertNotIn("abc", sanitized)
         self.assertIn("[redacted]", sanitized)
+        bearer = _sanitize_download_error("Authorization: Bearer top.secret.token")
+        self.assertNotIn("top.secret.token", bearer)
+        self.assertIn("[redacted]", bearer)
+        self.assertEqual(
+            _validated_tiktok_media_url(
+                "https://v16-webapp-prime.tiktok.com/video.mp4?signature=safe"
+            ),
+            "https://v16-webapp-prime.tiktok.com/video.mp4?signature=safe",
+        )
+        with self.assertRaises(TrendServiceError):
+            _validated_tiktok_media_url("https://attacker.example/video.mp4")
 
     def test_ytdlp_runner_uses_module_without_shell_or_browser_credentials(self):
         target = self.media / "downloads" / "123"
@@ -600,13 +770,21 @@ class TrendServiceTests(unittest.TestCase):
         produced = target / "123.mp4"
         produced.write_bytes(b"media")
         completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
-        with mock.patch("clipper_app.application.trends.subprocess.run", return_value=completed) as run:
+        with (
+            mock.patch("clipper_app.application.trends.subprocess.run", return_value=completed) as run,
+            mock.patch(
+                "clipper_app.application.trends._resolve_provider_media_url",
+                return_value="https://v16-webapp-prime.tiktok.com/provider.mp4?signature=safe",
+            ),
+        ):
             result = _run_ytdlp("123", "https://www.tiktok.com/@creator/video/123", target, 600)
         command = run.call_args.args[0]
         self.assertEqual(command[:3], [mock.ANY, "-m", "yt_dlp"])
         self.assertIn("--ignore-config", command)
         self.assertNotIn("--cookies-from-browser", command)
         self.assertNotIn("--proxy", command)
+        self.assertIn("User-Agent:Mozilla/5.0", command)
+        self.assertTrue(str(command[-1]).startswith("https://v16-webapp-prime.tiktok.com/"))
         self.assertNotIn("shell", run.call_args.kwargs)
         self.assertEqual(result, produced)
 
@@ -718,7 +896,7 @@ class TrendServiceTests(unittest.TestCase):
             "snapshot", "hashtag", "video",
         ))
 
-    def test_refresh_refuses_to_overwrite_a_colliding_legacy_video_id_folder(self):
+    def test_canonical_layout_does_not_overwrite_legacy_video_id_folder(self):
         hashtag_payload = _hashtag_payload(1)
         hashtag_payload["data"]["list"][0]["hashtag_name"] = "skincare123"
         snapshot = TrendRepository(self.database).save_snapshot(
@@ -729,15 +907,24 @@ class TrendServiceTests(unittest.TestCase):
         legacy_folder.mkdir(parents=True)
         legacy_file = legacy_folder / "skincare123.mp4"
         legacy_file.write_bytes(b"legacy")
-        service = TrendService(self.database, self.cfg)
+        def fake_download(video_id, _source_url, target_dir, _timeout):
+            path = target_dir / f"{video_id}.mp4"
+            path.write_bytes(b"canonical")
+            return path
+
+        service = TrendService(self.database, self.cfg, download_runner=fake_download)
         service._ytdlp_cache = (True, "2026.07.04")
-        with self.assertRaisesRegex(TrendServiceError, "collides with a legacy"):
+        with mock.patch(
+            "clipper_app.application.trends._probe_downloaded_video",
+            return_value={"duration_seconds": 1.0},
+        ):
             service.download_all(SimpleNamespace(
                 snapshot_id=snapshot["snapshot_id"], rights_confirmed=True, retry_failed=True,
             ))
         self.assertEqual(legacy_file.read_bytes(), b"legacy")
+        self.assertTrue((self.media / "library" / "v1-1.mp4").is_file())
 
-    def test_partial_hashtag_refresh_keeps_successes_and_compacts_ranks(self):
+    def test_partial_hashtag_refresh_keeps_successes_and_preserves_discovery_ranks(self):
         hashtag_payload = _hashtag_payload(1)
         hashtag_payload["data"]["list"][0]["hashtag_name"] = "skincare"
         snapshot = TrendRepository(self.database).save_snapshot(
@@ -777,20 +964,22 @@ class TrendServiceTests(unittest.TestCase):
         self.assertEqual(result["failed_count"], 1)
         self.assertEqual(
             sorted(path.name for path in previous.iterdir()),
-            ["001_v1-1.mp4", "002_v1-3.mp4", "metadata.json"],
+            ["001_previous.mp4", "metadata.json"],
         )
-        metadata = json.loads((previous / "metadata.json").read_text(encoding="utf-8"))
+        metadata = json.loads((
+            self.media / "hashtags" / "skincare" / "metadata.json"
+        ).read_text(encoding="utf-8"))
         self.assertEqual(
-            [(item["rank"], item["video_id"], item["relative_path"]) for item in metadata["videos"]],
+            [(item["rank"], item["video_id"], item["media"]) for item in metadata["videos"]],
             [
-                (1, "v1-1", "skincare/001_v1-1.mp4"),
-                (2, "v1-3", "skincare/002_v1-3.mp4"),
+                (1, "v1-1", "../../library/v1-1.mp4"),
+                (3, "v1-3", "../../library/v1-3.mp4"),
             ],
         )
         ranked = TrendRepository(self.database).videos(snapshot["snapshot_id"])
         self.assertEqual(
             [(row["video_id"], row["final_rank"]) for row in ranked],
-            [("v1-1", 1), ("v1-3", 2)],
+            [("v1-1", 1), ("v1-2", 2), ("v1-3", 3)],
         )
         failed = TrendRepository(self.database).download(snapshot["snapshot_id"], "h1", "v1-2")
         self.assertEqual(failed["status"], "failed")
@@ -814,7 +1003,7 @@ class TrendServiceTests(unittest.TestCase):
         previous.mkdir(parents=True)
         (previous / "001_previous.mp4").write_bytes(b"previous")
         (previous / "metadata.json").write_text('{"previous": true}', encoding="utf-8")
-        with self.assertRaisesRegex(TrendServiceError, "No TikTok videos"):
+        with self.assertRaisesRegex(TrendServiceError, "failed during preflight"):
             service.download_all(SimpleNamespace(
                 snapshot_id=snapshot["snapshot_id"], rights_confirmed=True, retry_failed=True,
             ))
@@ -827,7 +1016,7 @@ class TrendServiceTests(unittest.TestCase):
             {"previous": True},
         )
 
-    def test_hashtag_refresh_reuses_valid_legacy_video_id_files(self):
+    def test_migrated_legacy_video_id_files_are_globally_reused(self):
         hashtag_payload = _hashtag_payload(1)
         hashtag_payload["data"]["list"][0]["hashtag_name"] = "skincare"
         snapshot = TrendRepository(self.database).save_snapshot(
@@ -849,16 +1038,137 @@ class TrendServiceTests(unittest.TestCase):
             "clipper_app.application.trends._probe_downloaded_video",
             return_value={"duration_seconds": 1.0},
         ):
+            migration = service.migrate_legacy_media(downloads)
             result = service.download_all(SimpleNamespace(
                 snapshot_id=snapshot["snapshot_id"], rights_confirmed=True, retry_failed=True,
             ))
+        self.assertEqual(migration["files_migrated"], 2)
         self.assertEqual(result["reused_count"], 2)
-        self.assertEqual(
-            sorted(path.name for path in (downloads / "skincare").iterdir()),
-            ["001_v1-1.mp4", "002_v1-2.mp4", "metadata.json"],
-        )
+        self.assertTrue((self.media / "library" / "v1-1.mp4").is_file())
+        self.assertTrue((self.media / "library" / "v1-2.mp4").is_file())
+        self.assertTrue((self.media / "hashtags" / "skincare" / "metadata.json").is_file())
         self.assertTrue((downloads / "v1-1" / "v1-1.mp4").is_file())
         self.assertTrue((downloads / "v1-2" / "v1-2.mp4").is_file())
+
+    def test_new_snapshot_rank_and_share_url_change_reuse_without_ytdlp(self):
+        hashtags = _hashtag_payload(1)
+        hashtags["data"]["list"][0]["hashtag_name"] = "skincare"
+        first_snapshot = TrendRepository(self.database).save_snapshot(
+            country_code="ID", date_range="1DAY", category_name="ALL",
+            hashtag_payload=hashtags, video_payload=_video_payload(groups=1, videos=1),
+        )
+        calls = []
+
+        def fake_download(video_id, _source_url, target_dir, _timeout):
+            calls.append(video_id)
+            path = target_dir / f"{video_id}.mp4"
+            path.write_bytes(b"one-canonical-video")
+            return path
+
+        service = TrendService(self.database, self.cfg, download_runner=fake_download)
+        service._ytdlp_cache = (True, "test")
+        request = lambda snapshot_id: SimpleNamespace(
+            snapshot_id=snapshot_id, rights_confirmed=True, retry_failed=True,
+        )
+        with mock.patch(
+            "clipper_app.application.trends._probe_downloaded_video",
+            return_value={"duration_seconds": 1.0},
+        ):
+            service.download_all(request(first_snapshot["snapshot_id"]))
+            second_payload = _video_payload(groups=1, videos=1)
+            second_payload["data"]["list"][0]["top_video_list"][0]["share_url"] = (
+                "https://www.tiktok.com/@different/video/v1-1?changed=1"
+            )
+            second_snapshot = TrendRepository(self.database).save_snapshot(
+                country_code="ID", date_range="7DAY", category_name="ALL",
+                hashtag_payload=hashtags, video_payload=second_payload,
+            )
+            self.database.execute(
+                "UPDATE trend_videos SET final_rank=2 WHERE snapshot_id=? AND video_id='v1-1'",
+                (second_snapshot["snapshot_id"],),
+            )
+            service._ytdlp_cache = (False, "")
+            reused = service.download_all(request(second_snapshot["snapshot_id"]))
+
+        self.assertEqual(calls, ["v1-1"])
+        self.assertEqual(reused["downloaded_count"], 0)
+        self.assertEqual(reused["reused_count"], 1)
+        history = self.database.query(
+            "SELECT snapshot_id,final_rank,status FROM trend_media_downloads ORDER BY completed_at"
+        )
+        self.assertEqual(
+            [(row["final_rank"], row["status"]) for row in history],
+            [(1, "downloaded"), (2, "reused")],
+        )
+
+    def test_mixed_cached_and_new_batch_only_downloads_unique_new_ids(self):
+        hashtags = _hashtag_payload(2)
+        for item in hashtags["data"]["list"]:
+            item["hashtag_name"] = f"skincare{item['rank_position']}"
+        first_snapshot = TrendRepository(self.database).save_snapshot(
+            country_code="ID", date_range="1DAY", category_name="ALL",
+            hashtag_payload={"data": {"list": hashtags["data"]["list"][:1]}},
+            video_payload=_video_payload(groups=1, videos=20),
+        )
+        calls = []
+
+        def fake_download(video_id, _source_url, target_dir, _timeout):
+            calls.append(video_id)
+            path = target_dir / f"{video_id}.mp4"
+            path.write_bytes(video_id.encode("ascii"))
+            return path
+
+        service = TrendService(self.database, self.cfg, download_runner=fake_download)
+        service._ytdlp_cache = (True, "test")
+        with mock.patch(
+            "clipper_app.application.trends._probe_downloaded_video",
+            return_value={"duration_seconds": 1.0},
+        ):
+            service.download_all(SimpleNamespace(
+                snapshot_id=first_snapshot["snapshot_id"], rights_confirmed=True, retry_failed=True,
+            ))
+            second_payload = _video_payload(groups=2, videos=20)
+            second_payload["data"]["list"][1]["top_video_list"] = (
+                second_payload["data"]["list"][1]["top_video_list"][:5]
+            )
+            second_snapshot = TrendRepository(self.database).save_snapshot(
+                country_code="ID", date_range="7DAY", category_name="ALL",
+                hashtag_payload=hashtags, video_payload=second_payload,
+            )
+            before = len(calls)
+            result = service.download_all(SimpleNamespace(
+                snapshot_id=second_snapshot["snapshot_id"], rights_confirmed=True, retry_failed=True,
+            ))
+
+        self.assertEqual(result["target_reference_count"], 25)
+        self.assertEqual(result["unique_video_count"], 25)
+        self.assertEqual(result["reused_count"], 20)
+        self.assertEqual(result["downloaded_count"], 5)
+        self.assertEqual(len(calls) - before, 5)
+
+    def test_migration_consolidates_equal_hash_and_preserves_hash_conflict(self):
+        legacy = self.root / "legacy"
+        (legacy / "a").mkdir(parents=True)
+        (legacy / "b").mkdir(parents=True)
+        (legacy / "a" / "001_same.mp4").write_bytes(b"same")
+        (legacy / "b" / "002_same.mp4").write_bytes(b"same")
+        (legacy / "a" / "001_conflict.mp4").write_bytes(b"left")
+        (legacy / "b" / "002_conflict.mp4").write_bytes(b"right")
+        with mock.patch(
+            "clipper_app.application.trends._probe_downloaded_video",
+            return_value={"duration_seconds": 1.0},
+        ):
+            audit = self.service.audit_legacy_media(legacy)
+            first = self.service.migrate_legacy_media(legacy)
+            second = self.service.migrate_legacy_media(legacy)
+        self.assertEqual(audit["duplicate_file_count"], 1)
+        self.assertEqual(audit["duplicate_bytes"], 4)
+        self.assertEqual([item["video_id"] for item in audit["hash_conflicts"]], ["conflict"])
+        self.assertTrue((self.media / "library" / "same.mp4").is_file())
+        self.assertFalse((self.media / "library" / "conflict.mp4").exists())
+        self.assertEqual(first["files_migrated"], 1)
+        self.assertEqual(second["canonical_files_reused"], 1)
+        self.assertEqual(len(list(legacy.rglob("*conflict.mp4"))), 2)
 
     def test_media_probe_accepts_a_valid_mp4_without_an_audio_stream(self):
         probe_result = SimpleNamespace(

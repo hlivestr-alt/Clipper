@@ -575,7 +575,8 @@ SCORER_VISION_CONTACT_SHEET_CELL_SIZE = 384
 
 # TikTok trend-analysis intake. App credentials come from the environment;
 # OAuth tokens are stored separately in the encrypted runtime credential store.
-TREND_MEDIA_DIR = "working/trends/media"
+TREND_MEDIA_DIR = r"D:\Trend Videos"
+TREND_LEGACY_MEDIA_DIR = "working/trends/media"
 TREND_YTDLP_CONCURRENCY = 2
 TREND_YTDLP_TIMEOUT_SECONDS = 600
 TREND_YTDLP_MIN_FREE_BYTES = 5 * 1024 * 1024 * 1024
